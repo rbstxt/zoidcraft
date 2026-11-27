@@ -1135,6 +1135,47 @@ fn render_callback_frames<T, F>(
     );
 }
 
+/// Evaluates 4-point Catmull-Rom cubic Hermite interpolation for `t in [0.0, 1.0]`
+/// between `y1` (at `t = 0`) and `y2` (at `t = 1`) using neighbor samples `y0` and `y3`.
+#[inline]
+fn catmull_rom_sample(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
+    let a0 = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
+    let a1 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+    let a2 = -0.5 * y0 + 0.5 * y2;
+    let a3 = y1;
+    ((a0 * t + a1) * t + a2) * t + a3
+}
+
+/// Reads a stereo frame from `slice` at fractional sample position `pos` using 4-point
+/// Catmull-Rom cubic Hermite interpolation (real-time safe, zero allocations).
+#[inline]
+fn sample_stereo_slice_catmull_rom(slice: &[[f32; 2]], pos: f64) -> Option<[f32; 2]> {
+    let len = slice.len();
+    if len == 0 || !pos.is_finite() || pos < 0.0 {
+        return None;
+    }
+    let idx1 = pos.floor() as usize;
+    if idx1 >= len {
+        return None;
+    }
+    let frac = (pos - idx1 as f64) as f32;
+    if frac == 0.0 {
+        return Some(slice[idx1]);
+    }
+    let last = len - 1;
+    let idx0 = idx1.saturating_sub(1);
+    let idx2 = (idx1 + 1).min(last);
+    let idx3 = (idx1 + 2).min(last);
+    let s0 = slice[idx0];
+    let s1 = slice[idx1];
+    let s2 = slice[idx2];
+    let s3 = slice[idx3];
+    Some([
+        catmull_rom_sample(s0[0], s1[0], s2[0], s3[0], frac),
+        catmull_rom_sample(s0[1], s1[1], s2[1], s3[1], frac),
+    ])
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_callback_frames_windowed_with_loop_head<T, F>(
     shared: &ClockShared,
@@ -1187,22 +1228,9 @@ fn render_callback_frames_windowed_with_loop_head<T, F>(
         if mix.is_some() || loop_head.is_some() {
             let sample_slice =
                 |slice: &[[f32; 2]], origin: f64, exact_frame: f64| -> Option<[f32; 2]> {
-                    let len = slice.len();
-                    if len == 0 {
-                        return None;
-                    }
                     let timeline_sec = (exact_frame - origin) / snap.fps;
                     let pos = timeline_sec * mix_sample_rate;
-                    if pos >= 0.0 && (pos.floor() as usize) < len {
-                        let idx0 = pos.floor() as usize;
-                        let idx1 = (idx0 + 1).min(len - 1);
-                        let frac = (pos - idx0 as f64) as f32;
-                        let a = slice[idx0];
-                        let b = slice[idx1];
-                        Some([a[0] + (b[0] - a[0]) * frac, a[1] + (b[1] - a[1]) * frac])
-                    } else {
-                        None
-                    }
+                    sample_stereo_slice_catmull_rom(slice, pos)
                 };
 
             for (i, frame_chunk) in output.chunks_exact_mut(channels).enumerate() {
@@ -1712,5 +1740,72 @@ mod tests {
         assert!(!is_transient_cpal_xrun(&cpal::Error::new(
             cpal::ErrorKind::BackendError
         )));
+    }
+
+    #[test]
+    fn live_catmull_rom_resampling_preserves_ramps_and_beats_linear_on_sine() {
+        // Out-of-bounds and empty guards.
+        assert_eq!(sample_stereo_slice_catmull_rom(&[], 0.0), None);
+        let ramp: Vec<[f32; 2]> = (0..64)
+            .map(|i| {
+                let v = i as f32 * 0.01;
+                [v, -v]
+            })
+            .collect();
+        assert_eq!(sample_stereo_slice_catmull_rom(&ramp, -0.1), None);
+        assert_eq!(sample_stereo_slice_catmull_rom(&ramp, 64.0), None);
+        assert_eq!(sample_stereo_slice_catmull_rom(&ramp, f64::NAN), None);
+
+        // Exact reproduction on linear ramp at integer and fractional positions.
+        for &pos in &[0.0, 10.0, 10.25, 10.5, 31.75] {
+            let s = sample_stereo_slice_catmull_rom(&ramp, pos).expect("in range");
+            let expected = (pos * 0.01) as f32;
+            assert!(
+                (s[0] - expected).abs() < 1e-5 && (s[1] + expected).abs() < 1e-5,
+                "ramp mismatch at pos={pos}: got={s:?}, expected=[{expected}, -{}]",
+                expected
+            );
+        }
+
+        // High-frequency sine at 6 kHz / 48 kHz resampled at fractional step 0.73:
+        // 4-point Catmull-Rom must be dramatically cleaner than 2-point linear interpolation.
+        let sr = 48_000.0_f64;
+        let freq = 6_000.0_f64;
+        let len = 512_usize;
+        let sine: Vec<[f32; 2]> = (0..len)
+            .map(|i| {
+                let v = (std::f64::consts::TAU * freq * (i as f64) / sr).sin() as f32;
+                [v, v]
+            })
+            .collect();
+
+        let mut cr_err_sq = 0.0_f64;
+        let mut lin_err_sq = 0.0_f64;
+        let mut count = 0_usize;
+        for step in 16..480 {
+            let pos = step as f64 + 0.37;
+            let expected = (std::f64::consts::TAU * freq * pos / sr).sin();
+            let cr = sample_stereo_slice_catmull_rom(&sine, pos).unwrap()[0];
+            let err_cr = f64::from(cr) - expected;
+            cr_err_sq += err_cr * err_cr;
+
+            let i0 = pos.floor() as usize;
+            let frac = pos - i0 as f64;
+            let lin = f64::from(sine[i0][0])
+                + (f64::from(sine[i0 + 1][0]) - f64::from(sine[i0][0])) * frac;
+            let err_lin = lin - expected;
+            lin_err_sq += err_lin * err_lin;
+            count += 1;
+        }
+        let cr_rms = (cr_err_sq / count as f64).sqrt();
+        let lin_rms = (lin_err_sq / count as f64).sqrt();
+        assert!(
+            cr_rms < 0.015,
+            "Catmull-Rom fractional sine RMS error too high: {cr_rms}"
+        );
+        assert!(
+            lin_rms > cr_rms * 3.0,
+            "expected Catmull-Rom ({cr_rms}) to significantly beat linear ({lin_rms})"
+        );
     }
 }

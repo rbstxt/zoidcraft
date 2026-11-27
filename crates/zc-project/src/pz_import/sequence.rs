@@ -11,7 +11,7 @@ use crate::model::{
     StaticBehavior, VideoClip, VideoTrack, cm3_blend_mode_from_index, normalize_blend_mode_token,
 };
 
-use super::effects::parse_effect;
+use super::effects::{parse_custom_properties_from_maps, parse_effect};
 use super::objects3d::{parse_camera_data, parse_object3d, remap_scene_constraint_targets};
 use super::tracks::{
     build_fallback_time_curve, kf_frame, kf_value, parse_property_track, prop_f64, prop_str,
@@ -266,6 +266,9 @@ pub(super) fn parse_sequence(
                     | "markerColors"
                     | "zoidcraftMarkerColors"
                     | "zoidiumControls"
+                    | "customProperties"
+                    | "userProperties"
+                    | "extraProperties"
             ) {
                 seq.preserved.insert(format!("property.{k}"), v.clone());
             }
@@ -276,6 +279,35 @@ pub(super) fn parse_sequence(
         && let Some(bg) = parse_rgba_f32(bg_val)
     {
         seq.background_color = bg;
+    }
+
+    // Legacy CM3/Zoidium sequence-level `customProperties` / `userProperties` / `extraProperties`.
+    let legacy_seq_customs = parse_custom_properties_from_maps(obj, props);
+    if !legacy_seq_customs.is_empty() {
+        plugins.insert("expressions-plus".to_owned());
+        for cp in legacy_seq_customs {
+            if seq
+                .controls
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&cp.name))
+            {
+                continue;
+            }
+            let kind = match cp.track.value {
+                PropertyValue::Color(_) | PropertyValue::ColorRgba(_) => SequenceControlKind::Color,
+                PropertyValue::Vec2(_) => SequenceControlKind::Point2D,
+                PropertyValue::Vec3(_) => SequenceControlKind::Point3D,
+                PropertyValue::Bool(_) | PropertyValue::Option(_) => SequenceControlKind::Checkbox,
+                _ => SequenceControlKind::Slider,
+            };
+            seq.controls.push(SequenceControl {
+                id: Uuid::new_v4().to_string(),
+                name: cp.name,
+                kind,
+                track: cp.track,
+                preserved: cp.metadata,
+            });
+        }
     }
 
     seq.length_frames = obj.get("length").and_then(value_as_f64).unwrap_or(0.0);

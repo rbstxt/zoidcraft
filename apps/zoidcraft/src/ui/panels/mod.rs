@@ -31,7 +31,9 @@ use zc_shader::{CompileOptions, fix_property_name, translate_glsl_es100_with_opt
 
 use super::clipboard::{read_system_clipboard, write_system_clipboard};
 use super::pro_editors::{
-    LooksEditorState, NodeGraphEditorState, NodeGraphTargetKind, clamp_floating_window_in_screen,
+    DATAMOSH_ALGORITHM_ITEMS, DATAMOSH_MOTION_ITEMS, EffectSetupKind, EffectSetupState,
+    LensFlareOptionsState, LooksEditorState, NodeGraphEditorState, NodeGraphTargetKind,
+    ParticleDesignerKind, ParticleDesignerState, clamp_floating_window_in_screen,
     compute_clamped_editor_window_rect, consume_escape_for_floating_editor,
     mark_floating_editor_escape_consumed, show_pro_editor_windows,
 };
@@ -182,7 +184,7 @@ pub fn show_side_panel(
         SideTab::Plugins => show_plugins_tab(ui, session, theme, state),
         SideTab::Assets => show_assets_tab(ui, session, theme, state, actions),
         SideTab::About => show_about_tab(ui, session, theme),
-        SideTab::Settings => show_settings_tab(ui, viewport_rect, session, theme, state),
+        SideTab::Settings => show_settings_tab(ui, viewport_rect, session, theme, state, actions),
     }
 
     // If an inspector widget owning an open undo transaction was unmounted mid-edit
@@ -194,6 +196,6 @@ pub fn show_side_panel(
     // Floating editors spawned from inspectors (Custom Shader GLSL editor, Expression editor)
     show_inspector_floating_windows(ui.ctx(), viewport_rect, session, theme, state);
 
-    // Right-click stopwatch context menu (Edit Expression / Clear Expression / Toggle Keyframe)
-    show_stopwatch_context_menu(ui.ctx(), viewport_rect, session, theme, state);
+    // Right-click stopwatch context menu (Edit Expression / Clear Expression / Toggle Keyframe / Link Control / Graph)
+    show_stopwatch_context_menu(ui.ctx(), viewport_rect, session, theme, state, actions);
 }

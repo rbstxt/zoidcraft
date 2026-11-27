@@ -4,11 +4,14 @@ use crate::ui::controls::{
     ButtonVariant, FloatingWindowManager, FloatingWindowSpec, cm3_floating_window, cm3_prop_button,
 };
 use crate::ui::theme::{
-    BG_BUTTON, BG_HOVER, BG_INPUT, BG_PANEL, BG_SUNKEN, BORDER_CONTROL, BORDER_PANEL, Cm3Theme,
-    DANGER_TEXT, FONT_BODY, FONT_COMPACT, FONT_SMALL, FONT_TITLE, TEXT_FAINT, TEXT_MUTED,
+    BG_BUTTON, BG_HOVER, BG_INPUT, BG_PANEL, BG_SUNKEN, BG_TITLE, BORDER_CONTROL, BORDER_PANEL,
+    Cm3Theme, DANGER_TEXT, FONT_BODY, FONT_COMPACT, FONT_SMALL, FONT_TITLE, TEXT_FAINT, TEXT_MUTED,
     TEXT_PRIMARY, TEXT_STRONG, color32_with_alpha,
 };
-use egui::{Color32, CornerRadius, Id, Key, Rect, ScrollArea, Sense, Stroke, TextEdit, Ui, Vec2};
+use egui::{
+    Color32, CornerRadius, Id, Key, Pos2, Rect, ScrollArea, Sense, Shape, Stroke, StrokeKind,
+    TextEdit, Ui, Vec2,
+};
 use serde_json::{Map, Value, json};
 use zc_session::{Command, Session};
 
@@ -63,6 +66,8 @@ pub enum LooksParamKind {
     Bool,
     Choice(&'static [&'static str]),
     ColorRgb,
+    CubeLutAsset,
+    ToneCurves { multi_channel: bool },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -230,6 +235,14 @@ impl LooksEditorState {
                             p.key.into(),
                             json!([p.default_f64, p.default_f64, p.default_f64]),
                         );
+                    }
+                    LooksParamKind::CubeLutAsset => {}
+                    LooksParamKind::ToneCurves { multi_channel } => {
+                        if multi_channel {
+                            looks_set_curve_channel(&mut params, "master", default_5pt_curve());
+                        } else {
+                            looks_set_scurve_points(&mut params, synthesize_scurve_5pt(0.35, 0.5));
+                        }
                     }
                 }
             }
@@ -698,7 +711,9 @@ pub fn show_looks_editor_window(
                             ui.set_width((params_w - 18.0).max(120.0));
                             ui.set_min_height((body_h - 18.0).max(100.0));
                             ui.set_max_height((body_h - 18.0).max(100.0));
-                            if show_looks_tool_params_ui(ui, state, theme) && state.auto_apply {
+                            if show_looks_tool_params_ui(ui, state, session, theme)
+                                && state.auto_apply
+                            {
                                 should_commit = true;
                             }
                         });
@@ -916,6 +931,7 @@ pub fn show_looks_chain_list_ui(
 pub fn show_looks_tool_params_ui(
     ui: &mut Ui,
     state: &mut LooksEditorState,
+    session: &mut Session,
     theme: &Cm3Theme,
 ) -> bool {
     let mut changed = false;
@@ -975,6 +991,23 @@ pub fn show_looks_tool_params_ui(
                                 json!([p.default_f64, p.default_f64, p.default_f64]),
                             );
                         }
+                        LooksParamKind::CubeLutAsset => {
+                            looks_select_cube_lut(&mut state.chain[idx].params, None);
+                        }
+                        LooksParamKind::ToneCurves { multi_channel } => {
+                            if multi_channel {
+                                looks_set_curve_channel(
+                                    &mut state.chain[idx].params,
+                                    "master",
+                                    default_5pt_curve(),
+                                );
+                            } else {
+                                looks_set_scurve_points(
+                                    &mut state.chain[idx].params,
+                                    synthesize_scurve_5pt(0.35, 0.5),
+                                );
+                            }
+                        }
                     }
                 }
                 state.dirty = true;
@@ -1016,6 +1049,51 @@ pub fn show_looks_tool_params_ui(
                                         .changed()
                                     {
                                         inst.params.insert(param.key.into(), json!(val));
+                                        // Keep curve JSON synchronized when legacy/parametric sliders move.
+                                        if tool_id == "curves"
+                                            && matches!(
+                                                param.key,
+                                                "shadowLift" | "midGamma" | "highlightGain"
+                                            )
+                                        {
+                                            let lift = inst
+                                                .params
+                                                .get("shadowLift")
+                                                .and_then(Value::as_f64)
+                                                .unwrap_or(0.0);
+                                            let gamma = inst
+                                                .params
+                                                .get("midGamma")
+                                                .and_then(Value::as_f64)
+                                                .unwrap_or(1.0);
+                                            let gain = inst
+                                                .params
+                                                .get("highlightGain")
+                                                .and_then(Value::as_f64)
+                                                .unwrap_or(1.0);
+                                            looks_set_curve_channel(
+                                                &mut inst.params,
+                                                "master",
+                                                synthesize_legacy_curves_5pt(lift, gamma, gain),
+                                            );
+                                        } else if tool_id == "s-curve"
+                                            && matches!(param.key, "strength" | "pivot")
+                                        {
+                                            let strength = inst
+                                                .params
+                                                .get("strength")
+                                                .and_then(Value::as_f64)
+                                                .unwrap_or(0.35);
+                                            let pivot = inst
+                                                .params
+                                                .get("pivot")
+                                                .and_then(Value::as_f64)
+                                                .unwrap_or(0.5);
+                                            looks_set_scurve_points(
+                                                &mut inst.params,
+                                                synthesize_scurve_5pt(strength, pivot),
+                                            );
+                                        }
                                         changed = true;
                                     }
                                 },
@@ -1090,6 +1168,121 @@ pub fn show_looks_tool_params_ui(
                             );
                         });
                     }
+                    LooksParamKind::CubeLutAsset => {
+                        let assets = list_cube_lut_assets(session);
+                        let current_id = inst
+                            .params
+                            .get("lutAsset")
+                            .or_else(|| inst.params.get("lut"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        let selected_label = if current_id.is_empty() {
+                            "None (built-in)".to_owned()
+                        } else {
+                            assets
+                                .iter()
+                                .find(|(aid, _)| aid == &current_id)
+                                .map(|(_, name)| name.clone())
+                                .unwrap_or_else(|| current_id.clone())
+                        };
+                        ui.label(
+                            egui::RichText::new(param.label)
+                                .font(theme.font(FONT_SMALL))
+                                .color(TEXT_MUTED),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let combo_w = (ui.available_width() - 96.0).clamp(110.0, 220.0);
+                            egui::ComboBox::from_id_salt(Id::unique((
+                                "looks_cube_lut_asset",
+                                idx,
+                                param.key,
+                            )))
+                            .selected_text(selected_label.as_str())
+                            .width(combo_w)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(current_id.is_empty(), "None (built-in)")
+                                    .clicked()
+                                {
+                                    looks_select_cube_lut(&mut inst.params, None);
+                                    changed = true;
+                                }
+                                for (aid, name) in &assets {
+                                    if ui
+                                        .selectable_label(aid == &current_id, name.as_str())
+                                        .clicked()
+                                    {
+                                        looks_select_cube_lut(&mut inst.params, Some(aid));
+                                        changed = true;
+                                    }
+                                }
+                            });
+
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                if cm3_prop_button(
+                                    ui,
+                                    "Load .cube…",
+                                    ButtonVariant::Normal,
+                                    false,
+                                    theme,
+                                )
+                                .on_hover_text("Import a .cube 3D/1D LUT file into project assets")
+                                .clicked()
+                                    && let Some(path) = rfd::FileDialog::new()
+                                        .set_title("Load .cube LUT")
+                                        .add_filter("LUT Files (.cube)", &["cube"])
+                                        .pick_file()
+                                    && let Ok(bytes) = std::fs::read(&path)
+                                {
+                                    let fname = path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("custom.cube")
+                                        .to_owned();
+                                    let aid = import_cube_lut_bytes(session, &fname, bytes);
+                                    looks_select_cube_lut(&mut inst.params, Some(&aid));
+                                    changed = true;
+                                }
+                            }
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                let _ = cm3_prop_button(
+                                    ui,
+                                    "Load .cube…",
+                                    ButtonVariant::Normal,
+                                    false,
+                                    theme,
+                                )
+                                .on_hover_text(
+                                    "Import a .cube LUT via the Media panel, then pick it here",
+                                );
+                            }
+                        });
+                        if assets.is_empty() && current_id.is_empty() {
+                            ui.label(
+                                egui::RichText::new(
+                                    "No .cube assets in project yet — click Load .cube… to import.",
+                                )
+                                .font(theme.font(FONT_COMPACT))
+                                .color(TEXT_FAINT),
+                            );
+                        }
+                    }
+                    LooksParamKind::ToneCurves { multi_channel } => {
+                        if show_looks_tone_curves_widget(
+                            ui,
+                            idx,
+                            param.key,
+                            multi_channel,
+                            &mut inst.params,
+                            theme,
+                        ) {
+                            changed = true;
+                        }
+                    }
                 }
             }
         });
@@ -1098,6 +1291,318 @@ pub fn show_looks_tool_params_ui(
         state.dirty = true;
     }
     changed
+}
+
+fn show_looks_tone_curves_widget(
+    ui: &mut Ui,
+    idx: usize,
+    param_key: &str,
+    multi_channel: bool,
+    params: &mut Map<String, Value>,
+    theme: &Cm3Theme,
+) -> bool {
+    const CHANNELS: [(&str, &str, Color32); 4] = [
+        ("master", "Master", Color32::from_rgb(232, 234, 240)),
+        ("r", "R", Color32::from_rgb(235, 92, 92)),
+        ("g", "G", Color32::from_rgb(96, 212, 118)),
+        ("b", "B", Color32::from_rgb(96, 158, 240)),
+    ];
+
+    let ch_state_id = Id::unique(("looks_curves_ch", idx, param_key));
+    let drag_pt_id = Id::unique(("looks_curves_drag", idx, param_key));
+    let mut active_ch = if multi_channel {
+        ui.ctx()
+            .data(|d| d.get_temp::<usize>(ch_state_id))
+            .unwrap_or(0)
+            .min(3)
+    } else {
+        0
+    };
+
+    let mut curve_changed = false;
+    let mut reset_clicked = false;
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if multi_channel {
+            for (ci, &(_, label, col)) in CHANNELS.iter().enumerate() {
+                let selected = active_ch == ci;
+                let btn = egui::Button::new(
+                    egui::RichText::new(label)
+                        .font(theme.font(FONT_COMPACT))
+                        .color(if selected { col } else { TEXT_MUTED }),
+                )
+                .fill(if selected { BG_TITLE } else { BG_BUTTON })
+                .stroke(Stroke::new(
+                    1.0,
+                    if selected { col } else { BORDER_CONTROL },
+                ));
+                if ui.add(btn).clicked() {
+                    active_ch = ci;
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(ch_state_id, active_ch);
+                        d.remove_temp::<usize>(drag_pt_id);
+                    });
+                }
+            }
+        } else {
+            ui.label(
+                egui::RichText::new("Luminance S-Curve")
+                    .font(theme.font(FONT_SMALL))
+                    .color(TEXT_STRONG),
+            );
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("Reset").clicked() {
+                reset_clicked = true;
+            }
+        });
+    });
+
+    let (ch_key, _, ch_color) = CHANNELS[active_ch];
+    let mut pts = if multi_channel {
+        looks_parse_curve_channel(params, ch_key)
+    } else {
+        looks_parse_scurve_points(params)
+    };
+
+    if reset_clicked {
+        pts = if multi_channel {
+            default_5pt_curve()
+        } else {
+            let st = params
+                .get("strength")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.35);
+            let pv = params.get("pivot").and_then(Value::as_f64).unwrap_or(0.5);
+            synthesize_scurve_5pt(st, pv)
+        };
+        curve_changed = true;
+    }
+
+    // Interactive curve canvas
+    let canvas_w = ui.available_width().clamp(160.0, 320.0);
+    let canvas_h = 136.0_f32;
+    let (curve_rect, curve_resp) =
+        ui.allocate_exact_size(Vec2::new(canvas_w, canvas_h), Sense::click_and_drag());
+    let painter = ui.painter().with_clip_rect(curve_rect);
+    painter.rect_filled(curve_rect, CornerRadius::same(3), BG_SUNKEN);
+
+    let grid_col = Color32::from_rgba_unmultiplied(255, 255, 255, 22);
+    for step in [0.25_f32, 0.5, 0.75] {
+        let gx = curve_rect.min.x + curve_rect.width() * step;
+        let gy = curve_rect.min.y + curve_rect.height() * step;
+        painter.line_segment(
+            [
+                Pos2::new(gx, curve_rect.min.y),
+                Pos2::new(gx, curve_rect.max.y),
+            ],
+            Stroke::new(1.0, grid_col),
+        );
+        painter.line_segment(
+            [
+                Pos2::new(curve_rect.min.x, gy),
+                Pos2::new(curve_rect.max.x, gy),
+            ],
+            Stroke::new(1.0, grid_col),
+        );
+    }
+    // Identity diagonal guide
+    painter.line_segment(
+        [
+            Pos2::new(curve_rect.min.x, curve_rect.max.y),
+            Pos2::new(curve_rect.max.x, curve_rect.min.y),
+        ],
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 36)),
+    );
+
+    let to_screen = |pt: [f64; 2]| -> Pos2 {
+        Pos2::new(
+            curve_rect.min.x + (pt[0] as f32) * curve_rect.width(),
+            curve_rect.max.y - (pt[1] as f32) * curve_rect.height(),
+        )
+    };
+
+    // Subtle ghost curves for inactive RGB channels
+    if multi_channel {
+        for (ci, &(other_key, _, other_col)) in CHANNELS.iter().enumerate() {
+            if ci == active_ch {
+                continue;
+            }
+            let other_pts = looks_parse_curve_channel(params, other_key);
+            let sample_line: Vec<Pos2> = (0..=32)
+                .map(|s| {
+                    let x = s as f64 / 32.0;
+                    to_screen([x, looks_eval_curve_preview(&other_pts, x)])
+                })
+                .collect();
+            painter.add(Shape::line(
+                sample_line,
+                Stroke::new(1.0, color32_with_alpha(other_col, 72)),
+            ));
+        }
+    }
+
+    // Canvas drag / double-click add / right-click remove interactions
+    if curve_resp.drag_started()
+        && let Some(pointer) = curve_resp.interact_pointer_pos()
+        && let Some((best_i, dist)) = pts
+            .iter()
+            .enumerate()
+            .map(|(pi, &pt)| (pi, to_screen(pt).distance(pointer)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+        && dist <= 16.0
+    {
+        ui.ctx().data_mut(|d| d.insert_temp(drag_pt_id, best_i));
+    }
+    if curve_resp.dragged()
+        && let Some(pointer) = curve_resp.interact_pointer_pos()
+        && let Some(di) = ui.ctx().data(|d| d.get_temp::<usize>(drag_pt_id))
+        && di < pts.len()
+    {
+        let nx = f64::from(
+            ((pointer.x - curve_rect.min.x) / curve_rect.width().max(1.0)).clamp(0.0, 1.0),
+        );
+        let ny = f64::from(
+            ((curve_rect.max.y - pointer.y) / curve_rect.height().max(1.0)).clamp(0.0, 1.0),
+        );
+        pts[di] = [nx, ny];
+        curve_changed = true;
+    }
+    if curve_resp.drag_stopped() {
+        ui.ctx().data_mut(|d| d.remove_temp::<usize>(drag_pt_id));
+    }
+    if curve_resp.double_clicked()
+        && pts.len() < 12
+        && let Some(pointer) = curve_resp.interact_pointer_pos()
+    {
+        let nx = f64::from(
+            ((pointer.x - curve_rect.min.x) / curve_rect.width().max(1.0)).clamp(0.0, 1.0),
+        );
+        let ny = f64::from(
+            ((curve_rect.max.y - pointer.y) / curve_rect.height().max(1.0)).clamp(0.0, 1.0),
+        );
+        pts.push([nx, ny]);
+        curve_changed = true;
+    }
+    if curve_resp.secondary_clicked()
+        && pts.len() > 2
+        && let Some(pointer) = curve_resp.interact_pointer_pos()
+        && let Some((best_i, dist)) = pts
+            .iter()
+            .enumerate()
+            .map(|(pi, &pt)| (pi, to_screen(pt).distance(pointer)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+        && dist <= 14.0
+    {
+        pts.remove(best_i);
+        curve_changed = true;
+    }
+
+    // Paint smooth monotone cubic curve + control point handles
+    let mut sorted_preview = pts.clone();
+    sorted_preview.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    let smooth_poly: Vec<Pos2> = (0..=48)
+        .map(|s| {
+            let x = s as f64 / 48.0;
+            to_screen([x, looks_eval_curve_preview(&sorted_preview, x)])
+        })
+        .collect();
+    painter.add(Shape::line(smooth_poly, Stroke::new(2.0, ch_color)));
+    for &pt in &pts {
+        let pos = to_screen(pt);
+        painter.circle_filled(pos, 4.2, ch_color);
+        painter.circle_stroke(pos, 4.2, Stroke::new(1.0, BG_PANEL));
+    }
+    painter.rect_stroke(
+        curve_rect,
+        CornerRadius::same(3),
+        Stroke::new(1.0, BORDER_CONTROL),
+        StrokeKind::Inside,
+    );
+
+    ui.label(
+        egui::RichText::new(
+            "Drag points • Double-click canvas to add • Right-click point to remove",
+        )
+        .font(theme.font(FONT_COMPACT))
+        .color(TEXT_FAINT),
+    );
+
+    // Editable numeric control-point rows (Shadow / Low-Mid / Midtone / High-Mid / Highlight)
+    let mut remove_idx = None;
+    let pts_len = pts.len();
+    for (pi, pt) in pts.iter_mut().enumerate() {
+        let pt_label = if pts_len == 5 {
+            CURVE_TONE_LABELS[pi]
+        } else if pi == 0 {
+            "Shadow"
+        } else if pi + 1 == pts_len {
+            "Highlight"
+        } else {
+            "Point"
+        };
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                Vec2::new(64.0, 18.0),
+                egui::Label::new(
+                    egui::RichText::new(pt_label)
+                        .font(theme.font(FONT_COMPACT))
+                        .color(TEXT_MUTED),
+                )
+                .truncate(),
+            );
+            if ui
+                .add(
+                    egui::DragValue::new(&mut pt[0])
+                        .prefix("In:")
+                        .range(0.0..=1.0)
+                        .speed(0.01)
+                        .max_decimals(2),
+                )
+                .changed()
+            {
+                curve_changed = true;
+            }
+            if ui
+                .add(
+                    egui::DragValue::new(&mut pt[1])
+                        .prefix("Out:")
+                        .range(0.0..=1.0)
+                        .speed(0.01)
+                        .max_decimals(2),
+                )
+                .changed()
+            {
+                curve_changed = true;
+            }
+            if pts_len > 2 && ui.small_button("×").clicked() {
+                remove_idx = Some(pi);
+            }
+        });
+    }
+    if let Some(ri) = remove_idx {
+        pts.remove(ri);
+        curve_changed = true;
+    }
+
+    ui.horizontal(|ui| {
+        if pts.len() < 12 && ui.small_button("+ Add Point").clicked() {
+            let mid_x = 0.5;
+            let mid_y = looks_eval_curve_preview(&sorted_preview, mid_x);
+            pts.push([mid_x, mid_y]);
+            curve_changed = true;
+        }
+    });
+
+    if curve_changed {
+        if multi_channel {
+            looks_set_curve_channel(params, ch_key, pts);
+        } else {
+            looks_set_scurve_points(params, pts);
+        }
+    }
+    curve_changed
 }
 
 #[must_use]

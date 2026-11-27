@@ -330,13 +330,13 @@ pub fn dispatch_shortcuts_with_clipboard(
                         Key::ArrowRight => {
                             p.arrow_right.get_or_insert(m);
                         }
-                        Key::J => {
+                        Key::J if !*repeat => {
                             p.j.get_or_insert(m);
                         }
-                        Key::K => {
+                        Key::K if !*repeat => {
                             p.k.get_or_insert(m);
                         }
-                        Key::L => {
+                        Key::L if !*repeat => {
                             p.l.get_or_insert(m);
                         }
                         Key::C => {
@@ -417,10 +417,13 @@ pub fn dispatch_shortcuts_with_clipboard(
         p
     });
 
+    let graph_focused = graph_editor.open && graph_editor.window_focused;
+
     // --- Escape: cancel active drag / rename or close Graph Editor ---
     // Only claim Escape when something was actually cancelled or closed AND no foreground
     // transient popover (color picker, dropdown, easing menu) is open or already consumed
-    // Escape during this frame.
+    // Escape during this frame. When Graph Editor is focused with selected keyframes, yield
+    // Escape so Graph Editor deselects keyframes before a second Escape closes the window.
     if let Some(m) = pressed.escape
         && no_mods(m)
         && !super::controls::is_transient_popover_open(ctx)
@@ -429,13 +432,21 @@ pub fn dispatch_shortcuts_with_clipboard(
         let cancelled = timeline.cancel_active_interaction(session)
             || graph_editor.cancel_active_interaction(session)
             || viewport.cancel_active_interaction(session);
-        let closed_graph = if !cancelled && graph_editor.open {
+        if cancelled {
+            outcome.cancel_or_close = true;
+            outcome.mark_handled(Key::Escape);
+            return outcome;
+        }
+        if graph_focused {
+            graph_editor.selected_keys.retain(|gk| {
+                keyframe_exists_in_session(session, &gk.target_id, &gk.property, gk.local_frame())
+            });
+            if !graph_editor.selected_keys.is_empty() {
+                return outcome;
+            }
+        }
+        if graph_editor.open {
             graph_editor.open = false;
-            true
-        } else {
-            false
-        };
-        if cancelled || closed_graph {
             outcome.cancel_or_close = true;
             outcome.mark_handled(Key::Escape);
             return outcome;
@@ -530,7 +541,6 @@ pub fn dispatch_shortcuts_with_clipboard(
         precompose_selected_clips(session, &mut outcome);
         return outcome;
     }
-    let graph_focused = graph_editor.open && graph_editor.window_focused;
     let copy_triggered = pressed.ev_copy || pressed.c.is_some_and(cmd_only);
     if !graph_focused && copy_triggered {
         smart_copy_selection(ctx, session, timeline, active_tab, clipboard, &mut outcome);
@@ -602,7 +612,8 @@ pub fn dispatch_shortcuts_with_clipboard(
         );
         return outcome;
     }
-    if let Some(m) = pressed.arrow_left
+    if !graph_focused
+        && let Some(m) = pressed.arrow_left
         && (no_mods(m) || shift_only(m))
     {
         let delta = if m.shift { -5.0 } else { -1.0 };
@@ -614,7 +625,8 @@ pub fn dispatch_shortcuts_with_clipboard(
         );
         return outcome;
     }
-    if let Some(m) = pressed.arrow_right
+    if !graph_focused
+        && let Some(m) = pressed.arrow_right
         && (no_mods(m) || shift_only(m))
     {
         let delta = if m.shift { 5.0 } else { 1.0 };
@@ -629,7 +641,7 @@ pub fn dispatch_shortcuts_with_clipboard(
     if let Some(m) = pressed.j
         && no_mods(m)
     {
-        let next = session.playback.speed - 0.25;
+        let next = next_shuttle_reverse_speed(session.playback.speed);
         exec(
             session,
             Command::SetSpeed { speed: next },
@@ -638,7 +650,8 @@ pub fn dispatch_shortcuts_with_clipboard(
         );
         return outcome;
     }
-    if let Some(m) = pressed.k
+    if !graph_focused
+        && let Some(m) = pressed.k
         && no_mods(m)
     {
         let was_playing = session.playback.is_playing();
@@ -648,6 +661,7 @@ pub fn dispatch_shortcuts_with_clipboard(
             Key::K,
             &mut outcome,
         );
+        session.playback.last_speed = 1.0;
         if was_playing && !session.playback.is_playing() {
             snap_paused_playhead_to_integer(session);
         }
@@ -656,7 +670,7 @@ pub fn dispatch_shortcuts_with_clipboard(
     if let Some(m) = pressed.l
         && no_mods(m)
     {
-        let next = session.playback.speed + 0.25;
+        let next = next_shuttle_forward_speed(session.playback.speed);
         exec(
             session,
             Command::SetSpeed { speed: next },
@@ -667,7 +681,8 @@ pub fn dispatch_shortcuts_with_clipboard(
     }
 
     // --- Viewport Mode Toggles & Pro Tools ---
-    if let Some(m) = pressed.v
+    if !graph_focused
+        && let Some(m) = pressed.v
         && no_mods(m)
     {
         viewport.active_draw_tool = None;
@@ -706,7 +721,8 @@ pub fn dispatch_shortcuts_with_clipboard(
         outcome.mark_handled(Key::E);
         return outcome;
     }
-    if let Some(m) = pressed.r
+    if !graph_focused
+        && let Some(m) = pressed.r
         && no_mods(m)
     {
         viewport.gizmo_3d_mode = Gizmo3DMode::Scale;
@@ -737,7 +753,8 @@ pub fn dispatch_shortcuts_with_clipboard(
         outcome.mark_handled(Key::C);
         return outcome;
     }
-    if let Some(m) = pressed.t
+    if !graph_focused
+        && let Some(m) = pressed.t
         && no_mods(m)
     {
         session.playback.toggle_transform_controls_2d();
@@ -746,7 +763,8 @@ pub fn dispatch_shortcuts_with_clipboard(
     }
 
     // --- Timeline Clip Editing & Zoom ---
-    if let Some(m) = pressed.s
+    if !graph_focused
+        && let Some(m) = pressed.s
         && no_mods(m)
     {
         split_selected_clips_at_playhead(session, &mut outcome);
@@ -774,6 +792,13 @@ pub fn dispatch_shortcuts_with_clipboard(
             && !graph_editor.selected_keys.is_empty()
         {
             delete_graph_editor_keyframes(session, graph_editor, key, &mut outcome);
+        } else if focused_panel == PanelFocus::Viewport
+            && (viewport.selected_path_vertex.is_some()
+                || viewport.selected_path_vertices.is_some())
+        {
+            // Leave Delete/Backspace unconsumed so the viewport Bezier path editor
+            // deletes the selected vertices rather than removing the clip.
+            return outcome;
         } else {
             let allow_clip_delete = matches!(
                 focused_panel,
@@ -783,7 +808,8 @@ pub fn dispatch_shortcuts_with_clipboard(
         }
         return outcome;
     }
-    if let Some(m) = pressed.equals
+    if !graph_focused
+        && let Some(m) = pressed.equals
         && (no_mods(m) || shift_only(m) || cmd_only(m) || cmd_shift(m))
     {
         timeline.zoom_at_playhead(true, session.playback.current_frame, session.document().fps);
@@ -800,7 +826,8 @@ pub fn dispatch_shortcuts_with_clipboard(
         outcome.mark_handled(Key::Equals);
         return outcome;
     }
-    if let Some(m) = pressed.plus
+    if !graph_focused
+        && let Some(m) = pressed.plus
         && (no_mods(m) || shift_only(m) || cmd_only(m) || cmd_shift(m))
     {
         timeline.zoom_at_playhead(true, session.playback.current_frame, session.document().fps);
@@ -815,7 +842,8 @@ pub fn dispatch_shortcuts_with_clipboard(
         outcome.mark_handled(Key::Plus);
         return outcome;
     }
-    if let Some(m) = pressed.minus
+    if !graph_focused
+        && let Some(m) = pressed.minus
         && (no_mods(m) || cmd_only(m))
     {
         timeline.zoom_at_playhead(
@@ -834,7 +862,8 @@ pub fn dispatch_shortcuts_with_clipboard(
         outcome.mark_handled(Key::Minus);
         return outcome;
     }
-    if let Some(m) = pressed.backslash
+    if !graph_focused
+        && let Some(m) = pressed.backslash
         && no_mods(m)
     {
         timeline.fit_sequence(session.document().sequence_length, session.document().fps);
@@ -904,6 +933,9 @@ fn keyframe_exists_in_session(
     property: &str,
     frame: f64,
 ) -> bool {
+    if super::timeline::is_custom_keyframe_target(target_id) {
+        return super::timeline::mask_or_shape_keyframe_exists(session, target_id, property, frame);
+    }
     let doc = session.document();
     let props = if target_id == "sequence" {
         Some(&doc.sequence_properties)
@@ -1077,15 +1109,42 @@ fn delete_selected(
         let kfs = session.selection.keyframes.clone();
         if session.begin_transaction("Delete Keyframes").is_ok() {
             let mut changed = false;
+            let mut deleted_refs = Vec::new();
             for kf in kfs {
-                match session.execute(Command::DeleteKeyframe {
-                    target_id: kf.target_id,
-                    property: kf.property,
-                    frame: kf.frame,
-                }) {
-                    Ok(_) => changed = true,
-                    Err(err) => outcome.last_error = Some(err.to_string()),
+                let res = if super::timeline::is_custom_keyframe_target(&kf.target_id) {
+                    super::timeline::delete_mask_or_shape_keyframe(
+                        session,
+                        &kf.target_id,
+                        &kf.property,
+                        kf.frame,
+                    )
+                    .map(|_| ())
+                } else {
+                    session
+                        .execute(Command::DeleteKeyframe {
+                            target_id: kf.target_id.clone(),
+                            property: kf.property.clone(),
+                            frame: kf.frame,
+                        })
+                        .map(|_| ())
+                        .map_err(|err| err.to_string())
+                };
+                match res {
+                    Ok(()) => {
+                        changed = true;
+                        deleted_refs.push(kf);
+                    }
+                    Err(err) => outcome.last_error = Some(err),
                 }
+            }
+            if !deleted_refs.is_empty() {
+                session.selection.keyframes.retain(|sel| {
+                    !deleted_refs.iter().any(|d| {
+                        sel.target_id == d.target_id
+                            && sel.property == d.property
+                            && sel.matches_frame(d.frame)
+                    })
+                });
             }
             let _ = session.commit_transaction(changed);
             outcome.mark_handled(key);
@@ -1528,6 +1587,38 @@ struct PressedSnapshot {
     escape: Option<Modifiers>,
 }
 
+/// Computes the next forward JKL shuttle playback speed (`L`):
+/// starts at `1.0x` when paused or playing in reverse, and steps `1x -> 2x -> 4x -> 8x`.
+#[must_use]
+pub(crate) fn next_shuttle_forward_speed(current: f64) -> f64 {
+    const STEPS: [f64; 4] = [1.0, 2.0, 4.0, 8.0];
+    if !current.is_finite() || current <= 1e-6 {
+        return STEPS[0];
+    }
+    for &step in &STEPS {
+        if current < step - 1e-6 {
+            return step;
+        }
+    }
+    STEPS[STEPS.len() - 1]
+}
+
+/// Computes the next reverse JKL shuttle playback speed (`J`):
+/// starts at `-1.0x` when paused or playing forward, and steps `-1x -> -2x -> -4x -> -8x`.
+#[must_use]
+pub(crate) fn next_shuttle_reverse_speed(current: f64) -> f64 {
+    const STEPS: [f64; 4] = [-1.0, -2.0, -4.0, -8.0];
+    if !current.is_finite() || current >= -1e-6 {
+        return STEPS[0];
+    }
+    for &step in &STEPS {
+        if current > step + 1e-6 {
+            return step;
+        }
+    }
+    STEPS[STEPS.len() - 1]
+}
+
 fn no_mods(m: Modifiers) -> bool {
     !m.command && !m.ctrl && !m.shift && !m.alt
 }
@@ -1575,6 +1666,16 @@ mod tests {
             outcome = dispatch_shortcuts(ui.ctx(), session, timeline, graph, viewport);
         });
         full.textures_delta.clear();
+        let mut release = egui::RawInput::default();
+        release.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers,
+        });
+        let mut release_full = ctx.run_ui(release, |_| {});
+        release_full.textures_delta.clear();
         outcome
     }
 
@@ -1904,6 +2005,80 @@ mod tests {
         );
         assert!(!session.playback.is_playing());
         assert!((session.playback.current_frame - 47.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn jkl_shuttle_steps_forward_reverse_and_stops_cleanly() {
+        let ctx = Context::default();
+        let mut session = Session::new();
+        let mut timeline = TimelineViewState::new();
+        let mut graph = GraphEditorState::new();
+        let mut viewport = ViewportState::new();
+
+        // L from paused starts at 1x and steps 1x -> 2x -> 4x -> 8x -> 8x.
+        for expected in [1.0, 2.0, 4.0, 8.0, 8.0] {
+            let out = run_key_event(
+                &ctx,
+                Key::L,
+                Modifiers::NONE,
+                &mut session,
+                &mut timeline,
+                &mut graph,
+                &mut viewport,
+            );
+            assert!(out.handled_any);
+            assert_eq!(out.handled_keys, vec![Key::L]);
+            assert!((session.playback.speed - expected).abs() < 1e-6);
+        }
+
+        // J from forward immediately reverses to -1x and steps -1x -> -2x -> -4x -> -8x -> -8x.
+        for expected in [-1.0, -2.0, -4.0, -8.0, -8.0] {
+            let out = run_key_event(
+                &ctx,
+                Key::J,
+                Modifiers::NONE,
+                &mut session,
+                &mut timeline,
+                &mut graph,
+                &mut viewport,
+            );
+            assert!(out.handled_any);
+            assert_eq!(out.handled_keys, vec![Key::J]);
+            assert!((session.playback.speed - expected).abs() < 1e-6);
+        }
+
+        // L from reverse immediately switches to +1x.
+        let out_fwd = run_key_event(
+            &ctx,
+            Key::L,
+            Modifiers::NONE,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert!(out_fwd.handled_any);
+        assert!((session.playback.speed - 1.0).abs() < 1e-6);
+
+        // K pauses cleanly, snaps fractional playhead to integer, and resets last_speed to 1x.
+        session.playback.speed = 4.0;
+        session.playback.last_speed = 4.0;
+        session.playback.current_frame = 22.7;
+        let out_stop = run_key_event(
+            &ctx,
+            Key::K,
+            Modifiers::NONE,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert!(out_stop.handled_any);
+        assert_eq!(out_stop.handled_keys, vec![Key::K]);
+        assert!(!session.playback.is_playing());
+        assert!((session.playback.speed - 0.0).abs() < 1e-6);
+        assert!((session.playback.last_speed - 1.0).abs() < 1e-6);
+        assert!((session.playback.current_frame - 23.0).abs() < 1e-6);
     }
 
     #[test]
@@ -2896,5 +3071,95 @@ mod tests {
             shortcut_out2.cancel_or_close && !graph.open,
             "Second Escape after Color Picker closed must dismiss Graph Editor"
         );
+    }
+
+    #[test]
+    fn graph_editor_focused_does_not_hijack_graph_shortcuts() {
+        let ctx = Context::default();
+        let mut session = Session::new();
+        let mut timeline = TimelineViewState::new();
+        let mut graph = GraphEditorState::new();
+        let mut viewport = ViewportState::new();
+
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session
+            .selection
+            .select_clip(clip_id.clone(), Some("scene"), false);
+        session
+            .execute(Command::SetKeyframe {
+                target_id: clip_id.clone(),
+                property: "opacity".to_owned(),
+                frame: 0.0,
+                value: serde_json::json!(1.0),
+                tween: Some(1),
+            })
+            .expect("kf 0");
+        session
+            .execute(Command::SetKeyframe {
+                target_id: clip_id.clone(),
+                property: "opacity".to_owned(),
+                frame: 20.0,
+                value: serde_json::json!(0.5),
+                tween: Some(1),
+            })
+            .expect("kf 20");
+        session.playback.current_frame = 10.0;
+
+        graph.open = true;
+        graph.window_focused = true;
+        graph.selected_keys = vec![GraphKeyId::new(&clip_id, "opacity", None, 20.0)];
+
+        let initial_zoom = timeline.zoom;
+        let initial_clips = session.document().video_tracks[0].clips.len();
+
+        for key in [
+            Key::ArrowLeft,
+            Key::ArrowRight,
+            Key::Equals,
+            Key::Plus,
+            Key::Minus,
+            Key::Backslash,
+            Key::V,
+            Key::S,
+            Key::T,
+            Key::R,
+            Key::K,
+            Key::Escape,
+        ] {
+            let out = run_key_event(
+                &ctx,
+                key,
+                Modifiers::NONE,
+                &mut session,
+                &mut timeline,
+                &mut graph,
+                &mut viewport,
+            );
+            assert!(
+                !out.handled_any,
+                "dispatch_shortcuts must NOT consume {key:?} while Graph Editor is focused"
+            );
+        }
+
+        // Verify none of the global side effects fired while Graph Editor was focused.
+        assert!((session.playback.current_frame - 10.0).abs() < 1e-6);
+        assert!((timeline.zoom - initial_zoom).abs() < 1e-9);
+        assert_eq!(
+            session.document().video_tracks[0].clips.len(),
+            initial_clips
+        );
+        assert!(graph.open);
+
+        // Global Cmd+G still toggles Graph Editor closed cleanly.
+        let out_cmd_g = run_key_event(
+            &ctx,
+            Key::G,
+            Modifiers::COMMAND,
+            &mut session,
+            &mut timeline,
+            &mut graph,
+            &mut viewport,
+        );
+        assert!(out_cmd_g.handled_any && out_cmd_g.toggle_graph_editor && !graph.open);
     }
 }

@@ -10,7 +10,7 @@ use crate::model::{
 use super::effects::serialize_custom_properties;
 use super::tracks::{
     finite_array3, finite_array4, finite_f64, is_non_default_scalar, remap_json_value, remap_str,
-    serialize_gradient_stops, serialize_property_track, serialize_property_value,
+    serialize_gradient_stops, serialize_property_track, serialize_static_or_animated_track,
 };
 
 #[derive(Default)]
@@ -284,10 +284,12 @@ pub(super) fn serialize_object3d_with_ctx(
         }
         Object3DKind::Model(model) => {
             out.insert("type".to_owned(), json!(2));
-            out.insert(
-                "objectType".to_owned(),
-                json!(model.preset_type.unwrap_or(1)),
-            );
+            let object_type = match (model.preset_type, model.asset_id.is_some()) {
+                (Some(pt), _) => pt,
+                (None, true) => 0,
+                (None, false) => 1,
+            };
+            out.insert("objectType".to_owned(), json!(object_type));
             if !model.model_properties.is_empty() {
                 let mut mp = Map::new();
                 for (k, v) in &model.model_properties {
@@ -955,6 +957,11 @@ pub(super) fn serialize_light(
     props.insert("penumbra".to_owned(), json!(finite_f64(light.penumbra)));
     props.insert("decay".to_owned(), json!(finite_f64(light.decay)));
     props.insert("distance".to_owned(), json!(finite_f64(light.distance)));
+    props.insert("shadowMapSize".to_owned(), json!(light.shadow_map_size));
+    props.insert(
+        "shadowBias".to_owned(),
+        json!(finite_f64(light.shadow_bias)),
+    );
 }
 
 pub(super) fn serialize_camera(
@@ -1072,11 +1079,12 @@ pub(super) fn serialize_camera(
                 "relative": u32::from(vib.relative),
                 "seed": vib.seed,
                 "enablePosition": u32::from(vib.enable_position),
-                "positionAmplitude": serialize_property_value(&vib.position_amplitude.value, remap),
-                "positionFrequency": serialize_property_value(&vib.position_frequency.value, remap),
+                "positionAmplitude": serialize_static_or_animated_track(&vib.position_amplitude, remap),
+                "positionFrequency": serialize_static_or_animated_track(&vib.position_frequency, remap),
                 "enableRotation": u32::from(vib.enable_rotation),
-                "rotationAmplitude": serialize_property_value(&vib.rotation_amplitude.value, remap),
-                "rotationFrequency": serialize_property_value(&vib.rotation_frequency.value, remap),
+                "rotationAmplitude": serialize_static_or_animated_track(&vib.rotation_amplitude, remap),
+                "rotationFrequency": serialize_static_or_animated_track(&vib.rotation_frequency, remap),
+                "frequency": serialize_static_or_animated_track(&vib.frequency, remap),
             }),
         );
     }
@@ -1197,8 +1205,8 @@ pub(crate) fn serialize_material(
                 json!({
                     "color": serialize_property_track(&m.color, remap),
                     "emissive": serialize_property_track(&m.emissive, remap),
-                    "roughness": serialize_property_value(&m.roughness.value, remap),
-                    "metalness": serialize_property_value(&m.metalness.value, remap),
+                    "roughness": serialize_static_or_animated_track(&m.roughness, remap),
+                    "metalness": serialize_static_or_animated_track(&m.metalness, remap),
                     "texture": m.texture.as_ref().map_or(Value::Null, |t| Value::String(remap_str(t, remap))),
                     "transparent": u32::from(m.transparent),
                     "opacity": serialize_property_track(&m.opacity, remap),

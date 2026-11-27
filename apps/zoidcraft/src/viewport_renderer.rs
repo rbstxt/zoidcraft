@@ -20,6 +20,7 @@ pub(crate) struct ViewportRenderKey {
     pub(crate) editing_camera: bool,
     pub(crate) active_camera_hash: u64,
     pub(crate) camera_bits: [u32; 9],
+    pub(crate) exact_effects: bool,
 }
 
 impl ViewportRenderKey {
@@ -32,6 +33,7 @@ impl ViewportRenderKey {
             editing_camera: self.editing_camera,
             active_camera_hash: self.active_camera_hash,
             camera_bits: self.camera_bits,
+            exact_effects: self.exact_effects,
         }
     }
 }
@@ -48,6 +50,7 @@ pub(crate) struct PreviewCacheContext {
     pub(crate) editing_camera: bool,
     pub(crate) active_camera_hash: u64,
     pub(crate) camera_bits: [u32; 9],
+    pub(crate) exact_effects: bool,
 }
 
 pub(crate) struct CachedPreviewEntry<T> {
@@ -254,6 +257,29 @@ pub(crate) fn pack_camera_bits(cam: &EditorCameraState) -> [u32; 9] {
     ]
 }
 
+/// Resolves the effective preview resolution divisor from Player+ settings.
+///
+/// When `exact_effects` is `true` (or Player+ is disabled), returns `1` to force full-resolution
+/// effect evaluation without reduced-resolution downsampling; when `false`, allows the selected
+/// `preview_quality` and optional `adaptive_quality` divisor optimization.
+pub(crate) fn effective_preview_divisor(
+    player_plus_enabled: bool,
+    preview_quality: ui::layout::PreviewQuality,
+    adaptive_quality: bool,
+    adaptive_divisor: u32,
+    exact_effects: bool,
+) -> u32 {
+    if !player_plus_enabled || exact_effects {
+        return 1;
+    }
+    let base_div = preview_quality.divisor();
+    if adaptive_quality {
+        base_div.max(adaptive_divisor.clamp(1, 8))
+    } else {
+        base_div
+    }
+}
+
 /// Computes preview texture dimensions in sequence pixels, independent of the viewport layout.
 pub(crate) fn compute_preview_render_resolution(
     seq_resolution: [u32; 2],
@@ -282,6 +308,7 @@ pub(crate) struct ViewportGpuPresenter {
     pub(crate) last_render_key: Option<ViewportRenderKey>,
     pub(crate) last_active_composition_id: Option<Uuid>,
     pub(crate) cache_budget_mib: u32,
+    pub(crate) last_sharp_upscale: bool,
     pub(crate) preview_cache: PreviewFrameCache<wgpu::Texture>,
 }
 
@@ -301,8 +328,32 @@ impl ViewportGpuPresenter {
             last_render_key: None,
             last_active_composition_id: None,
             cache_budget_mib: default_mib,
+            last_sharp_upscale: false,
             preview_cache: PreviewFrameCache::new(default_bytes),
         })
+    }
+
+    pub(crate) fn sync_sharp_upscale(&mut self, sharp: bool) {
+        if self.last_sharp_upscale == sharp {
+            return;
+        }
+        self.last_sharp_upscale = sharp;
+        if let (Some(existing_id), Some(target)) =
+            (self.egui_texture_id, self.display_target.as_ref())
+        {
+            let filter = if sharp {
+                wgpu::FilterMode::Nearest
+            } else {
+                wgpu::FilterMode::Linear
+            };
+            let mut renderer = self.render_state.renderer.write();
+            renderer.update_egui_texture_from_wgpu_texture(
+                &self.render_state.device,
+                &target.view,
+                filter,
+                existing_id,
+            );
+        }
     }
 
     pub(crate) fn texture_id(&self) -> Option<egui::TextureId> {
@@ -337,6 +388,12 @@ impl ViewportGpuPresenter {
 
     pub(crate) fn preview_cache_spans(&mut self) -> &[(f64, f64)] {
         self.preview_cache.cached_spans()
+    }
+
+    pub(crate) fn is_frame_cached(&self, frame: f64) -> bool {
+        self.preview_cache
+            .entries
+            .contains_key(&(frame.floor().max(0.0) as i64))
     }
 
     pub(crate) fn copy_texture_full(
@@ -659,19 +716,24 @@ impl ViewportGpuPresenter {
         };
 
         {
+            let filter = if self.last_sharp_upscale {
+                wgpu::FilterMode::Nearest
+            } else {
+                wgpu::FilterMode::Linear
+            };
             let mut renderer = self.render_state.renderer.write();
             if let Some(existing_id) = self.egui_texture_id {
                 renderer.update_egui_texture_from_wgpu_texture(
                     &self.render_state.device,
                     &target.view,
-                    wgpu::FilterMode::Linear,
+                    filter,
                     existing_id,
                 );
             } else {
                 let id = renderer.register_native_texture(
                     &self.render_state.device,
                     &target.view,
-                    wgpu::FilterMode::Linear,
+                    filter,
                 );
                 self.egui_texture_id = Some(id);
             }
@@ -804,7 +866,7 @@ pub(crate) fn selected_single_scene3d_clip_uuid(session: &Session) -> Option<Uui
     }
     let clip_id_str = session.selection.clip_ids.first()?;
     let clip_uuid = Uuid::parse_str(clip_id_str).ok()?;
-    let is_scene3d = session.project.sequence.video_tracks.iter().any(|track| {
+    let is_scene3d = session.active_sequence().video_tracks.iter().any(|track| {
         track.clips.iter().any(|clip| {
             clip.id == clip_uuid && matches!(clip.layer.kind, LayerKind::Scene3D { .. })
         })
@@ -1543,12 +1605,34 @@ impl ZoidCraftApp {
         &mut self,
     ) -> (f64, u32, u32, bool, ViewportRenderKey) {
         let player_plus_enabled = self.session.plugins.is_enabled("player-plus");
+        let exact_effects = player_plus_enabled && self.workspace.player_plus.exact_effects;
         let seq_res = self.session.document().resolution;
-        let divisor = if player_plus_enabled {
-            self.workspace.player_plus.preview_quality.divisor()
+        if player_plus_enabled && !exact_effects && self.workspace.player_plus.adaptive_quality {
+            if self.session.playback.is_playing() {
+                let samples = &self.viewport.last_frame_times;
+                if samples.len() >= 6 {
+                    let avg_ms = samples.iter().copied().sum::<f32>() / samples.len() as f32;
+                    let budget_ms = 1000.0 / (self.session.document().fps.max(1.0) as f32);
+                    let cur = self.workspace.player_plus.adaptive_divisor.clamp(1, 8);
+                    if avg_ms > budget_ms * 1.5 && cur < 8 {
+                        self.workspace.player_plus.adaptive_divisor = (cur * 2).min(8);
+                    } else if avg_ms < budget_ms * 0.85 && cur > 1 {
+                        self.workspace.player_plus.adaptive_divisor = (cur / 2).max(1);
+                    }
+                }
+            } else {
+                self.workspace.player_plus.adaptive_divisor = 1;
+            }
         } else {
-            1
-        };
+            self.workspace.player_plus.adaptive_divisor = 1;
+        }
+        let divisor = effective_preview_divisor(
+            player_plus_enabled,
+            self.workspace.player_plus.preview_quality,
+            self.workspace.player_plus.adaptive_quality,
+            self.workspace.player_plus.adaptive_divisor,
+            exact_effects,
+        );
         let max_texture_dimension = self.renderer.as_ref().map_or_else(
             || wgpu::Limits::default().max_texture_dimension_2d,
             |renderer| {
@@ -1585,6 +1669,7 @@ impl ZoidCraftApp {
             } else {
                 [0; 9]
             },
+            exact_effects,
         };
         (frame, render_w, render_h, editing_camera, key)
     }
@@ -1614,9 +1699,11 @@ impl ZoidCraftApp {
 
         let (frame, render_w, render_h, editing_camera, key) = self.current_viewport_render_key();
         let active_camera_id = self.viewport.active_camera_id.clone();
+        let sharp_upscale = player_plus_enabled && self.workspace.player_plus.sharp_upscale;
         let render_result = {
             let renderer = self.renderer.as_mut()?;
             renderer.sync_cache_budget(cache_budget);
+            renderer.sync_sharp_upscale(sharp_upscale);
             renderer
                 .render_viewport_if_dirty(
                     &mut self.session,
@@ -1766,5 +1853,86 @@ impl ZoidCraftApp {
             });
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod viewport_renderer_unit_tests {
+    use super::*;
+    use crate::ui::layout::PreviewQuality;
+
+    #[test]
+    fn exact_effects_forces_full_resolution_divisor() {
+        assert_eq!(
+            effective_preview_divisor(true, PreviewQuality::Quarter, false, 1, false),
+            4
+        );
+        assert_eq!(
+            effective_preview_divisor(true, PreviewQuality::Quarter, false, 1, true),
+            1
+        );
+        assert_eq!(
+            effective_preview_divisor(true, PreviewQuality::Half, true, 4, false),
+            4
+        );
+        assert_eq!(
+            effective_preview_divisor(true, PreviewQuality::Half, true, 4, true),
+            1
+        );
+        assert_eq!(
+            effective_preview_divisor(false, PreviewQuality::Eighth, true, 8, false),
+            1
+        );
+    }
+
+    #[test]
+    fn selected_single_scene3d_clip_uuid_resolves_inside_active_precomp() {
+        let mut session = Session::new();
+        let created = session
+            .execute(Command::CreateComposition {
+                name: "Nested 3D Comp".to_owned(),
+                resolution: [1280, 720],
+                fps: 30,
+                length_frames: 120,
+            })
+            .expect("create nested composition");
+        let comp_id = Uuid::parse_str(
+            created
+                .get("comp_id")
+                .and_then(|v| v.as_str())
+                .expect("comp_id string"),
+        )
+        .expect("comp_id uuid");
+
+        session
+            .execute(Command::SetActiveComposition {
+                comp_id: Some(comp_id),
+            })
+            .expect("enter precomp");
+        let track_id = session.document().video_tracks[0].id.clone();
+        let added = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "scene".to_owned(),
+                name: Some("Nested Scene".to_owned()),
+                start: 0.0,
+                length: 60.0,
+            })
+            .expect("add 3D scene clip inside precomp");
+        let scene_clip_id = added
+            .get("clip_id")
+            .and_then(|v| v.as_str())
+            .expect("clip_id")
+            .to_owned();
+        let expected_uuid = Uuid::parse_str(&scene_clip_id).expect("clip uuid");
+
+        let _ = session
+            .selection
+            .select_clip(scene_clip_id, Some("scene"), false);
+        assert_eq!(
+            selected_single_scene3d_clip_uuid(&session),
+            Some(expected_uuid),
+            "Editing Camera must detect selected 3D Scene clips inside the active nested precomp"
+        );
     }
 }

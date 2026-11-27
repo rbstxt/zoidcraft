@@ -365,10 +365,103 @@ pub struct SessionDocument {
     /// Preserves the declaration order and original `SequenceControl::id` for each `ctl_*`
     /// entry in `sequence_properties` so duplicate-named controls never collide or reorder.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) sequence_control_order: Vec<(String, String)>,
+    pub sequence_control_order: Vec<(String, String)>,
+    /// Child effects of `EffectKind::EffectGroup` instances, indexed by parent `SessionEffect.id`.
+    /// Supports arbitrary nesting when a child effect is itself an `EffectGroup`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub effect_group_children: BTreeMap<String, Vec<SessionEffect>>,
+    /// Preserved `CustomProperty.metadata` maps (e.g. Shader+ kinds, dropdown option lists,
+    /// conditional visibility, and rename rules), indexed by
+    /// `target_id -> property_name -> metadata_map`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub property_metadata: BTreeMap<String, BTreeMap<String, BTreeMap<String, Value>>>,
+    /// Track-level matte settings (`trackMatte`, `matteType`, `matteInvert`) indexed by `track_id`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub track_matte: BTreeMap<String, BTreeMap<String, Value>>,
+}
+
+pub(crate) fn effect_tree_contains(
+    group_children: &BTreeMap<String, Vec<SessionEffect>>,
+    root_id: &str,
+    target_id: &str,
+    depth: usize,
+) -> bool {
+    if depth >= 16 {
+        return false;
+    }
+    let Some(children) = group_children.get(root_id) else {
+        return false;
+    };
+    for child in children {
+        if child.id == target_id
+            || effect_tree_contains(group_children, &child.id, target_id, depth + 1)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 impl SessionDocument {
+    /// Returns the direct child effects of an `EffectGroup` by parent effect ID.
+    #[must_use]
+    pub fn effect_children(&self, group_effect_id: &str) -> &[SessionEffect] {
+        self.effect_group_children
+            .get(group_effect_id)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Finds an effect by ID across both top-level clip stacks and nested `EffectGroup` children.
+    #[must_use]
+    pub fn find_effect(&self, effect_id: &str) -> Option<&SessionEffect> {
+        for track in self.all_tracks() {
+            for clip in &track.clips {
+                if let Some(fx) = clip.effects.iter().find(|e| e.id == effect_id) {
+                    return Some(fx);
+                }
+            }
+        }
+        for children in self.effect_group_children.values() {
+            if let Some(fx) = children.iter().find(|e| e.id == effect_id) {
+                return Some(fx);
+            }
+        }
+        None
+    }
+
+    /// Looks up preserved `CustomProperty.metadata` for `(target_id, property)`.
+    #[must_use]
+    pub fn property_metadata(
+        &self,
+        target_id: &str,
+        property: &str,
+    ) -> Option<&BTreeMap<String, Value>> {
+        self.property_metadata.get(target_id)?.get(property)
+    }
+
+    /// Sets or clears preserved `CustomProperty.metadata` for `(target_id, property)`.
+    pub fn set_property_metadata(
+        &mut self,
+        target_id: impl Into<String>,
+        property: impl Into<String>,
+        metadata: BTreeMap<String, Value>,
+    ) {
+        let tid = target_id.into();
+        let prop = property.into();
+        if metadata.is_empty() {
+            if let Some(map) = self.property_metadata.get_mut(&tid) {
+                map.remove(&prop);
+                if map.is_empty() {
+                    self.property_metadata.remove(&tid);
+                }
+            }
+        } else {
+            self.property_metadata
+                .entry(tid)
+                .or_default()
+                .insert(prop, metadata);
+        }
+    }
     pub(crate) fn all_tracks(&self) -> impl Iterator<Item = &SessionTrack> {
         self.video_tracks.iter().chain(self.audio_tracks.iter())
     }
@@ -423,6 +516,39 @@ impl SessionDocument {
     ) -> Result<&mut BTreeMap<String, SessionProperty>, SessionError> {
         if target_id == "sequence" {
             return Ok(&mut self.sequence_properties);
+        }
+
+        if self
+            .effect_group_children
+            .values()
+            .any(|children| children.iter().any(|e| e.id == target_id))
+        {
+            let mut owning_locked: Option<(String, String)> = None;
+            let mut found_in_group = false;
+            for track in self.video_tracks.iter().chain(self.audio_tracks.iter()) {
+                for clip in &track.clips {
+                    if clip.effects.iter().any(|fx| {
+                        effect_tree_contains(&self.effect_group_children, &fx.id, target_id, 0)
+                    }) {
+                        found_in_group = true;
+                        if track.locked {
+                            owning_locked = Some((track.name.clone(), track.id.clone()));
+                        }
+                        break;
+                    }
+                }
+                if found_in_group {
+                    break;
+                }
+            }
+            if let Some((tname, tid)) = owning_locked {
+                return Err(track_locked_error(&tname, &tid));
+            }
+            for children in self.effect_group_children.values_mut() {
+                if let Some(fx) = children.iter_mut().find(|e| e.id == target_id) {
+                    return Ok(&mut fx.properties);
+                }
+            }
         }
 
         for track in self
@@ -1034,6 +1160,38 @@ fn estimate_session_document_bytes(doc: &SessionDocument) -> usize {
         total = total
             .saturating_add(k.len())
             .saturating_add(id.len())
+            .saturating_add(48);
+    }
+    for (parent_id, children) in &doc.effect_group_children {
+        total = total.saturating_add(parent_id.len()).saturating_add(48);
+        for fx in children {
+            total = total
+                .saturating_add(std::mem::size_of::<SessionEffect>())
+                .saturating_add(fx.id.len())
+                .saturating_add(fx.kind.len())
+                .saturating_add(fx.name.len())
+                .saturating_add(fx.source_id.as_ref().map_or(0, String::len));
+            for (k, p) in &fx.properties {
+                total = total
+                    .saturating_add(k.len())
+                    .saturating_add(estimate_session_property_bytes(p))
+                    .saturating_add(48);
+            }
+        }
+    }
+    for (tid, props) in &doc.property_metadata {
+        total = total.saturating_add(tid.len()).saturating_add(48);
+        for (pk, meta) in props {
+            total = total
+                .saturating_add(pk.len())
+                .saturating_add(estimate_preserved_bytes(meta))
+                .saturating_add(48);
+        }
+    }
+    for (tid, map) in &doc.track_matte {
+        total = total
+            .saturating_add(tid.len())
+            .saturating_add(estimate_preserved_bytes(map))
             .saturating_add(48);
     }
     total

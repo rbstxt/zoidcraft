@@ -33,7 +33,59 @@ pub enum RenderError {
     Effect(String),
 }
 
+/// Maximum number of asynchronous WebGPU validation errors retained for host diagnostics.
+#[cfg(target_arch = "wasm32")]
+const MAX_ASYNC_VALIDATION_ERRORS: usize = 64;
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static ASYNC_VALIDATION_ERRORS: std::cell::RefCell<std::collections::VecDeque<String>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(target_arch = "wasm32")]
+fn record_async_validation_error(message: String) {
+    ASYNC_VALIDATION_ERRORS.with_borrow_mut(|errors| {
+        while errors.len() >= MAX_ASYNC_VALIDATION_ERRORS {
+            errors.pop_front();
+        }
+        errors.push_back(message);
+    });
+}
+
+/// Drains asynchronous GPU validation errors captured from deferred WebGPU error scopes
+/// on `wasm32` (always empty on native targets where scopes resolve synchronously).
+#[must_use]
+pub fn take_async_validation_errors() -> Vec<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        ASYNC_VALIDATION_ERRORS.with_borrow_mut(|errors| errors.drain(..).collect())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Vec::new()
+    }
+}
+
+/// Awaits a `wgpu::ErrorScopeGuard` on both native and browser WebGPU backends.
+pub async fn pop_validation_error_async(scope: wgpu::ErrorScopeGuard) -> Option<wgpu::Error> {
+    let error = scope.pop().await;
+    #[cfg(target_arch = "wasm32")]
+    if let Some(ref err) = error {
+        let msg = err.to_string();
+        tracing::error!("GPU validation failed: {msg}");
+        web_sys::console::error_1(&format!("[zc-render] GPU validation failed: {msg}").into());
+        record_async_validation_error(msg);
+    }
+    error
+}
+
 /// Returns validation errors when the backend can deliver them synchronously.
+///
+/// On `wasm32` WebGL2, scopes resolve immediately and are returned synchronously.
+/// On browser WebGPU where `popErrorScope()` returns a JS `Promise`, the future is
+/// awaited on the browser microtask queue and any validation failure is both logged
+/// to `tracing` + `console.error` and retained for [`take_async_validation_errors`].
 pub(crate) fn pop_validation_error(scope: wgpu::ErrorScopeGuard) -> Option<wgpu::Error> {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -49,11 +101,26 @@ pub(crate) fn pop_validation_error(scope: wgpu::ErrorScopeGuard) -> Option<wgpu:
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
         {
-            Poll::Ready(error) => error,
+            Poll::Ready(error) => {
+                if let Some(ref err) = error {
+                    let msg = err.to_string();
+                    tracing::error!("GPU shader validation failed: {msg}");
+                    web_sys::console::error_1(
+                        &format!("[zc-render] GPU shader validation failed: {msg}").into(),
+                    );
+                }
+                error
+            }
             Poll::Pending => {
                 wasm_bindgen_futures::spawn_local(async move {
                     if let Some(error) = validation.await {
-                        tracing::warn!("GPU shader validation failed: {error}");
+                        let msg = error.to_string();
+                        tracing::error!("Async WebGPU shader validation failed: {msg}");
+                        web_sys::console::error_1(
+                            &format!("[zc-render] Async WebGPU shader validation failed: {msg}")
+                                .into(),
+                        );
+                        record_async_validation_error(msg);
                     }
                 });
                 None

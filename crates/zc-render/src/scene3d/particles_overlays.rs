@@ -143,21 +143,49 @@ pub(crate) fn encode_optical_flares_pass(
         } else {
             0.0
         };
+        let ndc_x = if flare.screen_pos_ndc[0].is_finite() {
+            flare.screen_pos_ndc[0]
+        } else {
+            continue;
+        };
+        let ndc_y = if flare.screen_pos_ndc[1].is_finite() {
+            flare.screen_pos_ndc[1]
+        } else {
+            continue;
+        };
+        let depth_ndc = if flare.depth_ndc.is_finite() {
+            flare.depth_ndc
+        } else {
+            1.0
+        };
+        let dispersion = (0.35 + ring * 0.25 + anamorphic * 0.15).clamp(0.0, 2.0);
         let u = OpticalFlareUniforms {
-            pos_depth_aspect: [
-                flare.screen_pos_ndc[0],
-                flare.screen_pos_ndc[1],
-                flare.depth_ndc,
-                aspect,
-            ],
+            pos_depth_aspect: [ndc_x, ndc_y, depth_ndc, aspect],
             resolution_inv: [width, height, 1.0 / width, 1.0 / height],
-            color_brightness: [flare.color[0], flare.color[1], flare.color[2], brightness],
+            color_brightness: [
+                if flare.color[0].is_finite() {
+                    flare.color[0].max(0.0)
+                } else {
+                    1.0
+                },
+                if flare.color[1].is_finite() {
+                    flare.color[1].max(0.0)
+                } else {
+                    1.0
+                },
+                if flare.color[2].is_finite() {
+                    flare.color[2].max(0.0)
+                } else {
+                    1.0
+                },
+                brightness,
+            ],
             shape_params: [scale, anamorphic, ring, rot],
             counts_occlusion: [
                 (flare.ghosts.min(8)) as f32,
                 (flare.starburst_rays.min(24)) as f32,
                 if flare.occlusion_enabled { 1.0 } else { 0.0 },
-                0.0,
+                dispersion,
             ],
         };
         let ubo = create_uniform_buffer(ctx, "zc-render optical flare ubo", bytemuck::bytes_of(&u));
@@ -500,6 +528,41 @@ pub(crate) fn encode_dof_passes(
     color_dst: &RenderTarget,
     params: &DofPassParams,
 ) {
+    let near = if params.near.is_finite() {
+        params.near.max(1e-4)
+    } else {
+        0.1
+    };
+    let far = if params.far.is_finite() {
+        params.far.max(near + 1e-3)
+    } else {
+        (near + 5000.0).max(near + 1.0)
+    };
+    let aperture = if params.enabled && params.aperture.is_finite() {
+        params.aperture.max(0.0)
+    } else {
+        0.0
+    };
+    let focus_distance = if params.focus_distance.is_finite() {
+        params.focus_distance.max(0.0)
+    } else {
+        80.0
+    };
+    let focus_area_width = if params.focus_area_width.is_finite() {
+        params.focus_area_width.max(0.0)
+    } else {
+        0.0
+    };
+    let near_blur_level = if params.near_blur_level.is_finite() {
+        params.near_blur_level.max(0.0)
+    } else {
+        1.0
+    };
+    let far_blur_level = if params.far_blur_level.is_finite() {
+        params.far_blur_level.max(0.0)
+    } else {
+        1.0
+    };
     let dof_u = DofUniforms {
         resolution_tile_count: [
             color_src.width as f32,
@@ -509,15 +572,15 @@ pub(crate) fn encode_dof_passes(
         ],
         camera_depth_params: [
             if params.orthographic { 1.0 } else { 0.0 },
-            params.near.max(1e-4),
-            params.far.max(params.near.max(1e-4) + 1e-3),
-            params.aperture.max(0.0),
+            near,
+            far,
+            aperture,
         ],
         focus_blur_params: [
-            params.focus_distance,
-            params.focus_area_width.max(0.0),
-            params.near_blur_level.max(0.0),
-            params.far_blur_level.max(0.0),
+            focus_distance,
+            focus_area_width,
+            near_blur_level,
+            far_blur_level,
         ],
     };
     let dof_ubo = create_uniform_buffer(ctx, "zc-render dof ubo", bytemuck::bytes_of(&dof_u));
@@ -731,9 +794,31 @@ pub(crate) fn create_soft_circle_sprite(ctx: &GpuContext) -> Result<RenderTarget
     ctx.create_rgba8_texture("zc-render default particle sprite", SIZE, SIZE, &pixels)
 }
 
+pub(crate) fn is_area_light_sentinel(light: &SceneLight) -> bool {
+    light.penumbra.is_finite() && light.penumbra <= -1000.0 && light.penumbra > -2000.0
+}
+
+pub(crate) fn is_ies_light_sentinel(light: &SceneLight) -> bool {
+    light.penumbra.is_finite() && light.penumbra <= -2000.0 && light.penumbra > -3000.0
+}
+
+pub(crate) fn is_portal_light_sentinel(light: &SceneLight) -> bool {
+    light.penumbra.is_finite() && light.penumbra <= -3000.0 && light.penumbra > -4000.0
+}
+
+#[allow(dead_code)]
 pub(crate) fn assign_shadow_lights(
     lights: &[SceneLight],
     meshes: &[MeshDrawCall<'_>],
+    compat_mode: CompatMode,
+) -> ShadowAssignment {
+    assign_shadow_lights_with_aabbs(lights, meshes, &[], compat_mode)
+}
+
+pub(crate) fn assign_shadow_lights_with_aabbs(
+    lights: &[SceneLight],
+    meshes: &[MeshDrawCall<'_>],
+    mesh_world_aabbs: &[([f32; 3], [f32; 3])],
     compat_mode: CompatMode,
 ) -> ShadowAssignment {
     let mut light_slots = [-1.0_f32; MAX_SCENE_LIGHTS];
@@ -758,11 +843,35 @@ pub(crate) fn assign_shadow_lights(
             CompatMode::Legacy => 0.0,
         };
 
+        if is_portal_light_sentinel(light) {
+            continue;
+        }
+
+        if is_area_light_sentinel(light) || is_ies_light_sentinel(light) {
+            if spot_dir_casters.len() < MAX_SHADOW_MAPS_2D {
+                let slot = spot_dir_casters.len();
+                let vp = compute_light_view_proj_with_aabbs(
+                    light,
+                    meshes,
+                    mesh_world_aabbs,
+                    compat_mode,
+                );
+                spot_dir_casters.push((slot, vp, receiver_bias));
+                light_slots[idx] = slot as f32;
+            }
+            continue;
+        }
+
         match light.kind {
             LightKind::Spot | LightKind::Directional => {
                 if spot_dir_casters.len() < MAX_SHADOW_MAPS_2D {
                     let slot = spot_dir_casters.len();
-                    let vp = compute_light_view_proj(light, meshes, compat_mode);
+                    let vp = compute_light_view_proj_with_aabbs(
+                        light,
+                        meshes,
+                        mesh_world_aabbs,
+                        compat_mode,
+                    );
                     spot_dir_casters.push((slot, vp, receiver_bias));
                     light_slots[idx] = slot as f32;
                 }
@@ -791,12 +900,31 @@ pub(crate) fn assign_shadow_lights(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_scene_uniforms(
     camera: &CameraParams,
     lights: &[SceneLight],
     shadow_assign: &ShadowAssignment,
     linear_lighting: bool,
     shadow_map_size_2d: u32,
+) -> SceneUniforms {
+    build_scene_uniforms_with_sizes(
+        camera,
+        lights,
+        shadow_assign,
+        linear_lighting,
+        shadow_map_size_2d,
+        POINT_SHADOW_MAP_SIZE,
+    )
+}
+
+pub(crate) fn build_scene_uniforms_with_sizes(
+    camera: &CameraParams,
+    lights: &[SceneLight],
+    shadow_assign: &ShadowAssignment,
+    linear_lighting: bool,
+    shadow_map_size_2d: u32,
+    point_shadow_map_size: u32,
 ) -> SceneUniforms {
     let count = lights.len().min(MAX_SCENE_LIGHTS);
     let mut gpu_lights = [LightGpu::zeroed(); MAX_SCENE_LIGHTS];
@@ -811,7 +939,6 @@ pub(crate) fn build_scene_uniforms(
             src.target[1] - src.position[1],
             src.target[2] - src.position[2],
         ]);
-        let outer_rad = (src.angle_deg.clamp(1.0, 89.5)) * (PI / 180.0);
         let distance = if src.distance.is_finite() {
             src.distance.max(0.0)
         } else {
@@ -822,6 +949,68 @@ pub(crate) fn build_scene_uniforms(
         } else {
             1.0
         };
+
+        if is_area_light_sentinel(src) {
+            let half_w = if src.angle_deg.is_finite() {
+                src.angle_deg.clamp(0.05, 500.0)
+            } else {
+                10.0
+            };
+            let half_h = (-(src.penumbra + 1000.0)).clamp(0.05, 500.0);
+            let u_axis = vec3_normalize(src.ground_color);
+            *dst = LightGpu {
+                color_intensity: [src.color[0], src.color[1], src.color[2], src.intensity],
+                ground_kind: [u_axis[0], u_axis[1], u_axis[2], 6.0],
+                position_distance: [src.position[0], src.position[1], src.position[2], distance],
+                direction_cos_outer: [dir[0], dir[1], dir[2], half_w],
+                cos_inner_decay_penumbra: [half_h, decay, 0.0, shadow_assign.light_slots[idx]],
+            };
+            continue;
+        }
+
+        if is_ies_light_sentinel(src) {
+            let packed = if src.angle_deg.is_finite() {
+                src.angle_deg.max(0.0).round() as u32
+            } else {
+                255
+            };
+            let c0 = ((packed & 0xFF) as f32) / 255.0;
+            let c4 = (((packed >> 8) & 0xFF) as f32) / 255.0;
+            let c5 = ((-(src.penumbra + 2000.0)).clamp(0.0, 255.0)) / 255.0;
+            *dst = LightGpu {
+                color_intensity: [src.color[0], src.color[1], src.color[2], src.intensity],
+                ground_kind: [
+                    src.ground_color[0].clamp(0.0, 1.0),
+                    src.ground_color[1].clamp(0.0, 1.0),
+                    src.ground_color[2].clamp(0.0, 1.0),
+                    7.0,
+                ],
+                position_distance: [src.position[0], src.position[1], src.position[2], distance],
+                direction_cos_outer: [dir[0], dir[1], dir[2], c0],
+                cos_inner_decay_penumbra: [c4, decay, c5, shadow_assign.light_slots[idx]],
+            };
+            continue;
+        }
+
+        if is_portal_light_sentinel(src) {
+            let half_w = if src.angle_deg.is_finite() {
+                src.angle_deg.clamp(0.05, 500.0)
+            } else {
+                12.0
+            };
+            let half_h = (-(src.penumbra + 3000.0)).clamp(0.05, 500.0);
+            let u_axis = vec3_normalize(src.ground_color);
+            *dst = LightGpu {
+                color_intensity: [src.color[0], src.color[1], src.color[2], src.intensity],
+                ground_kind: [u_axis[0], u_axis[1], u_axis[2], 8.0],
+                position_distance: [src.position[0], src.position[1], src.position[2], distance],
+                direction_cos_outer: [dir[0], dir[1], dir[2], half_w],
+                cos_inner_decay_penumbra: [half_h, decay, 0.0, shadow_assign.light_slots[idx]],
+            };
+            continue;
+        }
+
+        let outer_rad = (src.angle_deg.clamp(1.0, 89.5)) * (PI / 180.0);
         let penumbra = if src.penumbra.is_finite() {
             src.penumbra.clamp(0.0, 1.0)
         } else {
@@ -855,14 +1044,11 @@ pub(crate) fn build_scene_uniforms(
         shadow_biases[slot] = bias;
     }
 
-    let mut point_shadow_params = [[
-        SHADOW_CAMERA_NEAR,
-        SHADOW_CAMERA_FAR,
-        0.0,
-        1.0 / (POINT_SHADOW_MAP_SIZE as f32),
-    ]; MAX_POINT_SHADOW_LIGHTS];
+    let point_texel = 1.0 / (point_shadow_map_size.max(1) as f32);
+    let mut point_shadow_params =
+        [[SHADOW_CAMERA_NEAR, SHADOW_CAMERA_FAR, 0.0, point_texel]; MAX_POINT_SHADOW_LIGHTS];
     for &(pslot, _, near, far, bias) in &shadow_assign.point_casters {
-        point_shadow_params[pslot] = [near, far, bias, 1.0 / (POINT_SHADOW_MAP_SIZE as f32)];
+        point_shadow_params[pslot] = [near, far, bias, point_texel];
     }
 
     let primary_bias = shadow_assign
@@ -1114,9 +1300,19 @@ pub(crate) fn build_object_uniforms(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn compute_light_view_proj(
     light: &SceneLight,
     meshes: &[MeshDrawCall<'_>],
+    compat_mode: CompatMode,
+) -> [[f32; 4]; 4] {
+    compute_light_view_proj_with_aabbs(light, meshes, &[], compat_mode)
+}
+
+pub(crate) fn compute_light_view_proj_with_aabbs(
+    light: &SceneLight,
+    meshes: &[MeshDrawCall<'_>],
+    mesh_world_aabbs: &[([f32; 3], [f32; 3])],
     compat_mode: CompatMode,
 ) -> [[f32; 4]; 4] {
     let dir = vec3_normalize([
@@ -1130,39 +1326,131 @@ pub(crate) fn compute_light_view_proj(
         [0.0, 1.0, 0.0]
     };
     let view = mat4_look_at_rh(light.position, light.target, up);
-    let proj = match light.kind {
-        LightKind::Spot => {
-            let fov = (2.0 * light.angle_deg).clamp(1.0, 175.0).to_radians();
-            mat4_perspective_rh(fov, 1.0, SHADOW_CAMERA_NEAR, SHADOW_CAMERA_FAR)
-        }
-        _ => match compat_mode {
+    let is_spot_like = light.kind == LightKind::Spot
+        || is_area_light_sentinel(light)
+        || is_ies_light_sentinel(light);
+    let proj = if is_spot_like {
+        let fov_deg = if is_area_light_sentinel(light) || is_ies_light_sentinel(light) {
+            115.0
+        } else {
+            (2.0 * light.angle_deg).clamp(1.0, 175.0)
+        };
+        let (near, far) = fit_spot_shadow_depth_range(light, view, meshes, mesh_world_aabbs);
+        mat4_perspective_rh(fov_deg.to_radians(), 1.0, near, far)
+    } else {
+        match compat_mode {
             CompatMode::Legacy => {
                 mat4_orthographic_rh(-5.0, 5.0, -5.0, 5.0, SHADOW_CAMERA_NEAR, SHADOW_CAMERA_FAR)
             }
             CompatMode::Current => {
                 let (left, right, bottom, top, near, far) =
-                    fit_directional_shadow_bounds(view, meshes);
+                    fit_directional_shadow_bounds_with_aabbs(view, meshes, mesh_world_aabbs);
                 mat4_orthographic_rh(left, right, bottom, top, near, far)
             }
-        },
+        }
     };
     mat4_mul(proj, view)
 }
 
+fn fit_spot_shadow_depth_range(
+    light: &SceneLight,
+    light_view: [[f32; 4]; 4],
+    meshes: &[MeshDrawCall<'_>],
+    mesh_world_aabbs: &[([f32; 3], [f32; 3])],
+) -> (f32, f32) {
+    let max_far = if light.distance.is_finite() && light.distance > SHADOW_CAMERA_NEAR + 1.0 {
+        light.distance.min(SHADOW_CAMERA_FAR)
+    } else {
+        SHADOW_CAMERA_FAR
+    };
+    if mesh_world_aabbs.len() != meshes.len() || meshes.is_empty() {
+        return (SHADOW_CAMERA_NEAR, max_far);
+    }
+    let mut min_fwd = f32::INFINITY;
+    let mut max_fwd = f32::NEG_INFINITY;
+    let mut any = false;
+    for (draw, &(bmin, bmax)) in meshes.iter().zip(mesh_world_aabbs.iter()) {
+        if !draw.cast_shadow || draw.mesh.index_count == 0 {
+            continue;
+        }
+        if !bmin[0].is_finite() || !bmax[0].is_finite() {
+            continue;
+        }
+        for x in [bmin[0], bmax[0]] {
+            for y in [bmin[1], bmax[1]] {
+                for z in [bmin[2], bmax[2]] {
+                    let vp = mat4_transform_point(light_view, [x, y, z]);
+                    let fwd = -vp[2];
+                    if fwd.is_finite() {
+                        min_fwd = min_fwd.min(fwd);
+                        max_fwd = max_fwd.max(fwd);
+                        any = true;
+                    }
+                }
+            }
+        }
+    }
+    if !any || !max_fwd.is_finite() || max_fwd <= 0.5 {
+        return (SHADOW_CAMERA_NEAR, max_far);
+    }
+    let pad = ((max_fwd - min_fwd).abs() * 0.05).max(1.0);
+    let near = (min_fwd - pad).clamp(0.5, SHADOW_CAMERA_NEAR);
+    let far = (max_fwd + pad).clamp(near + 2.0, max_far.max(near + 2.0));
+    (near, far)
+}
+
+#[allow(dead_code)]
 pub(crate) fn fit_directional_shadow_bounds(
     light_view: [[f32; 4]; 4],
     meshes: &[MeshDrawCall<'_>],
+) -> (f32, f32, f32, f32, f32, f32) {
+    fit_directional_shadow_bounds_with_aabbs(light_view, meshes, &[])
+}
+
+pub(crate) fn fit_directional_shadow_bounds_with_aabbs(
+    light_view: [[f32; 4]; 4],
+    meshes: &[MeshDrawCall<'_>],
+    mesh_world_aabbs: &[([f32; 3], [f32; 3])],
 ) -> (f32, f32, f32, f32, f32, f32) {
     let mut min_x = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
     let mut min_y = f32::INFINITY;
     let mut max_y = f32::NEG_INFINITY;
     let mut min_fwd = f32::INFINITY;
+    let mut max_fwd = f32::NEG_INFINITY;
     let mut any = false;
+    let have_aabbs = mesh_world_aabbs.len() == meshes.len();
 
-    for draw in meshes {
+    for (idx, draw) in meshes.iter().enumerate() {
         if !draw.cast_shadow || draw.mesh.index_count == 0 {
             continue;
+        }
+        if have_aabbs {
+            let (bmin, bmax) = mesh_world_aabbs[idx];
+            if bmin[0].is_finite()
+                && bmin[1].is_finite()
+                && bmin[2].is_finite()
+                && bmax[0].is_finite()
+                && bmax[1].is_finite()
+                && bmax[2].is_finite()
+            {
+                for x in [bmin[0], bmax[0]] {
+                    for y in [bmin[1], bmax[1]] {
+                        for z in [bmin[2], bmax[2]] {
+                            let vp = mat4_transform_point(light_view, [x, y, z]);
+                            min_x = min_x.min(vp[0]);
+                            max_x = max_x.max(vp[0]);
+                            min_y = min_y.min(vp[1]);
+                            max_y = max_y.max(vp[1]);
+                            let fwd = -vp[2];
+                            min_fwd = min_fwd.min(fwd);
+                            max_fwd = max_fwd.max(fwd);
+                        }
+                    }
+                }
+                any = true;
+                continue;
+            }
         }
         let origin = [draw.model[3][0], draw.model[3][1], draw.model[3][2]];
         let vp = mat4_transform_point(light_view, origin);
@@ -1185,6 +1473,7 @@ pub(crate) fn fit_directional_shadow_bounds(
         min_y = min_y.min(vp[1] - radius);
         max_y = max_y.max(vp[1] + radius);
         min_fwd = min_fwd.min(-vp[2] - radius);
+        max_fwd = max_fwd.max(-vp[2] + radius);
         any = true;
     }
 
@@ -1201,18 +1490,17 @@ pub(crate) fn fit_directional_shadow_bounds(
 
     let cx = 0.5 * (min_x + max_x);
     let cy = 0.5 * (min_y + max_y);
-    let half = (0.5 * (max_x - min_x))
-        .max(0.5 * (max_y - min_y))
-        .clamp(15.0, 250.0);
-    let near = min_fwd.clamp(0.5, SHADOW_CAMERA_NEAR);
-    (
-        cx - half,
-        cx + half,
-        cy - half,
-        cy + half,
-        near,
-        SHADOW_CAMERA_FAR,
-    )
+    let span = (0.5 * (max_x - min_x)).max(0.5 * (max_y - min_y));
+    let pad = (span * 0.04).max(1.0);
+    let half = (span + pad).clamp(2.0, 500.0);
+    let depth_pad = ((max_fwd - min_fwd).abs() * 0.05).max(2.0);
+    let near = (min_fwd - depth_pad).clamp(0.5, SHADOW_CAMERA_NEAR);
+    let far = if have_aabbs && max_fwd.is_finite() {
+        (max_fwd + depth_pad).clamp(near + 10.0, SHADOW_CAMERA_FAR.max(max_fwd + depth_pad))
+    } else {
+        SHADOW_CAMERA_FAR
+    };
+    (cx - half, cx + half, cy - half, cy + half, near, far)
 }
 
 /// Builds the 6 right-handed 90-degree cube-face view-projection matrices for an omni PointLight.

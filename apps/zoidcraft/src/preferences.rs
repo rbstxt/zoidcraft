@@ -91,6 +91,19 @@ impl UserPreferences {
             show_fps_overlay: settings["show_fps_overlay"]
                 .as_bool()
                 .unwrap_or(defaults.show_fps_overlay),
+            ffmpeg_path: settings["ffmpeg_path"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            ffprobe_path: settings["ffprobe_path"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            ffmpeg_setup_dismissed: settings["ffmpeg_setup_dismissed"]
+                .as_bool()
+                .unwrap_or(defaults.ffmpeg_setup_dismissed),
         };
         let preview_quality = PreviewQuality::ALL
             .into_iter()
@@ -165,6 +178,9 @@ impl UserPreferences {
                 "undo_max_entries": settings.undo_max_entries,
                 "undo_max_mib": settings.undo_max_mib,
                 "show_fps_overlay": settings.show_fps_overlay,
+                "ffmpeg_path": settings.ffmpeg_path,
+                "ffprobe_path": settings.ffprobe_path,
+                "ffmpeg_setup_dismissed": settings.ffmpeg_setup_dismissed,
             },
             "enabled_plugins": self.enabled_plugins,
             "plugin_configs": self.plugin_configs,
@@ -211,6 +227,9 @@ pub(crate) fn preferences_fingerprint(
         settings.undo_max_entries,
         settings.undo_max_mib,
         settings.show_fps_overlay,
+        settings.ffmpeg_path.as_deref(),
+        settings.ffprobe_path.as_deref(),
+        settings.ffmpeg_setup_dismissed,
         workspace.player_plus.preview_quality.divisor(),
     )
         .hash(&mut hasher);

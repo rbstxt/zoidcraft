@@ -1,10 +1,12 @@
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 
 use crate::Session;
 use crate::commands::Command;
 use crate::document::{
-    SessionError, SessionKeyframe, SessionProperty, SessionValueKind, json_value_type_name,
-    track_locked_error,
+    SessionError, SessionKeyframe, SessionProperty, SessionValueKind, effect_tree_contains,
+    json_value_type_name, track_locked_error,
 };
 use crate::property_conv::eval_session_property_at;
 
@@ -70,6 +72,42 @@ impl Session {
                                 break;
                             }
                         }
+                        if !renamed {
+                            let mut owning_locked: Option<(String, String)> = None;
+                            for track in self
+                                .document
+                                .video_tracks
+                                .iter()
+                                .chain(self.document.audio_tracks.iter())
+                            {
+                                if track.clips.iter().any(|c| {
+                                    c.effects.iter().any(|fx| {
+                                        effect_tree_contains(
+                                            &self.document.effect_group_children,
+                                            &fx.id,
+                                            &target_id,
+                                            0,
+                                        )
+                                    })
+                                }) {
+                                    if track.locked {
+                                        owning_locked =
+                                            Some((track.name.clone(), track.id.clone()));
+                                    }
+                                    break;
+                                }
+                            }
+                            if let Some((tname, tid)) = owning_locked {
+                                return Err(track_locked_error(&tname, &tid));
+                            }
+                            for children in self.document.effect_group_children.values_mut() {
+                                if let Some(fx) = children.iter_mut().find(|e| e.id == target_id) {
+                                    fx.name = new_name.to_owned();
+                                    renamed = true;
+                                    break;
+                                }
+                            }
+                        }
                         if renamed {
                             return Ok(json!({
                                 "target_id": target_id,
@@ -80,6 +118,68 @@ impl Session {
                     }
                 }
 
+                // Track-level matte properties (`trackMatte`, `matteType`, `matteInvert`).
+                if matches!(
+                    property.as_str(),
+                    "trackMatte" | "matteType" | "matteInvert"
+                ) && let Some(track) = self.document.find_track(&target_id)
+                {
+                    if track.locked {
+                        return Err(track_locked_error(&track.name, &track.id));
+                    }
+                    if value.is_null() {
+                        if let Some(map) = self.document.track_matte.get_mut(&target_id) {
+                            map.remove(&property);
+                            if map.is_empty() {
+                                self.document.track_matte.remove(&target_id);
+                            }
+                        }
+                    } else {
+                        self.document
+                            .track_matte
+                            .entry(target_id.clone())
+                            .or_default()
+                            .insert(property.clone(), value.clone());
+                    }
+                    return Ok(json!({
+                        "target_id": target_id,
+                        "property": property,
+                        "value": value,
+                    }));
+                }
+
+                // Undoable `CustomProperty.metadata` updates via `__meta.<propName>`.
+                if let Some(meta_prop) = property.strip_prefix("__meta.")
+                    && !meta_prop.is_empty()
+                {
+                    let _ = self.document.find_property_map_mut(&target_id)?;
+                    if value.is_null() {
+                        self.document.set_property_metadata(
+                            target_id.clone(),
+                            meta_prop.to_owned(),
+                            BTreeMap::new(),
+                        );
+                    } else if let Some(obj) = value.as_object() {
+                        let map: BTreeMap<String, Value> =
+                            obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                        self.document.set_property_metadata(
+                            target_id.clone(),
+                            meta_prop.to_owned(),
+                            map,
+                        );
+                    } else {
+                        return Err(SessionError::InvalidArgument(format!(
+                            "property '{property}' expects a JSON object or null, got {}",
+                            json_value_type_name(&value)
+                        )));
+                    }
+                    return Ok(json!({
+                        "target_id": target_id,
+                        "property": property,
+                        "value": value,
+                    }));
+                }
+
                 let props = self.document.find_property_map_mut(&target_id)?;
                 let existing_kf = props.get(&property).and_then(|p| p.keyframes.first());
                 let existing_kind = existing_kf.and_then(|kf| kf.value_kind);
@@ -87,7 +187,12 @@ impl Session {
                 let is_nullable_asset_prop = existing_kind == Some(SessionValueKind::Asset)
                     || matches!(
                         property.as_str(),
-                        "assetId" | "font" | "texture" | "particles.texture"
+                        "assetId"
+                            | "font"
+                            | "texture"
+                            | "particles.texture"
+                            | "iesProfile"
+                            | "trackMatte"
                     )
                     || property.ends_with(".assetId");
                 let is_gradient_text_prop =
@@ -135,6 +240,91 @@ impl Session {
                     entry.keyframes[0].value = value.clone();
                 }
                 let entry_animated = entry.animated;
+                if target_id == "sequence"
+                    && matches!(property.as_str(), "backgroundColor" | "backdropOpacity")
+                {
+                    // Update sequence `background_color` and primary solid `scene_backdrop`
+                    // immediately, mirroring onto the primary Scene3D clip in `self.document`
+                    // so `sync_document_to_project` stays consistent.
+                    let mut synced_rgb: Option<[f64; 3]> = None;
+                    let mut synced_alpha: Option<f64> = None;
+                    if property == "backgroundColor"
+                        && let Some(arr) = value.as_array()
+                        && arr.len() >= 3
+                        && let (Some(r), Some(g), Some(b)) =
+                            (arr[0].as_f64(), arr[1].as_f64(), arr[2].as_f64())
+                    {
+                        let r = r.clamp(0.0, 1.0);
+                        let g = g.clamp(0.0, 1.0);
+                        let b = b.clamp(0.0, 1.0);
+                        synced_rgb = Some([r, g, b]);
+                        if let Some(a) = arr.get(3).and_then(Value::as_f64) {
+                            synced_alpha = Some(a.clamp(0.0, 1.0));
+                        }
+                    } else if property == "backdropOpacity"
+                        && let Some(a) = value.as_f64()
+                    {
+                        synced_alpha = Some(a.clamp(0.0, 1.0));
+                    }
+                    if synced_rgb.is_some() || synced_alpha.is_some() {
+                        let seq = self.active_sequence_mut();
+                        if let Some([r, g, b]) = synced_rgb {
+                            seq.background_color[0] = r as f32;
+                            seq.background_color[1] = g as f32;
+                            seq.background_color[2] = b as f32;
+                        }
+                        if let Some(a) = synced_alpha {
+                            seq.background_color[3] = a as f32;
+                        }
+                        // Find primary solid scene backdrop (in track/clip order).
+                        let mut primary_clip_id: Option<String> = None;
+                        let mut primary_layer_id: Option<zc_project::Uuid> = None;
+                        'outer: for vt in &seq.video_tracks {
+                            for vc in &vt.clips {
+                                if let Some(bd) = seq.scene_backdrops.get(&vc.layer.id)
+                                    && bd.mode != 0
+                                {
+                                    primary_clip_id = Some(vc.id.to_string());
+                                    primary_layer_id = Some(vc.layer.id);
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        if let Some(lid) = primary_layer_id
+                            && let Some(bd) = seq.scene_backdrops.get_mut(&lid)
+                        {
+                            if let Some(rgb) = synced_rgb {
+                                bd.color = rgb;
+                            }
+                            if let Some(a) = synced_alpha {
+                                bd.opacity = zc_project::PropertyTrack::number(a);
+                            }
+                        }
+                        if let Some(cid) = primary_clip_id
+                            && let Some((track, ci)) = self.document.find_clip_mut(&cid)
+                        {
+                            let sclip = &mut track.clips[ci];
+                            if let Some([r, g, b]) = synced_rgb {
+                                sclip.properties.insert(
+                                    "backgroundColor".to_owned(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!([r, g, b]),
+                                        SessionValueKind::Color,
+                                    ),
+                                );
+                            }
+                            if let Some(a) = synced_alpha {
+                                sclip.properties.insert(
+                                    "backdropOpacity".to_owned(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!(a),
+                                        SessionValueKind::Number,
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
                 if property == "time"
                     && let Some((track, clip_idx)) = self.document.find_clip_mut(&target_id)
                 {
@@ -250,14 +440,70 @@ impl Session {
                 let resolved_tween = tween.unwrap_or(1);
                 let inherited_kind = entry.keyframes.first().and_then(|k| k.value_kind);
 
-                if let Some(existing) = entry
+                if let Some(idx) = entry
                     .keyframes
-                    .iter_mut()
-                    .find(|kf| (kf.frame - frame).abs() < 1e-6)
+                    .iter()
+                    .position(|kf| (kf.frame - frame).abs() < 1e-6)
                 {
-                    existing.value = value.clone();
+                    let old_val_f64 = entry.keyframes[idx].value.as_f64();
+                    let new_val_f64 = value.as_f64();
+                    let old_f = entry.keyframes[idx].frame;
+                    entry.keyframes[idx].value = value.clone();
                     if let Some(t) = tween {
-                        existing.tween = t;
+                        entry.keyframes[idx].tween = t;
+                    }
+                    if let (Some(old_v), Some(new_v)) = (old_val_f64, new_val_f64)
+                        && (new_v - old_v).abs() > 1e-9
+                    {
+                        // Rescale adjacent Bezier segments so normalized easing shape is preserved.
+                        if idx > 0 {
+                            let (mode, _) = zc_anim::InterpolationMode::from_cm3_tween_code(
+                                entry.keyframes[idx].tween,
+                            );
+                            if mode == zc_anim::InterpolationMode::Bezier
+                                && let Some(prev_v) = entry.keyframes[idx - 1].value.as_f64()
+                            {
+                                let prev_f = entry.keyframes[idx - 1].frame;
+                                let (new_out, new_in) = zc_anim::rescale_segment_handles(
+                                    prev_f,
+                                    prev_v,
+                                    old_f,
+                                    old_v,
+                                    prev_f,
+                                    prev_v,
+                                    old_f,
+                                    new_v,
+                                    entry.keyframes[idx - 1].control_points[1],
+                                    entry.keyframes[idx].control_points[0],
+                                );
+                                entry.keyframes[idx - 1].control_points[1] = new_out;
+                                entry.keyframes[idx].control_points[0] = new_in;
+                            }
+                        }
+                        if idx + 1 < entry.keyframes.len() {
+                            let (mode, _) = zc_anim::InterpolationMode::from_cm3_tween_code(
+                                entry.keyframes[idx + 1].tween,
+                            );
+                            if mode == zc_anim::InterpolationMode::Bezier
+                                && let Some(next_v) = entry.keyframes[idx + 1].value.as_f64()
+                            {
+                                let next_f = entry.keyframes[idx + 1].frame;
+                                let (new_out, new_in) = zc_anim::rescale_segment_handles(
+                                    old_f,
+                                    old_v,
+                                    next_f,
+                                    next_v,
+                                    old_f,
+                                    new_v,
+                                    next_f,
+                                    next_v,
+                                    entry.keyframes[idx].control_points[1],
+                                    entry.keyframes[idx + 1].control_points[0],
+                                );
+                                entry.keyframes[idx].control_points[1] = new_out;
+                                entry.keyframes[idx + 1].control_points[0] = new_in;
+                            }
+                        }
                     }
                 } else {
                     let mut kf = SessionKeyframe::new(frame, value.clone(), resolved_tween);
@@ -368,6 +614,11 @@ impl Session {
                         "property '{property}' on target '{target_id}'"
                     )));
                 }
+                self.document.set_property_metadata(
+                    target_id.clone(),
+                    property.clone(),
+                    BTreeMap::new(),
+                );
                 self.selection
                     .keyframes
                     .retain(|kf| !(kf.target_id == target_id && kf.property == property));

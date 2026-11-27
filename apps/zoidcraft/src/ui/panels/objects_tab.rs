@@ -242,7 +242,12 @@ pub(super) fn build_object_picker_items(session: &Session) -> Vec<FuzzyItem> {
             (
                 "zoidium:repeater/warp",
                 "Warp Deformer",
-                "Bend & shear mesh deformer",
+                "Bend & curve mesh deformer",
+            ),
+            (
+                "zoidium:repeater/shear",
+                "Shear Deformer",
+                "Axial shear mesh deformer",
             ),
             (
                 "zoidium:repeater/voronoi-fracture",
@@ -432,6 +437,11 @@ pub(super) fn build_object_picker_items(session: &Session) -> Vec<FuzzyItem> {
                 "zoidium:trapcode-suite/ies-light",
                 "IES Photometric Light",
                 "LM-63 photometric light",
+            ),
+            (
+                "zoidium:trapcode-suite/sun-light",
+                "Sun Light",
+                "Directional sun with elevation, azimuth & Kelvin temperature",
             ),
         ] {
             items.push(FuzzyItem {
@@ -731,6 +741,12 @@ pub(super) fn show_objects_tab(
                 }) && let Some(oid) = res.get("object_id").and_then(Value::as_str)
                 {
                     let _ = session.selection.select_object_3d(oid, &kind, false);
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(
+                            Id::unique(("objects_tree_selection_anchor", &clip_id)),
+                            oid.to_owned(),
+                        );
+                    });
                 }
                 state.add_object_open = false;
             }
@@ -905,9 +921,17 @@ pub(super) fn show_objects_tab(
                     }
 
                     let flat_tree = flatten_object_tree(&clip.objects_3d, &state.collapsed_objects);
+                    let visible_order: Vec<(&str, &str)> = flat_tree
+                        .iter()
+                        .map(|&(idx, _, _)| {
+                            let o = &clip.objects_3d[idx];
+                            (o.id.as_str(), o.kind.as_str())
+                        })
+                        .collect();
+                    let anchor_key = Id::unique(("objects_tree_selection_anchor", &clip_id));
                     let mut drop_request: Option<(String, String, TreeDropMode, bool)> = None;
 
-                    for (obj_idx, depth, has_children) in flat_tree {
+                    for &(obj_idx, depth, has_children) in &flat_tree {
                         let obj = &clip.objects_3d[obj_idx];
                         let selected = session.selection.object_3d_ids.contains(&obj.id);
                         let is_group = is_container_object(&obj.kind);
@@ -937,6 +961,7 @@ pub(super) fn show_objects_tab(
                         let label_left = row_rect.left() + 36.0 + depth as f32 * 15.0;
 
                         // Collapse triangle for containers (positioned left of label)
+                        let mut toggled_collapse = false;
                         if has_children || is_group {
                             let tri_rect = Rect::from_min_size(
                                 Pos2::new(
@@ -964,6 +989,7 @@ pub(super) fn show_objects_tab(
                                 TEXT_MUTED,
                             );
                             if tri_resp.clicked() {
+                                toggled_collapse = true;
                                 if collapsed {
                                     state.collapsed_objects.remove(&obj.id);
                                 } else {
@@ -1040,16 +1066,22 @@ pub(super) fn show_objects_tab(
                             );
                         }
 
-                        // Click / Shift+Click selection with same-type guard (Spec 01 §4.7)
-                        if row_resp.clicked() {
+                        // Click / Shift+Click range / Ctrl(Cmd)+Click toggle selection in visible tree order
+                        if row_resp.clicked() && !toggled_collapse {
                             commit_inspector_tx_if_open(session, state);
-                            let shift = ui.input(|i| i.modifiers.shift);
-                            if let Err(err) = session
-                                .selection
-                                .select_object_3d(&obj.id, &obj.kind, shift)
-                            {
-                                actions.push(PanelAction::StatusMessage(err.to_string()));
-                            }
+                            let (shift, ctrl_cmd) = ui.input(|i| {
+                                (i.modifiers.shift, i.modifiers.ctrl || i.modifiers.command)
+                            });
+                            apply_object_3d_list_click(
+                                ui.ctx(),
+                                session,
+                                &visible_order,
+                                anchor_key,
+                                &obj.id,
+                                &obj.kind,
+                                shift,
+                                ctrl_cmd,
+                            );
                         }
 
                         // Right-click context menu (Rename, Copy/Paste PZ JSON, Duplicate, Remove)
@@ -1278,6 +1310,110 @@ fn flatten_object_tree(
     }
     visit(objects, None, 0, collapsed, &mut out);
     out
+}
+
+fn sync_object_3d_base_type(session: &mut Session, visible_order: &[(&str, &str)]) {
+    let mut shared_kind: Option<&str> = None;
+    let mut mixed = false;
+    for sel_id in &session.selection.object_3d_ids {
+        if let Some(&(_, kind)) = visible_order.iter().find(|&&(id, _)| id == sel_id) {
+            match shared_kind {
+                None => shared_kind = Some(kind),
+                Some(prev) if prev != kind => {
+                    mixed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    session.selection.object_3d_base_type = if mixed {
+        None
+    } else {
+        shared_kind.map(str::to_owned)
+    };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_object_3d_list_click(
+    ctx: &egui::Context,
+    session: &mut Session,
+    visible_order: &[(&str, &str)],
+    anchor_key: Id,
+    clicked_id: &str,
+    clicked_kind: &str,
+    shift: bool,
+    ctrl_cmd: bool,
+) {
+    if shift {
+        let clicked_pos = visible_order.iter().position(|&(id, _)| id == clicked_id);
+        let stored_anchor = ctx.data(|d| d.get_temp::<String>(anchor_key));
+        let anchor_id = stored_anchor
+            .filter(|aid| visible_order.iter().any(|&(id, _)| id == aid))
+            .or_else(|| {
+                session
+                    .selection
+                    .object_3d_ids
+                    .last()
+                    .filter(|aid| visible_order.iter().any(|&(id, _)| id == aid.as_str()))
+                    .cloned()
+            });
+        let anchor_pos = anchor_id
+            .as_deref()
+            .and_then(|aid| visible_order.iter().position(|&(id, _)| id == aid));
+
+        if let (Some(a_idx), Some(c_idx)) = (anchor_pos, clicked_pos) {
+            let lo = a_idx.min(c_idx);
+            let hi = a_idx.max(c_idx);
+            let range = &visible_order[lo..=hi];
+            if !ctrl_cmd {
+                session.selection.object_3d_ids =
+                    range.iter().map(|&(id, _)| id.to_owned()).collect();
+            } else {
+                for &(id, _) in range {
+                    if !session.selection.object_3d_ids.iter().any(|s| s == id) {
+                        session.selection.object_3d_ids.push(id.to_owned());
+                    }
+                }
+            }
+            sync_object_3d_base_type(session, visible_order);
+            session.selection.clear_effects();
+            session.selection.clear_keyframes();
+            if let Some(aid) = anchor_id {
+                ctx.data_mut(|d| d.insert_temp(anchor_key, aid));
+            }
+            return;
+        }
+
+        let _ = session
+            .selection
+            .select_object_3d(clicked_id, clicked_kind, false);
+        ctx.data_mut(|d| d.insert_temp(anchor_key, clicked_id.to_owned()));
+        return;
+    }
+
+    if ctrl_cmd {
+        if let Some(pos) = session
+            .selection
+            .object_3d_ids
+            .iter()
+            .position(|id| id == clicked_id)
+        {
+            session.selection.object_3d_ids.remove(pos);
+        } else {
+            session.selection.object_3d_ids.push(clicked_id.to_owned());
+            session.selection.clear_effects();
+            session.selection.clear_keyframes();
+            ctx.data_mut(|d| d.insert_temp(anchor_key, clicked_id.to_owned()));
+        }
+        sync_object_3d_base_type(session, visible_order);
+        return;
+    }
+
+    let _ = session
+        .selection
+        .select_object_3d(clicked_id, clicked_kind, false);
+    ctx.data_mut(|d| d.insert_temp(anchor_key, clicked_id.to_owned()));
 }
 
 pub(super) fn apply_object_drop(

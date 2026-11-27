@@ -7,8 +7,8 @@ use crate::document::{
     SessionValueKind, TrackKind,
 };
 use crate::plugin_defaults::{
-    canonicalize_object_3d_kind, is_3d_camera_plus_kind, is_3d_container_kind,
-    is_3d_light_plus_kind, is_3d_trapcode_kind, is_core_object_3d_property,
+    canonicalize_object_3d_kind, insert_default_geometry_plus_properties, is_3d_camera_plus_kind,
+    is_3d_container_kind, is_3d_light_plus_kind, is_3d_trapcode_kind, is_core_object_3d_property,
     preserved_value_to_session_property,
 };
 use crate::property_conv::{
@@ -16,6 +16,247 @@ use crate::property_conv::{
     layer_kind_to_session_kind, parse_preserved_bool_u64, parse_preserved_rgba,
     property_track_to_session, text3d_align_to_index,
 };
+
+fn cm3_json_to_property_value(val: &Value) -> zc_project::PropertyValue {
+    match val {
+        Value::Number(n) => zc_project::PropertyValue::Number(n.as_f64().unwrap_or(0.0)),
+        Value::Bool(b) => zc_project::PropertyValue::Bool(*b),
+        Value::String(s) => zc_project::PropertyValue::Text(s.clone()),
+        Value::Array(arr) if arr.len() >= 4 && arr.iter().take(4).all(Value::is_number) => {
+            zc_project::PropertyValue::Vec4([
+                arr[0].as_f64().unwrap_or(0.0),
+                arr[1].as_f64().unwrap_or(0.0),
+                arr[2].as_f64().unwrap_or(0.0),
+                arr[3].as_f64().unwrap_or(0.0),
+            ])
+        }
+        Value::Array(arr) if arr.len() == 3 && arr.iter().all(Value::is_number) => {
+            zc_project::PropertyValue::Vec3([
+                arr[0].as_f64().unwrap_or(0.0),
+                arr[1].as_f64().unwrap_or(0.0),
+                arr[2].as_f64().unwrap_or(0.0),
+            ])
+        }
+        Value::Array(arr) if arr.len() == 2 && arr.iter().all(Value::is_number) => {
+            zc_project::PropertyValue::Vec2([
+                arr[0].as_f64().unwrap_or(0.0),
+                arr[1].as_f64().unwrap_or(0.0),
+            ])
+        }
+        _ => zc_project::PropertyValue::Json(val.clone()),
+    }
+}
+
+fn cm3_json_to_property_track(val: &Value) -> Option<zc_project::PropertyTrack> {
+    let map = val.as_object()?;
+    let looks_like_cm3 = map.contains_key("keyframes")
+        || map.contains_key("k")
+        || map.contains_key("objects")
+        || map.contains_key("expression")
+        || map.contains_key("animated");
+    if !looks_like_cm3 {
+        return None;
+    }
+
+    let explicit_base = map
+        .get("value")
+        .or_else(|| map.get("v"))
+        .map(cm3_json_to_property_value);
+    let animated_flag = map
+        .get("animated")
+        .or_else(|| map.get("a"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let expression = map
+        .get("expression")
+        .or_else(|| map.get("e"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(ToOwned::to_owned);
+
+    let mut keyframes = Vec::new();
+    if let Some(kf_arr) = map
+        .get("keyframes")
+        .or_else(|| map.get("k"))
+        .and_then(Value::as_array)
+    {
+        for kf in kf_arr {
+            let Some(kobj) = kf.as_object() else {
+                continue;
+            };
+            let Some(frame) = kobj
+                .get("frame")
+                .or_else(|| kobj.get("t"))
+                .or_else(|| kobj.get("f"))
+                .and_then(Value::as_f64)
+            else {
+                continue;
+            };
+            let kv = kobj
+                .get("value")
+                .or_else(|| kobj.get("v"))
+                .map(cm3_json_to_property_value)
+                .or_else(|| explicit_base.clone())
+                .unwrap_or(zc_project::PropertyValue::Number(0.0));
+            let tween = kobj
+                .get("tween")
+                .or_else(|| kobj.get("e"))
+                .and_then(Value::as_u64)
+                .unwrap_or(1) as u32;
+            let mut cp = [[-10.0, 0.0], [10.0, 0.0]];
+            if let Some(cparr) = kobj
+                .get("controlPoints")
+                .or_else(|| kobj.get("cp"))
+                .or_else(|| kobj.get("handles"))
+                .and_then(Value::as_array)
+                && cparr.len() >= 2
+            {
+                for (slot, pair_val) in cp.iter_mut().zip(cparr.iter().take(2)) {
+                    if let Some(pair) = pair_val.as_array()
+                        && pair.len() >= 2
+                    {
+                        slot[0] = pair[0].as_f64().unwrap_or(slot[0]);
+                        slot[1] = pair[1].as_f64().unwrap_or(slot[1]);
+                    }
+                }
+            }
+            let cont = kobj
+                .get("continuousTangent")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            keyframes.push(zc_project::PropertyKeyframe::from_cm3_tween(
+                frame, kv, tween, cp, cont,
+            ));
+        }
+    }
+
+    let mut channels = Vec::new();
+    if let Some(ch_arr) = map
+        .get("objects")
+        .or_else(|| map.get("channels"))
+        .and_then(Value::as_array)
+    {
+        for ch in ch_arr {
+            if let Some(ch_track) = cm3_json_to_property_track(ch) {
+                channels.push(ch_track);
+            } else {
+                channels.push(zc_project::PropertyTrack::constant(
+                    cm3_json_to_property_value(ch),
+                ));
+            }
+        }
+    }
+
+    let base_val = if let Some(v) = explicit_base {
+        v
+    } else if !channels.is_empty() {
+        let vals: Vec<f64> = channels
+            .iter()
+            .map(|c| c.value.as_f64().unwrap_or(0.0))
+            .collect();
+        match vals.as_slice() {
+            [x, y, z, w, ..] => zc_project::PropertyValue::Vec4([*x, *y, *z, *w]),
+            [x, y, z] => zc_project::PropertyValue::Vec3([*x, *y, *z]),
+            [x, y] => zc_project::PropertyValue::Vec2([*x, *y]),
+            [x] => zc_project::PropertyValue::Number(*x),
+            _ => zc_project::PropertyValue::Number(0.0),
+        }
+    } else if let Some(first_kf) = keyframes
+        .iter()
+        .find(|k| k.frame.abs() < 1e-6)
+        .or_else(|| keyframes.first())
+    {
+        first_kf.value.clone()
+    } else {
+        zc_project::PropertyValue::Number(0.0)
+    };
+
+    let any_ch_animated = channels
+        .iter()
+        .any(|c| c.animated || c.expression.is_some() || c.keyframes.len() > 1);
+    Some(zc_project::PropertyTrack {
+        animated: animated_flag || expression.is_some() || keyframes.len() > 1 || any_ch_animated,
+        expression,
+        static_behavior: zc_project::StaticBehavior::Constant,
+        value: base_val,
+        keyframes,
+        channels,
+    })
+}
+
+fn cm3_or_preserved_value_to_session_property(val: &Value) -> SessionProperty {
+    if val.is_object() {
+        if let Ok(track) = serde_json::from_value::<zc_project::PropertyTrack>(val.clone()) {
+            return property_track_to_session(&track);
+        }
+        if let Some(track) = cm3_json_to_property_track(val) {
+            return property_track_to_session(&track);
+        }
+    }
+    preserved_value_to_session_property(val)
+}
+
+fn export_preserved_custom_props_to_session(
+    val: &Value,
+    properties: &mut BTreeMap<String, SessionProperty>,
+    skip_core_3d: bool,
+) {
+    if let Some(arr) = val.as_array() {
+        for item in arr {
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
+            let props = obj.get("properties").and_then(Value::as_object);
+            let name = props
+                .and_then(|p| p.get("name"))
+                .and_then(Value::as_str)
+                .or_else(|| obj.get("name").and_then(Value::as_str))
+                .or_else(|| {
+                    obj.get("type")
+                        .and_then(Value::as_object)
+                        .and_then(|t| t.get("name"))
+                        .and_then(Value::as_str)
+                })
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(name) = name else {
+                continue;
+            };
+            let key = if (skip_core_3d && is_core_object_3d_property(name))
+                || properties.contains_key(name)
+            {
+                format!("custom.{name}")
+            } else {
+                name.to_owned()
+            };
+            if properties.contains_key(&key) {
+                continue;
+            }
+            let value_node = obj
+                .get("value")
+                .or_else(|| props.and_then(|p| p.get("value")))
+                .unwrap_or(item);
+            properties.insert(key, cm3_or_preserved_value_to_session_property(value_node));
+        }
+    } else if let Some(map) = val.as_object() {
+        for (name, item) in map {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let key = if (skip_core_3d && is_core_object_3d_property(trimmed))
+                || properties.contains_key(trimmed)
+            {
+                format!("custom.{trimmed}")
+            } else {
+                trimmed.to_owned()
+            };
+            properties
+                .entry(key)
+                .or_insert_with(|| cm3_or_preserved_value_to_session_property(item));
+        }
+    }
+}
 
 fn object_3d_kind_to_str(kind: &zc_project::Object3DKind) -> String {
     match kind {
@@ -75,17 +316,247 @@ pub(crate) fn material_type_index(mat: &zc_project::MaterialSpec) -> Option<u32>
     }
 }
 
-fn export_material_to_session(
-    mat: &zc_project::MaterialSpec,
+fn record_prop_metadata(
+    out: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, Value>>>,
+    target_id: &str,
+    prop_name: &str,
+    metadata: &BTreeMap<String, Value>,
+) {
+    if !metadata.is_empty() {
+        out.entry(target_id.to_owned())
+            .or_default()
+            .insert(prop_name.to_owned(), metadata.clone());
+    }
+}
+
+fn export_camera_data_to_session(
+    c: &zc_project::CameraData,
     properties: &mut BTreeMap<String, SessionProperty>,
 ) {
-    export_material_to_session_with_prefix(mat, "material.", properties);
+    let ckind = match c.kind {
+        zc_project::CameraKind::Perspective => 0,
+        zc_project::CameraKind::Orthographic => 1,
+    };
+    properties.insert(
+        "camera.kind".to_string(),
+        SessionProperty::static_value(json!(ckind)),
+    );
+    properties.insert("fov".to_string(), property_track_to_session(&c.fov));
+    properties.insert(
+        "near".to_string(),
+        SessionProperty::static_value(json!(c.near)),
+    );
+    properties.insert(
+        "far".to_string(),
+        SessionProperty::static_value(json!(c.far)),
+    );
+    properties.insert("zoom".to_string(), property_track_to_session(&c.zoom));
+    properties.insert(
+        "active".to_string(),
+        SessionProperty::static_value_with_kind(
+            json!(u32::from(c.active)),
+            SessionValueKind::Option,
+        ),
+    );
+    properties.insert(
+        "focalLength".to_string(),
+        property_track_to_session(&c.focal_length),
+    );
+    properties.insert(
+        "filmGate".to_string(),
+        SessionProperty::static_value(json!(c.film_gate)),
+    );
+    properties.insert(
+        "filmOffsetX".to_string(),
+        property_track_to_session(&c.film_offset_x),
+    );
+    properties.insert(
+        "filmOffsetY".to_string(),
+        property_track_to_session(&c.film_offset_y),
+    );
+    if let Some(mb) = &c.motion_blur {
+        properties.insert(
+            "motionBlur.enabled".to_string(),
+            SessionProperty::static_value_with_kind(
+                json!(u32::from(mb.enabled)),
+                SessionValueKind::Option,
+            ),
+        );
+        properties.insert(
+            "motionBlur.samples".to_string(),
+            SessionProperty::static_value(json!(mb.samples)),
+        );
+        properties.insert(
+            "motionBlur.shutter".to_string(),
+            property_track_to_session(&mb.shutter),
+        );
+    }
+    properties.insert(
+        "shakeAmplitude".to_string(),
+        property_track_to_session(&c.shake_amplitude),
+    );
+    properties.insert(
+        "shakeSpeed".to_string(),
+        property_track_to_session(&c.shake_speed),
+    );
+    properties.insert(
+        "shake.mode".to_string(),
+        SessionProperty::static_value_with_kind(json!(c.shake.mode), SessionValueKind::Option),
+    );
+    properties.insert(
+        "shake.amplitude".to_string(),
+        SessionProperty::static_value_with_kind(json!(c.shake.amplitude), SessionValueKind::Vec4),
+    );
+    properties.insert(
+        "shake.frequency".to_string(),
+        SessionProperty::static_value_with_kind(json!(c.shake.frequency), SessionValueKind::Vec4),
+    );
+    properties.insert(
+        "shake.phase".to_string(),
+        SessionProperty::static_value_with_kind(json!(c.shake.phase), SessionValueKind::Vec4),
+    );
+    properties.insert(
+        "shake.noise".to_string(),
+        SessionProperty::static_value_with_kind(json!(c.shake.noise), SessionValueKind::Vec4),
+    );
+    properties.insert(
+        "shake.smooth".to_string(),
+        SessionProperty::static_value_with_kind(json!(c.shake.smooth), SessionValueKind::Vec4),
+    );
+    if let Some(dof) = &c.dof {
+        if let Some(tr) = &dof.enabled_track {
+            properties.insert("dofEnabled".to_string(), property_track_to_session(tr));
+        } else {
+            properties.insert(
+                "dofEnabled".to_string(),
+                SessionProperty::static_value(json!(u32::from(dof.enabled))),
+            );
+        }
+        properties.insert(
+            "dofFocusDistance".to_string(),
+            property_track_to_session(&dof.focus_distance),
+        );
+        properties.insert(
+            "dofAperture".to_string(),
+            property_track_to_session(&dof.aperture),
+        );
+        properties.insert(
+            "dofFocusAreaWidth".to_string(),
+            property_track_to_session(&dof.focus_area_width),
+        );
+        properties.insert(
+            "dofNearBlur".to_string(),
+            property_track_to_session(&dof.near_blur),
+        );
+        properties.insert(
+            "dofFarBlur".to_string(),
+            property_track_to_session(&dof.far_blur),
+        );
+    }
+    if let Some(vib) = &c.vibrate {
+        properties.insert(
+            "vibrate.enabled".to_string(),
+            SessionProperty::static_value(json!(u32::from(vib.enabled))),
+        );
+        properties.insert(
+            "vibrate.seed".to_string(),
+            SessionProperty::static_value(json!(vib.seed)),
+        );
+        properties.insert(
+            "vibrate.positionAmplitude".to_string(),
+            property_track_to_session(&vib.position_amplitude),
+        );
+        properties.insert(
+            "vibrate.rotationAmplitude".to_string(),
+            property_track_to_session(&vib.rotation_amplitude),
+        );
+        properties.insert(
+            "vibrate.frequency".to_string(),
+            property_track_to_session(&vib.frequency),
+        );
+        properties.insert(
+            "vibrate.regularPulse".to_string(),
+            SessionProperty::static_value_with_kind(
+                json!(u32::from(vib.regular_pulse)),
+                SessionValueKind::Option,
+            ),
+        );
+        properties.insert(
+            "vibrate.relative".to_string(),
+            SessionProperty::static_value_with_kind(
+                json!(u32::from(vib.relative)),
+                SessionValueKind::Option,
+            ),
+        );
+        properties.insert(
+            "vibrate.enablePosition".to_string(),
+            SessionProperty::static_value_with_kind(
+                json!(u32::from(vib.enable_position)),
+                SessionValueKind::Option,
+            ),
+        );
+        properties.insert(
+            "vibrate.enableRotation".to_string(),
+            SessionProperty::static_value_with_kind(
+                json!(u32::from(vib.enable_rotation)),
+                SessionValueKind::Option,
+            ),
+        );
+        properties.insert(
+            "vibrate.positionFrequency".to_string(),
+            property_track_to_session(&vib.position_frequency),
+        );
+        properties.insert(
+            "vibrate.rotationFrequency".to_string(),
+            property_track_to_session(&vib.rotation_frequency),
+        );
+    }
+}
+
+fn find_primary_camera_object(
+    objects: &[zc_project::Object3D],
+) -> Option<(&zc_project::Object3D, &zc_project::CameraData)> {
+    for obj in objects {
+        if let zc_project::Object3DKind::Camera(cam) = &obj.kind {
+            return Some((obj, cam));
+        }
+        if let zc_project::Object3DKind::Group { children, .. } = &obj.kind
+            && let Some(found) = find_primary_camera_object(children)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn normalize_backdrop_rgb(color: [f64; 3]) -> [f64; 3] {
+    let scale = if color[0] > 1.0 || color[1] > 1.0 || color[2] > 1.0 {
+        1.0 / 255.0
+    } else {
+        1.0
+    };
+    [
+        (color[0] * scale).clamp(0.0, 1.0),
+        (color[1] * scale).clamp(0.0, 1.0),
+        (color[2] * scale).clamp(0.0, 1.0),
+    ]
+}
+
+fn export_material_to_session(
+    mat: &zc_project::MaterialSpec,
+    obj_id: &str,
+    properties: &mut BTreeMap<String, SessionProperty>,
+    prop_meta: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, Value>>>,
+) {
+    export_material_to_session_with_prefix(mat, "material.", obj_id, properties, prop_meta);
 }
 
 fn export_material_to_session_with_prefix(
     mat: &zc_project::MaterialSpec,
     prefix: &str,
+    obj_id: &str,
     properties: &mut BTreeMap<String, SessionProperty>,
+    prop_meta: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, Value>>>,
 ) {
     let k = |suffix: &str| format!("{prefix}{suffix}");
     if let Some(idx) = material_type_index(mat) {
@@ -300,10 +771,9 @@ fn export_material_to_session_with_prefix(
                 SessionProperty::static_value(json!(frag_shader)),
             );
             for cp in custom_properties {
-                properties.insert(
-                    format!("{prefix}custom.{}", cp.name),
-                    property_track_to_session(&cp.track),
-                );
+                let prop_key = format!("{prefix}custom.{}", cp.name);
+                properties.insert(prop_key.clone(), property_track_to_session(&cp.track));
+                record_prop_metadata(prop_meta, obj_id, &prop_key, &cp.metadata);
             }
         }
         zc_project::MaterialSpec::NodeMaterial {
@@ -332,8 +802,10 @@ fn flatten_objects_3d(
     objects: &[zc_project::Object3D],
     parent_id: Option<String>,
     out: &mut Vec<SessionObject3D>,
+    prop_meta: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, Value>>>,
 ) {
     for obj in objects {
+        let obj_id = obj.id.to_string();
         let mut properties = BTreeMap::new();
         properties.insert(
             "enabled".to_string(),
@@ -355,10 +827,20 @@ fn flatten_objects_3d(
                 SessionValueKind::Option,
             ),
         );
+        if obj.zoidium_shadow_mode != zc_project::CompatMode::Current {
+            properties.insert(
+                "zoidiumShadowMode".to_string(),
+                SessionProperty::static_value_with_kind(
+                    json!(obj.zoidium_shadow_mode.as_str()),
+                    SessionValueKind::Text,
+                ),
+            );
+        }
 
         match &obj.kind {
             zc_project::Object3DKind::Group {
                 reflection_visibility,
+                custom_properties,
                 ..
             } => {
                 properties.insert(
@@ -368,6 +850,20 @@ fn flatten_objects_3d(
                         SessionValueKind::Option,
                     ),
                 );
+                for cp in custom_properties {
+                    if cp.name.is_empty() {
+                        continue;
+                    }
+                    let key = if is_core_object_3d_property(&cp.name)
+                        || properties.contains_key(&cp.name)
+                    {
+                        format!("custom.{}", cp.name)
+                    } else {
+                        cp.name.clone()
+                    };
+                    properties.insert(key.clone(), property_track_to_session(&cp.track));
+                    record_prop_metadata(prop_meta, &obj_id, &key, &cp.metadata);
+                }
             }
             zc_project::Object3DKind::Text3D(t) => {
                 properties.insert(
@@ -589,6 +1085,19 @@ fn flatten_objects_3d(
                     properties.insert(
                         "path_innerDetail".to_string(),
                         SessionProperty::static_value(json!(*inner_segments)),
+                    );
+                    let path_closed = obj
+                        .preserved
+                        .get("path_closed")
+                        .or_else(|| obj.preserved.get("property.path_closed"))
+                        .and_then(parse_preserved_bool_u64)
+                        .unwrap_or(0);
+                    properties.insert(
+                        "path_closed".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(path_closed),
+                            SessionValueKind::Option,
+                        ),
                     );
                 }
                 zc_project::Shape3DKind::CustomGeometry { asset_id } => {
@@ -1090,204 +1599,25 @@ fn flatten_objects_3d(
                     "shadowBias".to_string(),
                     SessionProperty::static_value(json!(l.shadow_bias)),
                 );
+                if let Some(ies) = obj
+                    .preserved
+                    .get("iesProfile")
+                    .or_else(|| obj.preserved.get("property.iesProfile"))
+                    && !ies.is_null()
+                {
+                    let prop = if ies.is_string() {
+                        SessionProperty::static_value_with_kind(
+                            ies.clone(),
+                            SessionValueKind::Asset,
+                        )
+                    } else {
+                        cm3_or_preserved_value_to_session_property(ies)
+                    };
+                    properties.insert("iesProfile".to_string(), prop);
+                }
             }
             zc_project::Object3DKind::Camera(c) => {
-                let ckind = match c.kind {
-                    zc_project::CameraKind::Perspective => 0,
-                    zc_project::CameraKind::Orthographic => 1,
-                };
-                properties.insert(
-                    "camera.kind".to_string(),
-                    SessionProperty::static_value(json!(ckind)),
-                );
-                properties.insert("fov".to_string(), property_track_to_session(&c.fov));
-                properties.insert(
-                    "near".to_string(),
-                    SessionProperty::static_value(json!(c.near)),
-                );
-                properties.insert(
-                    "far".to_string(),
-                    SessionProperty::static_value(json!(c.far)),
-                );
-                properties.insert("zoom".to_string(), property_track_to_session(&c.zoom));
-                properties.insert(
-                    "active".to_string(),
-                    SessionProperty::static_value_with_kind(
-                        json!(u32::from(c.active)),
-                        SessionValueKind::Option,
-                    ),
-                );
-                properties.insert(
-                    "focalLength".to_string(),
-                    property_track_to_session(&c.focal_length),
-                );
-                properties.insert(
-                    "filmGate".to_string(),
-                    SessionProperty::static_value(json!(c.film_gate)),
-                );
-                properties.insert(
-                    "filmOffsetX".to_string(),
-                    property_track_to_session(&c.film_offset_x),
-                );
-                properties.insert(
-                    "filmOffsetY".to_string(),
-                    property_track_to_session(&c.film_offset_y),
-                );
-                if let Some(mb) = &c.motion_blur {
-                    properties.insert(
-                        "motionBlur.enabled".to_string(),
-                        SessionProperty::static_value_with_kind(
-                            json!(u32::from(mb.enabled)),
-                            SessionValueKind::Option,
-                        ),
-                    );
-                    properties.insert(
-                        "motionBlur.samples".to_string(),
-                        SessionProperty::static_value(json!(mb.samples)),
-                    );
-                    properties.insert(
-                        "motionBlur.shutter".to_string(),
-                        property_track_to_session(&mb.shutter),
-                    );
-                }
-                properties.insert(
-                    "shakeAmplitude".to_string(),
-                    property_track_to_session(&c.shake_amplitude),
-                );
-                properties.insert(
-                    "shakeSpeed".to_string(),
-                    property_track_to_session(&c.shake_speed),
-                );
-                properties.insert(
-                    "shake.mode".to_string(),
-                    SessionProperty::static_value_with_kind(
-                        json!(c.shake.mode),
-                        SessionValueKind::Option,
-                    ),
-                );
-                properties.insert(
-                    "shake.amplitude".to_string(),
-                    SessionProperty::static_value_with_kind(
-                        json!(c.shake.amplitude),
-                        SessionValueKind::Vec4,
-                    ),
-                );
-                properties.insert(
-                    "shake.frequency".to_string(),
-                    SessionProperty::static_value_with_kind(
-                        json!(c.shake.frequency),
-                        SessionValueKind::Vec4,
-                    ),
-                );
-                properties.insert(
-                    "shake.phase".to_string(),
-                    SessionProperty::static_value_with_kind(
-                        json!(c.shake.phase),
-                        SessionValueKind::Vec4,
-                    ),
-                );
-                properties.insert(
-                    "shake.noise".to_string(),
-                    SessionProperty::static_value_with_kind(
-                        json!(c.shake.noise),
-                        SessionValueKind::Vec4,
-                    ),
-                );
-                properties.insert(
-                    "shake.smooth".to_string(),
-                    SessionProperty::static_value_with_kind(
-                        json!(c.shake.smooth),
-                        SessionValueKind::Vec4,
-                    ),
-                );
-                if let Some(dof) = &c.dof {
-                    if let Some(tr) = &dof.enabled_track {
-                        properties.insert("dofEnabled".to_string(), property_track_to_session(tr));
-                    } else {
-                        properties.insert(
-                            "dofEnabled".to_string(),
-                            SessionProperty::static_value(json!(u32::from(dof.enabled))),
-                        );
-                    }
-                    properties.insert(
-                        "dofFocusDistance".to_string(),
-                        property_track_to_session(&dof.focus_distance),
-                    );
-                    properties.insert(
-                        "dofAperture".to_string(),
-                        property_track_to_session(&dof.aperture),
-                    );
-                    properties.insert(
-                        "dofFocusAreaWidth".to_string(),
-                        property_track_to_session(&dof.focus_area_width),
-                    );
-                    properties.insert(
-                        "dofNearBlur".to_string(),
-                        property_track_to_session(&dof.near_blur),
-                    );
-                    properties.insert(
-                        "dofFarBlur".to_string(),
-                        property_track_to_session(&dof.far_blur),
-                    );
-                }
-                if let Some(vib) = &c.vibrate {
-                    properties.insert(
-                        "vibrate.enabled".to_string(),
-                        SessionProperty::static_value(json!(u32::from(vib.enabled))),
-                    );
-                    properties.insert(
-                        "vibrate.seed".to_string(),
-                        SessionProperty::static_value(json!(vib.seed)),
-                    );
-                    properties.insert(
-                        "vibrate.positionAmplitude".to_string(),
-                        property_track_to_session(&vib.position_amplitude),
-                    );
-                    properties.insert(
-                        "vibrate.rotationAmplitude".to_string(),
-                        property_track_to_session(&vib.rotation_amplitude),
-                    );
-                    properties.insert(
-                        "vibrate.frequency".to_string(),
-                        property_track_to_session(&vib.frequency),
-                    );
-                    properties.insert(
-                        "vibrate.regularPulse".to_string(),
-                        SessionProperty::static_value_with_kind(
-                            json!(u32::from(vib.regular_pulse)),
-                            SessionValueKind::Option,
-                        ),
-                    );
-                    properties.insert(
-                        "vibrate.relative".to_string(),
-                        SessionProperty::static_value_with_kind(
-                            json!(u32::from(vib.relative)),
-                            SessionValueKind::Option,
-                        ),
-                    );
-                    properties.insert(
-                        "vibrate.enablePosition".to_string(),
-                        SessionProperty::static_value_with_kind(
-                            json!(u32::from(vib.enable_position)),
-                            SessionValueKind::Option,
-                        ),
-                    );
-                    properties.insert(
-                        "vibrate.enableRotation".to_string(),
-                        SessionProperty::static_value_with_kind(
-                            json!(u32::from(vib.enable_rotation)),
-                            SessionValueKind::Option,
-                        ),
-                    );
-                    properties.insert(
-                        "vibrate.positionFrequency".to_string(),
-                        property_track_to_session(&vib.position_frequency),
-                    );
-                    properties.insert(
-                        "vibrate.rotationFrequency".to_string(),
-                        property_track_to_session(&vib.rotation_frequency),
-                    );
-                }
+                export_camera_data_to_session(c, &mut properties);
             }
             zc_project::Object3DKind::Particles(p) => {
                 properties.insert(
@@ -1419,13 +1749,25 @@ fn flatten_objects_3d(
         }
 
         if let Some(mat) = &obj.material {
-            export_material_to_session(mat, &mut properties);
+            export_material_to_session(mat, &obj_id, &mut properties, prop_meta);
         }
         if let Some(front_mat) = obj.material_slots.get("front") {
-            export_material_to_session_with_prefix(front_mat, "frontMaterial.", &mut properties);
+            export_material_to_session_with_prefix(
+                front_mat,
+                "frontMaterial.",
+                &obj_id,
+                &mut properties,
+                prop_meta,
+            );
         }
         if let Some(side_mat) = obj.material_slots.get("side") {
-            export_material_to_session_with_prefix(side_mat, "sideMaterial.", &mut properties);
+            export_material_to_session_with_prefix(
+                side_mat,
+                "sideMaterial.",
+                &obj_id,
+                &mut properties,
+                prop_meta,
+            );
         }
 
         for (pk, pv) in &obj.preserved {
@@ -1437,8 +1779,38 @@ fn flatten_objects_3d(
             {
                 properties.insert(
                     prop_name.to_owned(),
-                    preserved_value_to_session_property(pv),
+                    cm3_or_preserved_value_to_session_property(pv),
                 );
+            }
+        }
+        // Also surface Zoidium plugin property bags (`characterProperties`, `repeaterProperties`,
+        // `effectorProperties`, `fieldProperties`) when they exist in `obj.preserved` (e.g. legacy
+        // `.zcraft` saves created before `pz_import` unpacked them into `property.*`).
+        for container_key in [
+            "characterProperties",
+            "repeaterProperties",
+            "effectorProperties",
+            "fieldProperties",
+        ] {
+            if let Some(cmap) = obj.preserved.get(container_key).and_then(Value::as_object) {
+                for (prop_name, pv) in cmap {
+                    if !prop_name.is_empty()
+                        && prop_name != "name"
+                        && prop_name != "kerning"
+                        && !is_core_object_3d_property(prop_name)
+                        && !properties.contains_key(prop_name)
+                    {
+                        properties.insert(
+                            prop_name.to_owned(),
+                            cm3_or_preserved_value_to_session_property(pv),
+                        );
+                    }
+                }
+            }
+        }
+        for custom_key in ["customProperties", "userProperties", "extraProperties"] {
+            if let Some(cv) = obj.preserved.get(custom_key) {
+                export_preserved_custom_props_to_session(cv, &mut properties, true);
             }
         }
         if !properties.contains_key("fieldNoiseEvolution")
@@ -1446,7 +1818,7 @@ fn flatten_objects_3d(
         {
             properties.insert(
                 "fieldNoiseEvolution".to_owned(),
-                preserved_value_to_session_property(ev),
+                cm3_or_preserved_value_to_session_property(ev),
             );
         }
 
@@ -1517,7 +1889,6 @@ fn flatten_objects_3d(
             );
         }
 
-        let obj_id = obj.id.to_string();
         let plugin_type_str = obj
             .preserved
             .get("zoidiumPluginObjectType")
@@ -1548,6 +1919,7 @@ fn flatten_objects_3d(
             ),
             _ => object_3d_kind_to_str(&obj.kind),
         };
+        insert_default_geometry_plus_properties(&kind, &mut properties);
         out.push(SessionObject3D {
             id: obj_id.clone(),
             parent_id: parent_id.clone(),
@@ -1557,7 +1929,7 @@ fn flatten_objects_3d(
             properties,
         });
         if let zc_project::Object3DKind::Group { children, .. } = &obj.kind {
-            flatten_objects_3d(children, Some(obj_id), out);
+            flatten_objects_3d(children, Some(obj_id), out, prop_meta);
         }
     }
 }
@@ -1574,35 +1946,71 @@ pub(crate) fn effect_kind_to_session_id(kind: &zc_project::EffectKind) -> String
     }
 }
 
-fn effect_to_session(fx: &zc_project::EffectInstance) -> SessionEffect {
+fn effect_to_session(
+    fx: &zc_project::EffectInstance,
+    group_children: &mut BTreeMap<String, Vec<SessionEffect>>,
+    prop_meta: &mut BTreeMap<String, BTreeMap<String, BTreeMap<String, Value>>>,
+    depth: usize,
+) -> SessionEffect {
+    let fx_id = fx.id.to_string();
     let mut properties = BTreeMap::new();
     properties.insert(
         "enabled".to_string(),
         property_track_to_session(&fx.enabled),
     );
-    let is_custom_shader = matches!(fx.kind, zc_project::EffectKind::CustomShader { .. });
-    if let zc_project::EffectKind::CustomShader {
-        frag_shader,
-        custom_properties,
-    } = &fx.kind
-    {
-        properties.insert(
-            "fragShader".to_string(),
-            SessionProperty::static_value(json!(frag_shader)),
-        );
-        for cp in custom_properties {
-            properties.insert(cp.name.clone(), property_track_to_session(&cp.track));
+    let has_custom_properties = matches!(
+        fx.kind,
+        zc_project::EffectKind::CustomShader { .. } | zc_project::EffectKind::EffectGroup { .. }
+    );
+    match &fx.kind {
+        zc_project::EffectKind::CustomShader {
+            frag_shader,
+            custom_properties,
+        } => {
+            properties.insert(
+                "fragShader".to_string(),
+                SessionProperty::static_value(json!(frag_shader)),
+            );
+            for cp in custom_properties {
+                properties.insert(cp.name.clone(), property_track_to_session(&cp.track));
+                record_prop_metadata(prop_meta, &fx_id, &cp.name, &cp.metadata);
+            }
         }
+        zc_project::EffectKind::EffectGroup {
+            custom_properties,
+            children,
+        } => {
+            for cp in custom_properties {
+                if !cp.name.is_empty() && cp.name != "enabled" {
+                    properties.insert(cp.name.clone(), property_track_to_session(&cp.track));
+                    record_prop_metadata(prop_meta, &fx_id, &cp.name, &cp.metadata);
+                }
+            }
+            if !children.is_empty() && depth < 16 {
+                let child_sessions: Vec<SessionEffect> = children
+                    .iter()
+                    .map(|child| effect_to_session(child, group_children, prop_meta, depth + 1))
+                    .collect();
+                group_children.insert(fx_id.clone(), child_sessions);
+            }
+        }
+        _ => {}
     }
     for (k, track) in &fx.params {
-        if k == "enabled" || (is_custom_shader && (k == "fragShader" || properties.contains_key(k)))
+        if k == "enabled"
+            || (has_custom_properties && (k == "fragShader" || properties.contains_key(k)))
         {
             continue;
         }
         properties.insert(k.clone(), property_track_to_session(track));
     }
+    for custom_key in ["customProperties", "userProperties", "extraProperties"] {
+        if let Some(cv) = fx.preserved.get(custom_key) {
+            export_preserved_custom_props_to_session(cv, &mut properties, false);
+        }
+    }
     SessionEffect {
-        id: fx.id.to_string(),
+        id: fx_id,
         kind: effect_kind_to_session_id(&fx.kind),
         name: fx.name.clone(),
         source_id: None,
@@ -1769,6 +2177,39 @@ pub(crate) fn default_clip_properties(
                 SessionProperty::static_value_with_kind(json!(1.0), SessionValueKind::Number),
             );
         }
+        "zoidium:camera-plus/camera-layer" | "zoidium:camera-plus/camera" => {
+            export_camera_data_to_session(&zc_project::CameraData::default(), &mut properties);
+            properties.insert(
+                "cameraPosition".to_string(),
+                SessionProperty::static_value_with_kind(
+                    json!([0.0, 0.0, 100.0]),
+                    SessionValueKind::Vec3,
+                ),
+            );
+            properties.insert(
+                "cameraRotation".to_string(),
+                SessionProperty::static_value_with_kind(
+                    json!([0.0, 0.0, 0.0]),
+                    SessionValueKind::Vec3,
+                ),
+            );
+            properties.insert(
+                "depth".to_string(),
+                SessionProperty::static_value(json!(100.0)),
+            );
+            properties.insert(
+                "rotationX".to_string(),
+                SessionProperty::static_value(json!(0.0)),
+            );
+            properties.insert(
+                "rotationY".to_string(),
+                SessionProperty::static_value(json!(0.0)),
+            );
+            properties.insert(
+                "motionBlurAmount".to_string(),
+                SessionProperty::static_value(json!(1.0)),
+            );
+        }
         _ => {}
     }
 
@@ -1795,7 +2236,26 @@ impl SessionDocument {
     ) -> Self {
         let fps = f64::from(seq.fps.max(1));
         let mut video_tracks = Vec::with_capacity(seq.video_tracks.len());
+        let mut effect_group_children: BTreeMap<String, Vec<SessionEffect>> = BTreeMap::new();
+        let mut property_metadata: BTreeMap<String, BTreeMap<String, BTreeMap<String, Value>>> =
+            BTreeMap::new();
+        let mut track_matte: BTreeMap<String, BTreeMap<String, Value>> = BTreeMap::new();
         for vt in &seq.video_tracks {
+            let mut vt_matte = BTreeMap::new();
+            for (canon, snake) in [
+                ("trackMatte", "track_matte"),
+                ("matteType", "matte_type"),
+                ("matteInvert", "matte_invert"),
+            ] {
+                if let Some(v) = vt.preserved.get(canon).or_else(|| vt.preserved.get(snake))
+                    && !v.is_null()
+                {
+                    vt_matte.insert(canon.to_owned(), v.clone());
+                }
+            }
+            if !vt_matte.is_empty() {
+                track_matte.insert(vt.id.to_string(), vt_matte);
+            }
             let mut clips = Vec::with_capacity(vt.clips.len());
             for vc in &vt.clips {
                 let (time_start, time_end, time_animated) =
@@ -1911,80 +2371,165 @@ impl SessionDocument {
                             "shadows".to_string(),
                             SessionProperty::static_value(json!(shadows_on)),
                         );
-                        let bg_raw = vc
-                            .layer
-                            .preserved
-                            .get("backgroundColor")
-                            .or_else(|| vc.layer.preserved.get("property.backgroundColor"));
-                        if let Some([r, g, b, alpha]) = bg_raw.and_then(parse_preserved_rgba) {
-                            let mode = u32::from(alpha > 0.0);
+                        if let Some(bd) = seq.scene_backdrops.get(&vc.layer.id) {
+                            let rgb = normalize_backdrop_rgb(bd.color);
                             properties.insert(
                                 "sceneBackground".to_string(),
-                                SessionProperty::static_value(json!(mode)),
+                                SessionProperty::static_value_with_kind(
+                                    json!(bd.mode),
+                                    SessionValueKind::Option,
+                                ),
                             );
                             properties.insert(
                                 "backgroundColor".to_string(),
                                 SessionProperty::static_value_with_kind(
-                                    json!([r, g, b]),
+                                    json!(rgb),
                                     SessionValueKind::Color,
                                 ),
                             );
                             properties.insert(
                                 "backdropOpacity".to_string(),
-                                SessionProperty::static_value_with_kind(
-                                    json!(alpha),
-                                    SessionValueKind::Number,
-                                ),
-                            );
-                        } else if let Some([r, g, b, alpha]) = bg_raw
-                            .and_then(Value::as_object)
-                            .and_then(|o| o.get("value"))
-                            .and_then(parse_preserved_rgba)
-                        {
-                            let mode = u32::from(alpha > 0.0);
-                            properties.insert(
-                                "sceneBackground".to_string(),
-                                SessionProperty::static_value(json!(mode)),
-                            );
-                            properties.insert(
-                                "backgroundColor".to_string(),
-                                SessionProperty::static_value_with_kind(
-                                    json!([r, g, b]),
-                                    SessionValueKind::Color,
-                                ),
-                            );
-                            properties.insert(
-                                "backdropOpacity".to_string(),
-                                SessionProperty::static_value_with_kind(
-                                    json!(alpha),
-                                    SessionValueKind::Number,
-                                ),
+                                property_track_to_session(&bd.opacity),
                             );
                         } else {
+                            let bg_raw = vc
+                                .layer
+                                .preserved
+                                .get("backgroundColor")
+                                .or_else(|| vc.layer.preserved.get("property.backgroundColor"));
+                            if let Some([r, g, b, alpha]) = bg_raw.and_then(parse_preserved_rgba) {
+                                let mode = u32::from(alpha > 0.0);
+                                properties.insert(
+                                    "sceneBackground".to_string(),
+                                    SessionProperty::static_value(json!(mode)),
+                                );
+                                properties.insert(
+                                    "backgroundColor".to_string(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!([r, g, b]),
+                                        SessionValueKind::Color,
+                                    ),
+                                );
+                                properties.insert(
+                                    "backdropOpacity".to_string(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!(alpha),
+                                        SessionValueKind::Number,
+                                    ),
+                                );
+                            } else if let Some([r, g, b, alpha]) = bg_raw
+                                .and_then(Value::as_object)
+                                .and_then(|o| o.get("value"))
+                                .and_then(parse_preserved_rgba)
+                            {
+                                let mode = u32::from(alpha > 0.0);
+                                properties.insert(
+                                    "sceneBackground".to_string(),
+                                    SessionProperty::static_value(json!(mode)),
+                                );
+                                properties.insert(
+                                    "backgroundColor".to_string(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!([r, g, b]),
+                                        SessionValueKind::Color,
+                                    ),
+                                );
+                                properties.insert(
+                                    "backdropOpacity".to_string(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!(alpha),
+                                        SessionValueKind::Number,
+                                    ),
+                                );
+                            } else {
+                                properties.insert(
+                                    "sceneBackground".to_string(),
+                                    SessionProperty::static_value(json!(0)),
+                                );
+                                properties.insert(
+                                    "backgroundColor".to_string(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!([
+                                            f64::from(seq.background_color[0]),
+                                            f64::from(seq.background_color[1]),
+                                            f64::from(seq.background_color[2]),
+                                        ]),
+                                        SessionValueKind::Color,
+                                    ),
+                                );
+                                properties.insert(
+                                    "backdropOpacity".to_string(),
+                                    SessionProperty::static_value_with_kind(
+                                        json!(1.0),
+                                        SessionValueKind::Number,
+                                    ),
+                                );
+                            }
+                        }
+                        if *shadow_mode != zc_project::CompatMode::Current {
                             properties.insert(
-                                "sceneBackground".to_string(),
-                                SessionProperty::static_value(json!(0)),
-                            );
-                            properties.insert(
-                                "backgroundColor".to_string(),
+                                "shadowMode".to_string(),
                                 SessionProperty::static_value_with_kind(
-                                    json!([
-                                        f64::from(seq.background_color[0]),
-                                        f64::from(seq.background_color[1]),
-                                        f64::from(seq.background_color[2]),
-                                    ]),
-                                    SessionValueKind::Color,
-                                ),
-                            );
-                            properties.insert(
-                                "backdropOpacity".to_string(),
-                                SessionProperty::static_value_with_kind(
-                                    json!(1.0),
-                                    SessionValueKind::Number,
+                                    json!(shadow_mode.as_str()),
+                                    SessionValueKind::Text,
                                 ),
                             );
                         }
-                        let _ = shadow_mode;
+                    }
+                    zc_project::LayerKind::CameraLayer { camera } => {
+                        export_camera_data_to_session(camera, &mut properties);
+                        if let Some(cam_objs) = seq.camera_layer_objects.get(&vc.layer.id)
+                            && let Some((cam_obj, cam_data)) = find_primary_camera_object(cam_objs)
+                        {
+                            export_camera_data_to_session(cam_data, &mut properties);
+                            properties.insert(
+                                "cameraPosition".to_string(),
+                                property_track_to_session(&cam_obj.position),
+                            );
+                            properties.insert(
+                                "cameraRotation".to_string(),
+                                property_track_to_session(&cam_obj.rotation),
+                            );
+                        } else {
+                            let px = match &vc.layer.position.value {
+                                zc_project::PropertyValue::Vec2(v) => v[0],
+                                _ => 0.0,
+                            };
+                            let py = match &vc.layer.position.value {
+                                zc_project::PropertyValue::Vec2(v) => v[1],
+                                _ => 0.0,
+                            };
+                            let pz = seq
+                                .layer_3d_props
+                                .get(&vc.layer.id)
+                                .and_then(|p| p.depth.value.as_f64())
+                                .unwrap_or(100.0);
+                            let rx = seq
+                                .layer_3d_props
+                                .get(&vc.layer.id)
+                                .and_then(|p| p.rotation_x.value.as_f64())
+                                .unwrap_or(0.0);
+                            let ry = seq
+                                .layer_3d_props
+                                .get(&vc.layer.id)
+                                .and_then(|p| p.rotation_y.value.as_f64())
+                                .unwrap_or(0.0);
+                            let rz = vc.layer.rotation.value.as_f64().unwrap_or(0.0);
+                            properties.insert(
+                                "cameraPosition".to_string(),
+                                SessionProperty::static_value_with_kind(
+                                    json!([px, py, pz]),
+                                    SessionValueKind::Vec3,
+                                ),
+                            );
+                            properties.insert(
+                                "cameraRotation".to_string(),
+                                SessionProperty::static_value_with_kind(
+                                    json!([rx, ry, rz]),
+                                    SessionValueKind::Vec3,
+                                ),
+                            );
+                        }
                     }
                     zc_project::LayerKind::PrecompRef { composition_id } => {
                         properties.insert(
@@ -2003,11 +2548,76 @@ impl SessionDocument {
                     }
                     _ => {}
                 }
+                if let Some(p3d) = seq.layer_3d_props.get(&vc.layer.id) {
+                    properties.insert("depth".to_string(), property_track_to_session(&p3d.depth));
+                    properties.insert(
+                        "rotationX".to_string(),
+                        property_track_to_session(&p3d.rotation_x),
+                    );
+                    properties.insert(
+                        "rotationY".to_string(),
+                        property_track_to_session(&p3d.rotation_y),
+                    );
+                    properties.insert(
+                        "motionBlurAmount".to_string(),
+                        property_track_to_session(&p3d.motion_blur_amount),
+                    );
+                }
+                for (canon, snake) in [
+                    ("trackMatte", "track_matte"),
+                    ("matteType", "matte_type"),
+                    ("matteInvert", "matte_invert"),
+                ] {
+                    if let Some(v) = vc
+                        .layer
+                        .preserved
+                        .get(canon)
+                        .or_else(|| vc.layer.preserved.get(snake))
+                        .or_else(|| vc.preserved.get(canon))
+                        .or_else(|| vc.preserved.get(snake))
+                        && !v.is_null()
+                    {
+                        let prop = if canon == "trackMatte" && v.is_string() {
+                            SessionProperty::static_value_with_kind(
+                                v.clone(),
+                                SessionValueKind::Text,
+                            )
+                        } else if (canon == "matteType" || canon == "matteInvert") && v.is_number()
+                        {
+                            SessionProperty::static_value_with_kind(
+                                v.clone(),
+                                SessionValueKind::Option,
+                            )
+                        } else {
+                            cm3_or_preserved_value_to_session_property(v)
+                        };
+                        properties.insert(canon.to_owned(), prop);
+                    }
+                }
+                for custom_key in ["customProperties", "userProperties", "extraProperties"] {
+                    if let Some(cv) = vc.layer.preserved.get(custom_key) {
+                        export_preserved_custom_props_to_session(cv, &mut properties, false);
+                    }
+                    if let Some(cv) = vc.preserved.get(custom_key) {
+                        export_preserved_custom_props_to_session(cv, &mut properties, false);
+                    }
+                }
                 let mut objects_3d = Vec::new();
                 if let zc_project::LayerKind::Scene3D { objects, .. } = &vc.layer.kind {
-                    flatten_objects_3d(objects, None, &mut objects_3d);
+                    flatten_objects_3d(objects, None, &mut objects_3d, &mut property_metadata);
+                } else if matches!(vc.layer.kind, zc_project::LayerKind::CameraLayer { .. })
+                    && let Some(cam_objs) = seq.camera_layer_objects.get(&vc.layer.id)
+                {
+                    flatten_objects_3d(cam_objs, None, &mut objects_3d, &mut property_metadata);
                 }
-                let effects = vc.layer.effects.iter().map(effect_to_session).collect();
+                let effects = vc
+                    .layer
+                    .effects
+                    .iter()
+                    .map(|fx| {
+                        effect_to_session(fx, &mut effect_group_children, &mut property_metadata, 0)
+                    })
+                    .collect();
                 let media_id_for_len = match &vc.layer.kind {
                     zc_project::LayerKind::Video { media } => {
                         media.as_deref().or(vc.media.as_deref())
@@ -2101,6 +2711,44 @@ impl SessionDocument {
         }
 
         let mut sequence_properties = BTreeMap::new();
+        // Expose primary solid `scene_backdrop` (if present) or sequence `background_color`.
+        let primary_solid_backdrop = seq.video_tracks.iter().find_map(|vt| {
+            vt.clips.iter().find_map(|vc| {
+                seq.scene_backdrops
+                    .get(&vc.layer.id)
+                    .filter(|bd| bd.mode != 0)
+            })
+        });
+        if let Some(bd) = primary_solid_backdrop {
+            let rgb = normalize_backdrop_rgb(bd.color);
+            sequence_properties.insert(
+                "backgroundColor".to_string(),
+                SessionProperty::static_value_with_kind(json!(rgb), SessionValueKind::Color),
+            );
+            sequence_properties.insert(
+                "backdropOpacity".to_string(),
+                property_track_to_session(&bd.opacity),
+            );
+        } else {
+            sequence_properties.insert(
+                "backgroundColor".to_string(),
+                SessionProperty::static_value_with_kind(
+                    json!([
+                        f64::from(seq.background_color[0]),
+                        f64::from(seq.background_color[1]),
+                        f64::from(seq.background_color[2]),
+                    ]),
+                    SessionValueKind::Color,
+                ),
+            );
+            sequence_properties.insert(
+                "backdropOpacity".to_string(),
+                SessionProperty::static_value_with_kind(
+                    json!(f64::from(seq.background_color[3])),
+                    SessionValueKind::Number,
+                ),
+            );
+        }
         sequence_properties.insert(
             "motionBlur.enabled".to_string(),
             SessionProperty::static_value(json!(u32::from(seq.motion_blur.enabled))),
@@ -2151,6 +2799,9 @@ impl SessionDocument {
             sequence_properties,
             active_composition_id,
             sequence_control_order,
+            effect_group_children,
+            property_metadata,
+            track_matte,
         }
     }
 }

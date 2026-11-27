@@ -240,6 +240,82 @@ pub fn cm3_gradient_bar(
             stop_changed = true;
         }
 
+        let modern_editor = ui.ctx().data(|d| {
+            d.get_temp::<usize>(Id::unique("zc_gradient_editor_style"))
+                .unwrap_or(0)
+                == 0
+        });
+        if modern_editor {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                if ui
+                    .small_button("Reverse")
+                    .on_hover_text("Reverse gradient stop positions")
+                    .clicked()
+                {
+                    for s in stops.iter_mut() {
+                        s.position = (1.0 - s.position).clamp(0.0, 1.0);
+                    }
+                    stops.sort_by(|a, b| a.position.total_cmp(&b.position));
+                    stop_changed = true;
+                    ev.changed = true;
+                    ev.committed = true;
+                }
+                if ui
+                    .small_button("Distribute")
+                    .on_hover_text("Distribute stops evenly across 0..1")
+                    .clicked()
+                {
+                    stops.sort_by(|a, b| a.position.total_cmp(&b.position));
+                    let n = stops.len();
+                    if n >= 2 {
+                        for (i, s) in stops.iter_mut().enumerate() {
+                            s.position = i as f64 / (n - 1) as f64;
+                        }
+                        stop_changed = true;
+                        ev.changed = true;
+                        ev.committed = true;
+                    }
+                }
+                for (plabel, preset_stops) in [
+                    (
+                        "B→W",
+                        &[(0.0, "rgba(0,0,0,1.000)"), (1.0, "rgba(255,255,255,1.000)")][..],
+                    ),
+                    (
+                        "Heat",
+                        &[
+                            (0.0, "rgba(18,8,28,1.000)"),
+                            (0.5, "rgba(220,64,28,1.000)"),
+                            (1.0, "rgba(255,244,180,1.000)"),
+                        ][..],
+                    ),
+                    (
+                        "Ocean",
+                        &[
+                            (0.0, "rgba(10,28,58,1.000)"),
+                            (0.5, "rgba(32,140,196,1.000)"),
+                            (1.0, "rgba(196,242,255,1.000)"),
+                        ][..],
+                    ),
+                ] {
+                    if ui.small_button(plabel).clicked() {
+                        *stops = preset_stops
+                            .iter()
+                            .map(|(p, c)| GradientStop {
+                                position: *p,
+                                color: (*c).to_owned(),
+                            })
+                            .collect();
+                        state.selected_stop = 0;
+                        stop_changed = true;
+                        ev.changed = true;
+                        ev.committed = true;
+                    }
+                }
+            });
+        }
+
         // Inline color editor for selected stop (single picker ID; commit & close popup when stop changes)
         let stop_picker_id = id.with("stop_color");
         if stop_changed {

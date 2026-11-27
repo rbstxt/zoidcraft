@@ -54,6 +54,80 @@ pub(crate) fn is_video_extension(ext: &str) -> bool {
     )
 }
 
+/// Probes total animation duration in seconds for an animated GIF (`GIF87a` / `GIF89a`),
+/// applying the standard `< 20ms => 100ms` frame-delay rule. Pure-Rust block scanner (works on
+/// native and wasm32). Returns `None` for non-GIFs or single-frame static GIFs.
+pub(crate) fn probe_gif_duration_secs(bytes: &[u8]) -> Option<f64> {
+    if bytes.len() < 13 || (&bytes[..6] != b"GIF87a" && &bytes[..6] != b"GIF89a") {
+        return None;
+    }
+    let mut i = 13_usize;
+    let packed = bytes[10];
+    if (packed & 0x80) != 0 {
+        let gct_entries = 1_usize << ((packed & 0x07) + 1);
+        i = i.checked_add(gct_entries * 3)?;
+    }
+    let mut frames = 0_usize;
+    let mut total_secs = 0.0_f64;
+    let mut pending_delay_ms: Option<f64> = None;
+
+    let skip_sub_blocks = |mut pos: usize| -> usize {
+        while pos < bytes.len() {
+            let len = usize::from(bytes[pos]);
+            pos += 1;
+            if len == 0 {
+                break;
+            }
+            pos = pos.saturating_add(len).min(bytes.len());
+        }
+        pos
+    };
+
+    while i < bytes.len() && frames < 10_000 {
+        match bytes[i] {
+            0x3B => break, // Trailer
+            0x21 => {
+                // Extension introducer
+                if i + 2 >= bytes.len() {
+                    break;
+                }
+                let label = bytes[i + 1];
+                if label == 0xF9 && i + 7 < bytes.len() && bytes[i + 2] == 4 {
+                    let delay_cs = u16::from_le_bytes([bytes[i + 4], bytes[i + 5]]);
+                    pending_delay_ms = Some(f64::from(delay_cs) * 10.0);
+                    i = skip_sub_blocks(i + 2);
+                } else {
+                    i = skip_sub_blocks(i + 2);
+                }
+            }
+            0x2C => {
+                // Image Descriptor
+                if i + 10 >= bytes.len() {
+                    break;
+                }
+                let img_packed = bytes[i + 9];
+                i += 10;
+                if (img_packed & 0x80) != 0 {
+                    let lct_entries = 1_usize << ((img_packed & 0x07) + 1);
+                    i = i.saturating_add(lct_entries * 3);
+                }
+                if i >= bytes.len() {
+                    break;
+                }
+                i += 1; // LZW minimum code size
+                i = skip_sub_blocks(i);
+                let ms = pending_delay_ms.take().unwrap_or(100.0);
+                total_secs += if ms < 20.0 { 0.1 } else { ms / 1000.0 };
+                frames += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    (frames > 1 && total_secs > 0.0).then_some(total_secs)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn is_video_path(path: &Path) -> bool {
     path.extension()
@@ -804,6 +878,10 @@ impl ZoidCraftApp {
             return Ok(warn);
         }
         if payload.probed.width.is_none() && !zc_render::video::ffprobe_binary_available() {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.ffmpeg_setup.banner_visible = true;
+            }
             return Ok(format!(
                 "Imported {} (FFmpeg/ffprobe not found — install FFmpeg to preview videos)",
                 payload.filename
@@ -899,6 +977,11 @@ impl ZoidCraftApp {
             .begin_transaction(format!("Import {filename}"))
             .is_ok();
 
+        let gif_duration_secs = if ext.eq_ignore_ascii_case("gif") {
+            probe_gif_duration_secs(&bytes)
+        } else {
+            None
+        };
         let asset_id = self
             .session
             .project
@@ -993,7 +1076,13 @@ impl ZoidCraftApp {
                 "video"
             };
             let desired_start = self.session.playback.current_frame.round().max(0.0);
-            let length = 150.0_f64;
+            let length = gif_duration_secs
+                .map(|secs| {
+                    (secs * self.session.document().fps.max(1.0))
+                        .round()
+                        .max(1.0)
+                })
+                .unwrap_or(150.0);
             let track_id = choose_free_video_track_at(&self.session, desired_start, length)
                 .or_else(|| {
                     self.session

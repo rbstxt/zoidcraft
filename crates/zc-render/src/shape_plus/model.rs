@@ -376,6 +376,14 @@ pub(crate) fn default_item_json(kind: &str, id: String) -> Result<Value, String>
             props.insert("selectorMode".to_owned(), json!("add"));
             props.insert("selectorAmount".to_owned(), json!(100.0));
             props.insert("selectorShape".to_owned(), json!("square"));
+            props.insert("position".to_owned(), json!([0.0, 0.0]));
+            props.insert("scale".to_owned(), json!([100.0, 100.0]));
+            props.insert("rotation".to_owned(), json!(0.0));
+            props.insert("opacity".to_owned(), json!(100.0));
+            props.insert("tracking".to_owned(), json!(0.0));
+            props.insert("fillColor".to_owned(), json!([1.0, 1.0, 1.0]));
+            props.insert("strokeColor".to_owned(), json!([1.0, 1.0, 1.0]));
+            props.insert("strokeWidth".to_owned(), json!(0.0));
         }
         "fill" => {
             props.insert("color".to_owned(), json!([1.0, 1.0, 1.0]));
@@ -391,6 +399,20 @@ pub(crate) fn default_item_json(kind: &str, id: String) -> Result<Value, String>
             props.insert("join".to_owned(), json!("miter"));
             props.insert("miterLimit".to_owned(), json!(4.0));
             props.insert("composite".to_owned(), json!("below"));
+            props.insert("dashLength".to_owned(), json!(0.0));
+            props.insert("dashGap".to_owned(), json!(0.0));
+            props.insert("dashOffset".to_owned(), json!(0.0));
+            props.insert("taperUnits".to_owned(), json!("percentage"));
+            props.insert("taperStartLength".to_owned(), json!(0.0));
+            props.insert("taperEndLength".to_owned(), json!(0.0));
+            props.insert("taperStartWidth".to_owned(), json!(0.0));
+            props.insert("taperEndWidth".to_owned(), json!(0.0));
+            props.insert("taperStartEase".to_owned(), json!(0.0));
+            props.insert("taperEndEase".to_owned(), json!(0.0));
+            props.insert("waveAmount".to_owned(), json!(0.0));
+            props.insert("waveUnits".to_owned(), json!("pixels"));
+            props.insert("waveLength".to_owned(), json!(20.0));
+            props.insert("wavePhase".to_owned(), json!(0.0));
         }
         "gradientFill" | "gradientStroke" => {
             props.insert("opacity".to_owned(), json!(1.0));
@@ -700,8 +722,152 @@ pub(crate) fn lerp_f64(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
+/// Parses a named easing string (e.g. `"linear"`, `"hold"`, `"easeInOutCubic"`, `"quadIn"`)
+/// into `(InterpolationMode, EasingKind)`.
+#[must_use]
+pub fn parse_easing_name(name: &str) -> Option<(InterpolationMode, EasingKind)> {
+    let norm: String = name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    match norm.as_str() {
+        "hold" | "none" | "step" | "discrete" => {
+            Some((InterpolationMode::Discrete, EasingKind::Hold))
+        }
+        "linear" => Some((InterpolationMode::Interpolated, EasingKind::Linear)),
+        "bezier" | "custombezier" => Some((InterpolationMode::Bezier, EasingKind::Linear)),
+        "quadin" | "easeinquad" | "quadraticin" => {
+            Some((InterpolationMode::Interpolated, EasingKind::QuadIn))
+        }
+        "quadout" | "easeoutquad" | "quadraticout" => {
+            Some((InterpolationMode::Interpolated, EasingKind::QuadOut))
+        }
+        "quadinout" | "easeinoutquad" | "quadraticinout" => {
+            Some((InterpolationMode::Interpolated, EasingKind::QuadInOut))
+        }
+        "cubicin" | "easeincubic" | "easein" => {
+            Some((InterpolationMode::Interpolated, EasingKind::CubicIn))
+        }
+        "cubicout" | "easeoutcubic" | "easeout" => {
+            Some((InterpolationMode::Interpolated, EasingKind::CubicOut))
+        }
+        "cubicinout" | "easeinoutcubic" | "easeinout" | "ease" => {
+            Some((InterpolationMode::Interpolated, EasingKind::CubicInOut))
+        }
+        "cubicoutin" | "easeoutincubic" => {
+            Some((InterpolationMode::Interpolated, EasingKind::CubicOutIn))
+        }
+        "quartin" | "easeinquart" | "quarticin" => {
+            Some((InterpolationMode::Interpolated, EasingKind::QuartIn))
+        }
+        "quartout" | "easeoutquart" | "quarticout" => {
+            Some((InterpolationMode::Interpolated, EasingKind::QuartOut))
+        }
+        "quartinout" | "easeinoutquart" | "quarticinout" => {
+            Some((InterpolationMode::Interpolated, EasingKind::QuartInOut))
+        }
+        "quintin" | "easeinquint" | "quinticin" => {
+            Some((InterpolationMode::Interpolated, EasingKind::QuintIn))
+        }
+        "quintout" | "easeoutquint" | "quinticout" => {
+            Some((InterpolationMode::Interpolated, EasingKind::QuintOut))
+        }
+        "quintinout" | "easeinoutquint" | "quinticinout" => {
+            Some((InterpolationMode::Interpolated, EasingKind::QuintInOut))
+        }
+        "sinein" | "easeinsine" | "sinusoidalin" => {
+            Some((InterpolationMode::Interpolated, EasingKind::SineIn))
+        }
+        "sineout" | "easeoutsine" | "sinusoidalout" => {
+            Some((InterpolationMode::Interpolated, EasingKind::SineOut))
+        }
+        "sineinout" | "easeinoutsine" | "sinusoidalinout" => {
+            Some((InterpolationMode::Interpolated, EasingKind::SineInOut))
+        }
+        "expoin" | "easeinexpo" | "exponentialin" => {
+            Some((InterpolationMode::Interpolated, EasingKind::ExpoIn))
+        }
+        "expoout" | "easeoutexpo" | "exponentialout" => {
+            Some((InterpolationMode::Interpolated, EasingKind::ExpoOut))
+        }
+        "expoinout" | "easeinoutexpo" | "exponentialinout" => {
+            Some((InterpolationMode::Interpolated, EasingKind::ExpoInOut))
+        }
+        "circin" | "easeincirc" | "circularin" => {
+            Some((InterpolationMode::Interpolated, EasingKind::CircIn))
+        }
+        "circout" | "easeoutcirc" | "circularout" => {
+            Some((InterpolationMode::Interpolated, EasingKind::CircOut))
+        }
+        "circinout" | "easeinoutcirc" | "circularinout" => {
+            Some((InterpolationMode::Interpolated, EasingKind::CircInOut))
+        }
+        "elasticin" | "easeinelastic" => {
+            Some((InterpolationMode::Interpolated, EasingKind::ElasticIn))
+        }
+        "elasticout" | "easeoutelastic" => {
+            Some((InterpolationMode::Interpolated, EasingKind::ElasticOut))
+        }
+        "elasticinout" | "easeinoutelastic" => {
+            Some((InterpolationMode::Interpolated, EasingKind::ElasticInOut))
+        }
+        "backin" | "easeinback" => Some((InterpolationMode::Interpolated, EasingKind::BackIn)),
+        "backout" | "easeoutback" => Some((InterpolationMode::Interpolated, EasingKind::BackOut)),
+        "backinout" | "easeinoutback" => {
+            Some((InterpolationMode::Interpolated, EasingKind::BackInOut))
+        }
+        "bouncein" | "easeinbounce" => {
+            Some((InterpolationMode::Interpolated, EasingKind::BounceIn))
+        }
+        "bounceout" | "easeoutbounce" => {
+            Some((InterpolationMode::Interpolated, EasingKind::BounceOut))
+        }
+        "bounceinout" | "easeinoutbounce" => {
+            Some((InterpolationMode::Interpolated, EasingKind::BounceInOut))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_keyframe_mode_easing(kf: &Value) -> (InterpolationMode, EasingKind) {
+    for key in ["tween", "easing"] {
+        if let Some(v) = kf.get(key) {
+            if let Some(code) = v.as_u64() {
+                return InterpolationMode::from_cm3_tween_code(code.min(u64::from(u16::MAX)) as u16);
+            }
+            if let Some(name) = v.as_str()
+                && let Some(parsed) = parse_easing_name(name)
+            {
+                return parsed;
+            }
+        }
+    }
+    (InterpolationMode::Interpolated, EasingKind::Linear)
+}
+
 pub(crate) fn parse_normalized_bezier(kf: &Value) -> Option<[f64; 4]> {
-    for key in ["bezier", "controlPoints"] {
+    let parse_obj = |obj: &Map<String, Value>| -> Option<[f64; 4]> {
+        if let (Some(x1), Some(y1), Some(x2), Some(y2)) = (
+            obj.get("x1").and_then(Value::as_f64),
+            obj.get("y1").and_then(Value::as_f64),
+            obj.get("x2").and_then(Value::as_f64),
+            obj.get("y2").and_then(Value::as_f64),
+        ) {
+            return Some([x1, y1, x2, y2]);
+        }
+        if let Some(inner) = obj.get("CustomBezier").and_then(Value::as_object) {
+            return Some([
+                inner.get("x1").and_then(Value::as_f64)?,
+                inner.get("y1").and_then(Value::as_f64)?,
+                inner.get("x2").and_then(Value::as_f64)?,
+                inner.get("y2").and_then(Value::as_f64)?,
+            ]);
+        }
+        None
+    };
+
+    for key in ["bezier", "controlPoints", "easing"] {
         if let Some(v) = kf.get(key) {
             if let Some(arr) = v.as_array()
                 && arr.len() == 4
@@ -715,14 +881,9 @@ pub(crate) fn parse_normalized_bezier(kf: &Value) -> Option<[f64; 4]> {
                 ]);
             }
             if let Some(obj) = v.as_object()
-                && let (Some(x1), Some(y1), Some(x2), Some(y2)) = (
-                    obj.get("x1").and_then(Value::as_f64),
-                    obj.get("y1").and_then(Value::as_f64),
-                    obj.get("x2").and_then(Value::as_f64),
-                    obj.get("y2").and_then(Value::as_f64),
-                )
+                && let Some(b) = parse_obj(obj)
             {
-                return Some([x1, y1, x2, y2]);
+                return Some(b);
             }
         }
     }
@@ -767,11 +928,7 @@ pub(crate) fn eval_segment_factor(k0: &Value, k1: &Value, frame: f64) -> Option<
     if frame >= f1 {
         return Some(1.0);
     }
-    let tween_code = k0
-        .get("tween")
-        .and_then(Value::as_u64)
-        .map_or(1_u16, |t| t.min(u64::from(u16::MAX)) as u16);
-    let (mode, easing) = InterpolationMode::from_cm3_tween_code(tween_code);
+    let (mode, easing) = parse_keyframe_mode_easing(k0);
     if mode == InterpolationMode::Discrete || easing == EasingKind::Hold {
         return Some(0.0);
     }
@@ -810,17 +967,51 @@ pub(crate) fn eval_segment_scalar(k0: &Value, v0: f64, k1: &Value, v1: f64, fram
             frame,
         );
     }
-    let tween_code = k0
-        .get("tween")
-        .and_then(Value::as_u64)
-        .map_or(1_u16, |t| t.min(u64::from(u16::MAX)) as u16);
-    let (_, easing) = InterpolationMode::from_cm3_tween_code(tween_code);
+    let (_, easing) = parse_keyframe_mode_easing(k0);
     let u = ((frame - f0) / span).clamp(0.0, 1.0);
     lerp_f64(v0, v1, eval_easing(easing, u))
 }
 
+#[inline]
+pub(crate) fn prop_explicitly_static(v: &Value) -> bool {
+    v.get("animated").and_then(Value::as_bool) == Some(false) && v.get("value").is_some()
+}
+
+/// Returns `true` if a Shape+ property JSON value is animated via keyframes, an active
+/// expression, or an animated child channel in `objects`.
+#[must_use]
+pub fn shape_plus_prop_is_animated(val: &Value) -> bool {
+    let Some(obj) = val.as_object() else {
+        return false;
+    };
+    if obj
+        .get("expression")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return true;
+    }
+    if obj.get("animated").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    if obj.get("animated").and_then(Value::as_bool) != Some(false)
+        && obj
+            .get("keyframes")
+            .and_then(Value::as_array)
+            .is_some_and(|kfs| kfs.len() > 1)
+    {
+        return true;
+    }
+    if let Some(objs) = obj.get("objects").and_then(Value::as_array)
+        && objs.iter().any(shape_plus_prop_is_animated)
+    {
+        return true;
+    }
+    false
+}
+
 /// Evaluates a Shape+ scalar property track at `frame` using full `zc_anim` easings,
-/// Hold (`tween == 0`), cubic Bezier handles, and optional expression evaluation.
+/// Hold (`tween == 0` / `easing: "hold"`), cubic Bezier handles, and optional expression evaluation.
 pub fn eval_prop_f64(
     val: Option<&Value>,
     frame: f64,
@@ -849,6 +1040,11 @@ pub fn eval_prop_f64(
         && out.is_finite()
     {
         return out;
+    }
+    if prop_explicitly_static(v)
+        && let Some(inner) = v.get("value")
+    {
+        return eval_prop_f64(Some(inner), frame, default, eval_expr);
     }
     if let Some(kfs) = v.get("keyframes").and_then(Value::as_array)
         && !kfs.is_empty()
@@ -886,7 +1082,8 @@ pub fn eval_prop_f64(
     default
 }
 
-pub(crate) fn eval_prop_vec2(
+/// Evaluates a 2D vector Shape+ property track (array, `{ objects: [x, y] }`, or keyframed track).
+pub fn eval_prop_vec2(
     val: Option<&Value>,
     frame: f64,
     default: [f64; 2],
@@ -917,6 +1114,11 @@ pub(crate) fn eval_prop_vec2(
             eval_prop_f64(Some(&objs[1]), frame, default[1], eval_expr),
         ];
     }
+    if prop_explicitly_static(v)
+        && let Some(inner) = v.get("value")
+    {
+        return eval_prop_vec2(Some(inner), frame, default, eval_expr);
+    }
     if let Some(kfs) = v.get("keyframes").and_then(Value::as_array)
         && !kfs.is_empty()
     {
@@ -931,11 +1133,8 @@ pub(crate) fn eval_prop_vec2(
     default
 }
 
-pub(crate) fn eval_prop_f64_vec(
-    val: Option<&Value>,
-    frame: f64,
-    eval_expr: ExprEval<'_>,
-) -> Vec<f64> {
+/// Evaluates a variable-length numeric vector Shape+ property track (array, `{ objects }`, or keyframes).
+pub fn eval_prop_f64_vec(val: Option<&Value>, frame: f64, eval_expr: ExprEval<'_>) -> Vec<f64> {
     let Some(v) = val else {
         return Vec::new();
     };
@@ -950,6 +1149,11 @@ pub(crate) fn eval_prop_f64_vec(
             .iter()
             .map(|o| eval_prop_f64(Some(o), frame, 0.0, eval_expr))
             .collect();
+    }
+    if prop_explicitly_static(v)
+        && let Some(inner) = v.get("value")
+    {
+        return eval_prop_f64_vec(Some(inner), frame, eval_expr);
     }
     if let Some(kfs) = v.get("keyframes").and_then(Value::as_array)
         && !kfs.is_empty()
@@ -990,12 +1194,18 @@ pub(crate) fn eval_prop_f64_vec(
     Vec::new()
 }
 
-pub(crate) fn eval_prop_str(val: Option<&Value>, frame: f64, default: &str) -> String {
+/// Evaluates a string Shape+ property track (static string or stepped/held keyframes).
+pub fn eval_prop_str(val: Option<&Value>, frame: f64, default: &str) -> String {
     let Some(v) = val else {
         return default.to_owned();
     };
     if let Some(s) = v.as_str() {
         return s.to_owned();
+    }
+    if prop_explicitly_static(v)
+        && let Some(inner) = v.get("value")
+    {
+        return eval_prop_str(Some(inner), frame, default);
     }
     if let Some(kfs) = v.get("keyframes").and_then(Value::as_array)
         && !kfs.is_empty()
@@ -1026,7 +1236,38 @@ pub(crate) fn eval_prop_str(val: Option<&Value>, frame: f64, default: &str) -> S
     default.to_owned()
 }
 
-pub(crate) fn eval_prop_color_rgb(
+fn parse_rgb_value(v: &Value) -> Option<[f64; 3]> {
+    if let Some(s) = v.as_str()
+        && let Ok(c) = parse_css_color(s)
+    {
+        return Some([c[0], c[1], c[2]]);
+    }
+    if let Some(arr) = v.as_array()
+        && arr.len() >= 3
+    {
+        let r = arr[0].as_f64()?;
+        let g = arr[1].as_f64()?;
+        let b = arr[2].as_f64()?;
+        if !r.is_finite() || !g.is_finite() || !b.is_finite() {
+            return None;
+        }
+        let scale = if r > 1.0 || g > 1.0 || b > 1.0 {
+            1.0 / 255.0
+        } else {
+            1.0
+        };
+        return Some([
+            (r * scale).clamp(0.0, 1.0),
+            (g * scale).clamp(0.0, 1.0),
+            (b * scale).clamp(0.0, 1.0),
+        ]);
+    }
+    None
+}
+
+/// Evaluates an RGB color Shape+ property track (normalized `[0..1]`, `[0..255]`, CSS color string,
+/// `{ objects: [r, g, b] }`, or keyframed color values).
+pub fn eval_prop_color_rgb(
     val: Option<&Value>,
     frame: f64,
     default: [f64; 3],
@@ -1035,23 +1276,63 @@ pub(crate) fn eval_prop_color_rgb(
     let Some(v) = val else {
         return default;
     };
-    if let Some(s) = v.as_str()
-        && let Ok(c) = parse_css_color(s)
-    {
-        return [c[0], c[1], c[2]];
+    if let Some(rgb) = parse_rgb_value(v) {
+        return rgb;
     }
-    let arr = eval_prop_f64_vec(Some(v), frame, eval_expr);
-    if arr.len() >= 3 {
-        let scale = if arr[0] > 1.0 || arr[1] > 1.0 || arr[2] > 1.0 {
+    if let Some(objs) = v.get("objects").and_then(Value::as_array)
+        && objs.len() >= 3
+    {
+        let r = eval_prop_f64(Some(&objs[0]), frame, default[0], eval_expr);
+        let g = eval_prop_f64(Some(&objs[1]), frame, default[1], eval_expr);
+        let b = eval_prop_f64(Some(&objs[2]), frame, default[2], eval_expr);
+        let scale = if r > 1.0 || g > 1.0 || b > 1.0 {
             1.0 / 255.0
         } else {
             1.0
         };
         return [
-            (arr[0] * scale).clamp(0.0, 1.0),
-            (arr[1] * scale).clamp(0.0, 1.0),
-            (arr[2] * scale).clamp(0.0, 1.0),
+            (r * scale).clamp(0.0, 1.0),
+            (g * scale).clamp(0.0, 1.0),
+            (b * scale).clamp(0.0, 1.0),
         ];
+    }
+    if prop_explicitly_static(v)
+        && let Some(inner) = v.get("value")
+    {
+        return eval_prop_color_rgb(Some(inner), frame, default, eval_expr);
+    }
+    if let Some(kfs) = v.get("keyframes").and_then(Value::as_array)
+        && !kfs.is_empty()
+    {
+        let mut sorted: Vec<(f64, [f64; 3], &Value)> = kfs
+            .iter()
+            .filter_map(|k| {
+                let f = k.get("frame").and_then(Value::as_f64)?;
+                let rgb = k.get("value").and_then(parse_rgb_value)?;
+                Some((f, rgb, k))
+            })
+            .collect();
+        if !sorted.is_empty() {
+            sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+            if frame <= sorted[0].0 {
+                return sorted[0].1;
+            }
+            if frame >= sorted[sorted.len() - 1].0 {
+                return sorted[sorted.len() - 1].1;
+            }
+            for w in sorted.windows(2) {
+                if frame <= w[1].0 {
+                    return [
+                        eval_segment_scalar(w[0].2, w[0].1[0], w[1].2, w[1].1[0], frame)
+                            .clamp(0.0, 1.0),
+                        eval_segment_scalar(w[0].2, w[0].1[1], w[1].2, w[1].1[1], frame)
+                            .clamp(0.0, 1.0),
+                        eval_segment_scalar(w[0].2, w[0].1[2], w[1].2, w[1].1[2], frame)
+                            .clamp(0.0, 1.0),
+                    ];
+                }
+            }
+        }
     }
     if let Some(inner) = v.get("value") {
         return eval_prop_color_rgb(Some(inner), frame, default, eval_expr);
@@ -1059,7 +1340,8 @@ pub(crate) fn eval_prop_color_rgb(
     default
 }
 
-pub(crate) fn eval_prop_enabled(
+/// Evaluates an `enabled` boolean flag on a Shape+ item's property map (defaults to `true`).
+pub fn eval_prop_enabled(
     props: Option<&Map<String, Value>>,
     frame: f64,
     eval_expr: ExprEval<'_>,
@@ -1071,6 +1353,16 @@ pub(crate) fn eval_prop_enabled(
         None => true,
         Some(v) => eval_prop_f64(Some(v), frame, 1.0, eval_expr) != 0.0,
     }
+}
+
+/// Evaluates a Shape+ gradient `stops` property track at `frame`, returning `(position, [r, g, b, a])`
+/// pairs sorted by stop position.
+#[must_use]
+pub fn eval_prop_gradient_stops(val: Option<&Value>, frame: f64) -> Vec<(f64, [f64; 4])> {
+    eval_gradient_stops(val, frame)
+        .into_iter()
+        .map(|s| (s.position, s.color))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ use crate::model::{
     PbrPlusMaterial, PropertyTrack, PropertyValue, TextureMaterial, VideoMaterial,
 };
 
+use super::effects::{extract_shader_string, parse_custom_properties_from_maps};
 use super::objects3d::prop_track_f64;
 use super::tracks::{parse_property_track, prop_f64, value_as_u32};
 
@@ -103,7 +104,7 @@ pub(crate) fn parse_material(
             MaterialSpec::Video(Box::new(m))
         }
         "custom" | "uvcustom" | "zoidium:material-plus/uv-custom" => {
-            let is_uv_custom = mat_type != "custom";
+            let is_uv_custom = mat_type_lower != "custom";
             if is_uv_custom {
                 plugins.insert("material-plus".to_owned());
             }
@@ -118,10 +119,10 @@ pub(crate) fn parse_material(
                 if let Some(v) = p.get("emissive") {
                     m.emissive = parse_property_track(v, PropertyValue::Color([0.0, 0.0, 0.0]));
                 }
-                if let Some(v) = p.get("roughness") {
+                if let Some(v) = p.get("roughness").or_else(|| obj.get("roughness")) {
                     m.roughness = parse_property_track(v, PropertyValue::Number(0.5));
                 }
-                if let Some(v) = p.get("metalness") {
+                if let Some(v) = p.get("metalness").or_else(|| obj.get("metalness")) {
                     m.metalness = parse_property_track(v, PropertyValue::Number(0.5));
                 }
                 m.texture = p
@@ -496,6 +497,21 @@ pub(crate) fn parse_material(
                 graph,
             }
         }
+        "shader" | "custom_shader" | "customshader" | "zoidium:material-plus/shader" => {
+            if mat_type_lower.starts_with("zoidium:material-plus/") {
+                plugins.insert("material-plus".to_owned());
+            }
+            let frag_shader = props
+                .and_then(|p| p.get("fragShader").or_else(|| p.get("fragmentShader")))
+                .or_else(|| obj.get("fragShader").or_else(|| obj.get("fragmentShader")))
+                .and_then(extract_shader_string)
+                .unwrap_or_default();
+            let custom_properties = parse_custom_properties_from_maps(obj, props);
+            MaterialSpec::CustomShader {
+                frag_shader,
+                custom_properties,
+            }
+        }
         other => MaterialSpec::Unknown {
             material_type: other.to_owned(),
             payload: val.clone(),
@@ -503,4 +519,83 @@ pub(crate) fn parse_material(
     };
 
     (spec, uv_mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_material_supports_custom_shader_aliases() {
+        for ty in ["shader", "custom_shader", "customShader"] {
+            let mut plugins = BTreeSet::new();
+            let val = json!({
+                "type": ty,
+                "properties": {
+                    "fragShader": "void main() { gl_FragColor = vec4(1.0); }"
+                },
+                "customProperties": [
+                    {
+                        "name": "uStrength",
+                        "type": 0,
+                        "keyframes": [
+                            { "frame": 0, "value": 0.25, "tween": 1 },
+                            { "frame": 30, "value": 1.0, "tween": 1 }
+                        ]
+                    }
+                ]
+            });
+            let (spec, _) = parse_material(&val, &mut plugins);
+            let MaterialSpec::CustomShader {
+                frag_shader,
+                custom_properties,
+            } = spec
+            else {
+                panic!("expected CustomShader for type {ty:?}, got {spec:?}");
+            };
+            assert_eq!(frag_shader, "void main() { gl_FragColor = vec4(1.0); }");
+            assert_eq!(custom_properties.len(), 1);
+            assert_eq!(custom_properties[0].name, "uStrength");
+            assert_eq!(custom_properties[0].track.keyframes.len(), 2);
+        }
+    }
+
+    #[test]
+    fn parse_material_preserves_animated_pbr_roughness_and_metalness() {
+        let mut plugins = BTreeSet::new();
+        let val = json!({
+            "type": "custom",
+            "properties": {
+                "roughness": {
+                    "animated": true,
+                    "keyframes": [
+                        { "frame": 0, "value": 0.1, "tween": 1 },
+                        { "frame": 60, "value": 0.9, "tween": 1 }
+                    ]
+                },
+                "metalness": {
+                    "animated": true,
+                    "expression": "clamp(time * 0.5, 0.0, 1.0)",
+                    "keyframes": [
+                        { "frame": 0, "value": 0.2, "tween": 1 },
+                        { "frame": 60, "value": 0.8, "tween": 1 }
+                    ]
+                }
+            }
+        });
+        let (spec, _) = parse_material(&val, &mut plugins);
+        let MaterialSpec::CustomPbr(m) = spec else {
+            panic!("expected CustomPbr");
+        };
+        assert!(m.roughness.animated);
+        assert_eq!(m.roughness.keyframes.len(), 2);
+        assert_eq!(m.roughness.keyframes[1].value, PropertyValue::Number(0.9));
+        assert!(m.metalness.animated);
+        assert_eq!(
+            m.metalness.expression.as_deref(),
+            Some("clamp(time * 0.5, 0.0, 1.0)")
+        );
+        assert_eq!(m.metalness.keyframes.len(), 2);
+    }
 }

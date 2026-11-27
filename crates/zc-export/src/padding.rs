@@ -120,6 +120,192 @@ pub fn pad_rgba_frame_into(
     Ok(())
 }
 
+/// Computes the intermediate render resolution for an export aspect-ratio fit mode:
+/// - `0` (Stretch): render directly at `(dst_w, dst_h)`.
+/// - `1` (Crop / Cover): preserve `seq_res` aspect ratio so the rendered image covers `(dst_w, dst_h)`.
+/// - `2` (Black fill / Contain): preserve `seq_res` aspect ratio so the rendered image fits inside `(dst_w, dst_h)`.
+#[must_use]
+pub fn compute_aspect_fit_render_size(
+    seq_res: [u32; 2],
+    dst_w: u32,
+    dst_h: u32,
+    aspect_mode: usize,
+) -> (u32, u32) {
+    let dst_w = dst_w.max(1);
+    let dst_h = dst_h.max(1);
+    if aspect_mode == 0 {
+        return (dst_w, dst_h);
+    }
+    let src_w = f64::from(seq_res[0].max(1));
+    let src_h = f64::from(seq_res[1].max(1));
+    let src_aspect = src_w / src_h;
+    let dst_aspect = f64::from(dst_w) / f64::from(dst_h);
+    if (src_aspect - dst_aspect).abs() < 1e-4 {
+        return (dst_w, dst_h);
+    }
+    let max_dim = dst_w.max(dst_h).saturating_mul(4).max(16);
+    if aspect_mode == 1 {
+        // Crop (cover): expand the shorter axis so both axes are >= dst.
+        if src_aspect > dst_aspect {
+            let rw = (f64::from(dst_h) * src_aspect).round() as u32;
+            (rw.clamp(dst_w, max_dim), dst_h)
+        } else {
+            let rh = (f64::from(dst_w) / src_aspect).round() as u32;
+            (dst_w, rh.clamp(dst_h, max_dim))
+        }
+    } else {
+        // Black fill (contain): shrink the longer axis so both axes are <= dst.
+        if src_aspect > dst_aspect {
+            let rh = (f64::from(dst_w) / src_aspect).round() as u32;
+            (dst_w, rh.clamp(1, dst_h))
+        } else {
+            let rw = (f64::from(dst_h) * src_aspect).round() as u32;
+            (rw.clamp(1, dst_w), dst_h)
+        }
+    }
+}
+
+/// Center-crops or center-pads an RGBA8 frame from `src_size` into `dst_size`.
+pub fn fit_rgba_frame_into(
+    src: &[u8],
+    src_size: (u32, u32),
+    dst_size: (u32, u32),
+    transparent_fill: bool,
+    dst: &mut Vec<u8>,
+) {
+    let (src_w, src_h) = src_size;
+    let (dst_w, dst_h) = dst_size;
+    let expected_src = (src_w as usize)
+        .saturating_mul(src_h as usize)
+        .saturating_mul(4);
+    let dst_len = (dst_w as usize)
+        .saturating_mul(dst_h as usize)
+        .saturating_mul(4);
+    if src_size == dst_size && src.len() == dst_len {
+        dst.clear();
+        dst.extend_from_slice(src);
+        return;
+    }
+    dst.resize(dst_len, 0);
+    if transparent_fill {
+        dst.fill(0);
+    } else {
+        for px in dst.as_chunks_mut::<4>().0 {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+            px[3] = 255;
+        }
+    }
+    if src.len() < expected_src || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return;
+    }
+    let copy_w = src_w.min(dst_w) as usize;
+    let copy_h = src_h.min(dst_h) as usize;
+    let src_x0 = (src_w.saturating_sub(dst_w) / 2) as usize;
+    let src_y0 = (src_h.saturating_sub(dst_h) / 2) as usize;
+    let dst_x0 = (dst_w.saturating_sub(src_w) / 2) as usize;
+    let dst_y0 = (dst_h.saturating_sub(src_h) / 2) as usize;
+    let row_bytes = copy_w * 4;
+    let src_stride = (src_w as usize) * 4;
+    let dst_stride = (dst_w as usize) * 4;
+    for y in 0..copy_h {
+        let s_off = (src_y0 + y) * src_stride + src_x0 * 4;
+        let d_off = (dst_y0 + y) * dst_stride + dst_x0 * 4;
+        dst[d_off..d_off + row_bytes].copy_from_slice(&src[s_off..s_off + row_bytes]);
+    }
+}
+
+/// Downsamples an RGBA8 image to at most `max_width` pixels wide for live export preview thumbnails.
+#[must_use]
+pub fn downsample_rgba_thumbnail(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    max_width: u32,
+) -> (u32, u32, Vec<u8>) {
+    if src_w == 0 || src_h == 0 || max_width == 0 {
+        return (0, 0, Vec::new());
+    }
+    let expected = (src_w as usize)
+        .saturating_mul(src_h as usize)
+        .saturating_mul(4);
+    if src.len() < expected {
+        return (0, 0, Vec::new());
+    }
+    if src_w <= max_width {
+        return (src_w, src_h, src[..expected].to_vec());
+    }
+    let tw = max_width.max(1);
+    let th = ((u64::from(src_h) * u64::from(tw)) / u64::from(src_w)).max(1) as u32;
+    let mut out = vec![0u8; (tw as usize) * (th as usize) * 4];
+    for y in 0..th {
+        let sy =
+            ((u64::from(y) * u64::from(src_h)) / u64::from(th)).min(u64::from(src_h - 1)) as usize;
+        for x in 0..tw {
+            let sx = ((u64::from(x) * u64::from(src_w)) / u64::from(tw)).min(u64::from(src_w - 1))
+                as usize;
+            let s_idx = (sy * (src_w as usize) + sx) * 4;
+            let d_idx = ((y as usize) * (tw as usize) + (x as usize)) * 4;
+            out[d_idx..d_idx + 4].copy_from_slice(&src[s_idx..s_idx + 4]);
+        }
+    }
+    (tw, th, out)
+}
+
+/// Encodes straight-alpha RGBA8 pixels to PNG (`0`), JPEG (`1`), or WebP (`2`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn encode_single_frame_image(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    format_index: usize,
+) -> Result<Vec<u8>, ExportError> {
+    use image::ImageEncoder;
+
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| ExportError::InvalidSettings("image dimensions overflow".into()))?;
+    if rgba.len() != expected {
+        return Err(ExportError::InvalidFrameSize {
+            frame_index: 0,
+            expected,
+            actual: rgba.len(),
+        });
+    }
+    let mut buf = Vec::new();
+    match format_index {
+        1 => {
+            // JPEG: composite straight RGBA onto black RGB8.
+            let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+            for px in rgba.as_chunks::<4>().0 {
+                let a = u16::from(px[3]);
+                rgb.push(((u16::from(px[0]) * a + 127) / 255) as u8);
+                rgb.push(((u16::from(px[1]) * a + 127) / 255) as u8);
+                rgb.push(((u16::from(px[2]) * a + 127) / 255) as u8);
+            }
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 92);
+            encoder
+                .write_image(&rgb, width, height, image::ExtendedColorType::Rgb8)
+                .map_err(|e| ExportError::ImageEncode(e.to_string()))?;
+        }
+        2 => {
+            let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut buf);
+            encoder
+                .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
+                .map_err(|e| ExportError::ImageEncode(e.to_string()))?;
+        }
+        _ => {
+            let encoder = image::codecs::png::PngEncoder::new(&mut buf);
+            encoder
+                .write_image(rgba, width, height, image::ExtendedColorType::Rgba8)
+                .map_err(|e| ExportError::ImageEncode(e.to_string()))?;
+        }
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +388,43 @@ mod tests {
             &dst[sh * row_bytes..(sh + 1) * row_bytes],
             &dst[(sh - 1) * row_bytes..sh * row_bytes]
         );
+    }
+
+    #[test]
+    fn aspect_fit_thumbnail_and_single_frame_encoders_work() {
+        // 16:9 sequence exported to 1:1 square (400x400):
+        assert_eq!(
+            compute_aspect_fit_render_size([1920, 1080], 400, 400, 0),
+            (400, 400)
+        );
+        // Crop (cover): width expands to ~711, height stays 400.
+        let (cw, ch) = compute_aspect_fit_render_size([1920, 1080], 400, 400, 1);
+        assert!(cw > 700 && ch == 400);
+        // Black fill (contain): width stays 400, height shrinks to ~225.
+        let (fw, fh) = compute_aspect_fit_render_size([1920, 1080], 400, 400, 2);
+        assert!(fw == 400 && fh < 230 && fh > 220);
+
+        // fit_rgba_frame_into center-pads 2x2 red square into 4x4 opaque black.
+        let red_2x2 = [255_u8, 0, 0, 255].repeat(4);
+        let mut fitted = Vec::new();
+        fit_rgba_frame_into(&red_2x2, (2, 2), (4, 4), false, &mut fitted);
+        assert_eq!(&fitted[0..4], &[0, 0, 0, 255]);
+        let center_px = (4 + 1) * 4;
+        assert_eq!(&fitted[center_px..center_px + 4], &[255, 0, 0, 255]);
+
+        // Downsample thumbnail preserves aspect ratio.
+        let (tw, th, thumb) = downsample_rgba_thumbnail(&fitted, 4, 4, 2);
+        assert_eq!((tw, th, thumb.len()), (2, 2, 16));
+
+        // PNG, JPEG, and WebP single-frame encoders all emit valid headers.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let png = encode_single_frame_image(&fitted, 4, 4, 0).expect("encode png");
+            assert_eq!(&png[..4], &[0x89, b'P', b'N', b'G']);
+            let jpg = encode_single_frame_image(&fitted, 4, 4, 1).expect("encode jpg");
+            assert_eq!(&jpg[..2], &[0xFF, 0xD8]);
+            let webp = encode_single_frame_image(&fitted, 4, 4, 2).expect("encode webp");
+            assert_eq!(&webp[..4], b"RIFF");
+        }
     }
 }

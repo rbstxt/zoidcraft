@@ -758,6 +758,94 @@ impl<'a> GltfDocument<'a> {
         Ok(out)
     }
 
+    fn read_color0(&self, accessor_idx: usize) -> Result<Vec<[f32; 4]>, GltfLoadError> {
+        let acc = self.accessors.get(accessor_idx).ok_or_else(|| {
+            GltfLoadError::InvalidBuffer(format!("accessor {accessor_idx} out of bounds"))
+        })?;
+        let is_vec4 = match acc.accessor_type.as_str() {
+            "VEC3" => false,
+            "VEC4" => true,
+            other => {
+                return Err(GltfLoadError::UnsupportedFeature(format!(
+                    "unsupported COLOR_0 accessor type '{other}' (expected VEC3 or VEC4)"
+                )));
+            }
+        };
+        let expected_type = if is_vec4 { "VEC4" } else { "VEC3" };
+        let s = self.accessor_slice_params(accessor_idx, expected_type, MAX_TOTAL_VERTICES)?;
+        let mut out = Vec::with_capacity(s.count);
+        for i in 0..s.count {
+            let off = s.base + i * s.stride;
+            let rgba = match s.component_type {
+                COMP_FLOAT => [
+                    read_f32_le(s.bytes, off)?,
+                    read_f32_le(s.bytes, off + 4)?,
+                    read_f32_le(s.bytes, off + 8)?,
+                    if is_vec4 {
+                        read_f32_le(s.bytes, off + 12)?
+                    } else {
+                        1.0
+                    },
+                ],
+                COMP_UNSIGNED_BYTE => [
+                    f32::from(s.bytes[off]) / 255.0,
+                    f32::from(s.bytes[off + 1]) / 255.0,
+                    f32::from(s.bytes[off + 2]) / 255.0,
+                    if is_vec4 {
+                        f32::from(s.bytes[off + 3]) / 255.0
+                    } else {
+                        1.0
+                    },
+                ],
+                COMP_UNSIGNED_SHORT => [
+                    f32::from(read_u16_le(s.bytes, off)?) / 65535.0,
+                    f32::from(read_u16_le(s.bytes, off + 2)?) / 65535.0,
+                    f32::from(read_u16_le(s.bytes, off + 4)?) / 65535.0,
+                    if is_vec4 {
+                        f32::from(read_u16_le(s.bytes, off + 6)?) / 65535.0
+                    } else {
+                        1.0
+                    },
+                ],
+                other => {
+                    return Err(GltfLoadError::UnsupportedFeature(format!(
+                        "unsupported COLOR_0 componentType {other}"
+                    )));
+                }
+            };
+            out.push(rgba);
+        }
+        Ok(out)
+    }
+
+    fn material_base_color_factor(&self, material_idx: usize) -> Option<[f32; 4]> {
+        let mat = self
+            .root
+            .get("materials")
+            .and_then(JsonValue::as_array)?
+            .get(material_idx)?;
+        let factor_arr = mat
+            .get("pbrMetallicRoughness")
+            .and_then(|pbr| pbr.get("baseColorFactor"))
+            .or_else(|| {
+                mat.get("extensions")
+                    .and_then(|ext| ext.get("KHR_materials_pbrSpecularGlossiness"))
+                    .and_then(|sg| sg.get("diffuseFactor"))
+            })
+            .and_then(JsonValue::as_array)?;
+        if factor_arr.len() < 3 {
+            return None;
+        }
+        let r = factor_arr[0].as_f64()? as f32;
+        let g = factor_arr[1].as_f64()? as f32;
+        let b = factor_arr[2].as_f64()? as f32;
+        let a = factor_arr
+            .get(3)
+            .and_then(JsonValue::as_f64)
+            .map_or(1.0_f32, |v| v as f32);
+        Some([r, g, b, a])
+    }
+
     fn read_indices(&self, accessor_idx: usize) -> Result<Vec<u32>, GltfLoadError> {
         let s = self.accessor_slice_params(accessor_idx, "SCALAR", MAX_TOTAL_INDICES)?;
         let mut out = Vec::with_capacity(s.count);
@@ -929,6 +1017,29 @@ impl<'a> GltfDocument<'a> {
                 None
             };
 
+            let color0 = if let Some(c_acc) = attrs.get("COLOR_0").and_then(JsonValue::as_usize) {
+                let c_count = self
+                    .accessors
+                    .get(c_acc)
+                    .ok_or_else(|| {
+                        GltfLoadError::InvalidBuffer(format!("accessor {c_acc} out of bounds"))
+                    })?
+                    .count;
+                if c_count > MAX_TOTAL_VERTICES {
+                    return Err(GltfLoadError::InvalidJson(format!(
+                        "COLOR_0 accessor {c_acc} count {c_count} exceeds maximum vertex budget of {MAX_TOTAL_VERTICES}"
+                    )));
+                }
+                if c_count != positions.len() {
+                    return Err(GltfLoadError::InvalidBuffer(String::from(
+                        "COLOR_0 count does not match POSITION count",
+                    )));
+                }
+                Some(self.read_color0(c_acc)?)
+            } else {
+                None
+            };
+
             let mut raw_indices: Vec<u32> =
                 if let Some(i_acc) = prim.get("indices").and_then(JsonValue::as_usize) {
                     self.read_indices(i_acc)?
@@ -987,10 +1098,10 @@ impl<'a> GltfDocument<'a> {
                 continue;
             }
 
-            let material_slot = prim
-                .get("material")
-                .and_then(JsonValue::as_u32)
-                .unwrap_or(0);
+            let material_idx = prim.get("material").and_then(JsonValue::as_usize);
+            let material_slot = material_idx.map_or(0, |idx| idx as u32);
+            let base_color_factor =
+                material_idx.and_then(|idx| self.material_base_color_factor(idx));
 
             let mut vertices = Vec::with_capacity(positions.len());
             for (vi, &pos) in positions.iter().enumerate() {
@@ -1008,7 +1119,23 @@ impl<'a> GltfDocument<'a> {
                 vertices.push(Vertex3D::new(pos, n, uv, material_slot));
             }
 
-            let mut prim_mesh = MeshData::new(vertices, tri_indices);
+            let mut prim_mesh = match (color0, base_color_factor) {
+                (Some(mut cols), Some(factor)) => {
+                    for c in &mut cols {
+                        c[0] *= factor[0];
+                        c[1] *= factor[1];
+                        c[2] *= factor[2];
+                        c[3] *= factor[3];
+                    }
+                    MeshData::with_colors(vertices, tri_indices, cols)
+                }
+                (Some(cols), None) => MeshData::with_colors(vertices, tri_indices, cols),
+                (None, Some(factor)) => {
+                    let cols = vec![factor; vertices.len()];
+                    MeshData::with_colors(vertices, tri_indices, cols)
+                }
+                (None, None) => MeshData::new(vertices, tri_indices),
+            };
             if normals.is_none() {
                 prim_mesh.compute_smooth_normals();
             }
@@ -1315,6 +1442,23 @@ fn parse_document(
     glb_bin_chunk: Option<&[u8]>,
     external_buffers: &[&[u8]],
 ) -> Result<MeshData, GltfLoadError> {
+    parse_document_with_resolver::<fn(&str) -> Option<Vec<u8>>>(
+        json_str,
+        glb_bin_chunk,
+        external_buffers,
+        None,
+    )
+}
+
+fn parse_document_with_resolver<F>(
+    json_str: &str,
+    glb_bin_chunk: Option<&[u8]>,
+    external_buffers: &[&[u8]],
+    mut resolver: Option<F>,
+) -> Result<MeshData, GltfLoadError>
+where
+    F: FnMut(&str) -> Option<Vec<u8>>,
+{
     let root = JsonParser::new(json_str).parse_root()?;
 
     let mut buffers: Vec<Cow<'_, [u8]>> = Vec::new();
@@ -1324,6 +1468,8 @@ fn parse_document(
             if let Some(uri) = buf_val.get("uri").and_then(JsonValue::as_str) {
                 if uri.starts_with("data:") {
                     buffers.push(Cow::Owned(decode_data_uri(uri)?));
+                } else if let Some(resolved) = resolver.as_mut().and_then(|f| f(uri)) {
+                    buffers.push(Cow::Owned(resolved));
                 } else {
                     buffers.push(Cow::Borrowed(&[])); // Resolved via external_buffers[i]
                 }
@@ -1425,8 +1571,7 @@ fn parse_document(
     doc.assemble_scene()
 }
 
-/// Parses a binary glTF 2.0 (`.glb`) container into a [`MeshData`].
-pub fn parse_glb(bytes: &[u8]) -> Result<MeshData, GltfLoadError> {
+fn extract_glb_chunks(bytes: &[u8]) -> Result<(&str, Option<&[u8]>), GltfLoadError> {
     if bytes.len() < 12 {
         return Err(GltfLoadError::InvalidHeader(String::from(
             "buffer shorter than 12-byte GLB header",
@@ -1481,7 +1626,12 @@ pub fn parse_glb(bytes: &[u8]) -> Result<MeshData, GltfLoadError> {
         .ok_or_else(|| GltfLoadError::InvalidHeader(String::from("GLB missing JSON chunk")))?;
     let json_str = std::str::from_utf8(json_bytes)
         .map_err(|_| GltfLoadError::InvalidJson(String::from("JSON chunk is not valid UTF-8")))?;
+    Ok((json_str, bin_chunk))
+}
 
+/// Parses a binary glTF 2.0 (`.glb`) container into a [`MeshData`].
+pub fn parse_glb(bytes: &[u8]) -> Result<MeshData, GltfLoadError> {
+    let (json_str, bin_chunk) = extract_glb_chunks(bytes)?;
     parse_document(json_str, bin_chunk, &[])
 }
 
@@ -1499,6 +1649,27 @@ pub fn parse_gltf_or_glb(bytes: &[u8]) -> Result<MeshData, GltfLoadError> {
         let text = std::str::from_utf8(bytes)
             .map_err(|_| GltfLoadError::InvalidJson(String::from("input is not valid UTF-8")))?;
         parse_gltf(text, &[])
+    }
+}
+
+/// Loads a `.glb` or `.gltf` byte slice into a [`MeshData`].
+pub fn load_gltf(bytes: &[u8]) -> Result<MeshData, GltfLoadError> {
+    parse_gltf_or_glb(bytes)
+}
+
+/// Loads a `.glb` or `.gltf` byte slice, resolving external non-`data:` buffer URIs (such as
+/// `"mesh.bin"`) via `resolver`.
+pub fn load_gltf_with_resolver<F>(bytes: &[u8], resolver: F) -> Result<MeshData, GltfLoadError>
+where
+    F: FnMut(&str) -> Option<Vec<u8>>,
+{
+    if bytes.len() >= 4 && &bytes[..4] == b"glTF" {
+        let (json_str, bin_chunk) = extract_glb_chunks(bytes)?;
+        parse_document_with_resolver(json_str, bin_chunk, &[], Some(resolver))
+    } else {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| GltfLoadError::InvalidJson(String::from("input is not valid UTF-8")))?;
+        parse_document_with_resolver(text, None, &[], Some(resolver))
     }
 }
 
@@ -1675,5 +1846,122 @@ mod tests {
                 && err.to_string().contains("visit budget"),
             "expected node visit budget error, got: {err}"
         );
+    }
+
+    #[test]
+    fn color0_vertex_colors_base_color_factor_and_external_bin_resolver() {
+        // Build binary buffer containing:
+        // [0..36]:   3 VEC3 f32 positions
+        // [36..42]:  3 u16 indices
+        // [42..44]:  2-byte pad
+        // [44..56]:  3 VEC4 u8 COLOR_0 vertices
+        // [56..74]:  3 VEC3 u16 COLOR_0 vertices
+        let mut bin = single_triangle_bin();
+        bin.extend_from_slice(&[0_u8, 0]);
+        let u8_colors: [[u8; 4]; 3] = [[255, 0, 0, 255], [0, 255, 0, 128], [0, 0, 255, 255]];
+        for c in u8_colors {
+            bin.extend_from_slice(&c);
+        }
+        let u16_colors: [[u16; 3]; 3] = [[65535, 32768, 0], [0, 65535, 0], [0, 0, 65535]];
+        for c in u16_colors {
+            for ch in c {
+                bin.extend_from_slice(&ch.to_le_bytes());
+            }
+        }
+
+        // 1. COLOR_0 VEC4 UNSIGNED_BYTE multiplied by material baseColorFactor + external .bin resolver
+        let gltf_combined = format!(
+            r#"{{
+              "asset": {{"version": "2.0"}},
+              "scene": 0,
+              "scenes": [{{"nodes": [0]}}],
+              "nodes": [{{"mesh": 0}}],
+              "materials": [
+                {{"pbrMetallicRoughness": {{"baseColorFactor": [0.5, 0.5, 1.0, 0.5]}}}}
+              ],
+              "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0, "COLOR_0": 2}}, "indices": 1, "material": 0}}]}}],
+              "buffers": [{{"uri": "external_mesh.bin", "byteLength": {len}}}],
+              "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 36}},
+                {{"buffer": 0, "byteOffset": 36, "byteLength": 6}},
+                {{"buffer": 0, "byteOffset": 44, "byteLength": 12}}
+              ],
+              "accessors": [
+                {{"bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": 3, "type": "VEC3"}},
+                {{"bufferView": 1, "byteOffset": 0, "componentType": 5123, "count": 3, "type": "SCALAR"}},
+                {{"bufferView": 2, "byteOffset": 0, "componentType": 5121, "normalized": true, "count": 3, "type": "VEC4"}}
+              ]
+            }}"#,
+            len = bin.len()
+        );
+        let mesh = load_gltf_with_resolver(gltf_combined.as_bytes(), |uri| {
+            (uri == "external_mesh.bin").then(|| bin.clone())
+        })
+        .expect("glTF with COLOR_0 + baseColorFactor + external resolver");
+        assert_eq!(mesh.colors.len(), 3);
+        assert!((mesh.colors[0][0] - 0.5).abs() < 1e-3);
+        assert!((mesh.colors[0][3] - 0.5).abs() < 1e-3);
+        assert!((mesh.colors[1][1] - 0.5).abs() < 1e-3);
+        assert!((mesh.colors[2][2] - 1.0).abs() < 1e-3);
+
+        // 2. COLOR_0 VEC3 UNSIGNED_SHORT (alpha defaults to 1.0)
+        let gltf_u16 = format!(
+            r#"{{
+              "asset": {{"version": "2.0"}},
+              "scene": 0,
+              "scenes": [{{"nodes": [0]}}],
+              "nodes": [{{"mesh": 0}}],
+              "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0, "COLOR_0": 2}}, "indices": 1}}]}}],
+              "buffers": [{{"byteLength": {len}}}],
+              "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 36}},
+                {{"buffer": 0, "byteOffset": 36, "byteLength": 6}},
+                {{"buffer": 0, "byteOffset": 56, "byteLength": 18}}
+              ],
+              "accessors": [
+                {{"bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": 3, "type": "VEC3"}},
+                {{"bufferView": 1, "byteOffset": 0, "componentType": 5123, "count": 3, "type": "SCALAR"}},
+                {{"bufferView": 2, "byteOffset": 0, "componentType": 5123, "normalized": true, "count": 3, "type": "VEC3"}}
+              ]
+            }}"#,
+            len = bin.len()
+        );
+        let mesh_u16 = parse_gltf(&gltf_u16, &[&bin]).expect("glTF with VEC3 u16 COLOR_0");
+        assert_eq!(mesh_u16.colors.len(), 3);
+        assert!((mesh_u16.colors[0][0] - 1.0).abs() < 1e-3);
+        assert!((mesh_u16.colors[0][1] - 0.5).abs() < 1e-3);
+        assert!((mesh_u16.colors[0][3] - 1.0).abs() < 1e-5);
+
+        // 3. Material baseColorFactor only (no COLOR_0 attribute)
+        let gltf_mat_only = format!(
+            r#"{{
+              "asset": {{"version": "2.0"}},
+              "scene": 0,
+              "scenes": [{{"nodes": [0]}}],
+              "nodes": [{{"mesh": 0}}],
+              "materials": [
+                {{"pbrMetallicRoughness": {{"baseColorFactor": [0.2, 0.6, 0.8, 0.9]}}}}
+              ],
+              "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0}}, "indices": 1, "material": 0}}]}}],
+              "buffers": [{{"byteLength": {len}}}],
+              "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 36}},
+                {{"buffer": 0, "byteOffset": 36, "byteLength": 6}}
+              ],
+              "accessors": [
+                {{"bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": 3, "type": "VEC3"}},
+                {{"bufferView": 1, "byteOffset": 0, "componentType": 5123, "count": 3, "type": "SCALAR"}}
+              ]
+            }}"#,
+            len = bin.len()
+        );
+        let mesh_mat = parse_gltf(&gltf_mat_only, &[&bin]).expect("glTF with baseColorFactor");
+        assert_eq!(mesh_mat.colors.len(), 3);
+        for c in &mesh_mat.colors {
+            assert!((c[0] - 0.2).abs() < 1e-5);
+            assert!((c[1] - 0.6).abs() < 1e-5);
+            assert!((c[2] - 0.8).abs() < 1e-5);
+            assert!((c[3] - 0.9).abs() < 1e-5);
+        }
     }
 }

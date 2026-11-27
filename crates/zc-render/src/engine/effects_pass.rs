@@ -101,7 +101,13 @@ impl ProjectRenderEngine {
                 plugin_id,
                 effect_id,
             } => {
-                if !env.plugins.is_enabled(plugin_id) {
+                // Node effects compile to standalone GLSL and must continue rendering even
+                // when the optional `node-effect` editor plugin toggle is disabled.
+                let is_node_effect = matches!(
+                    effect_id.to_ascii_lowercase().as_str(),
+                    "nodeeffect" | "node-effect"
+                ) || plugin_id.eq_ignore_ascii_case("node-effect");
+                if !is_node_effect && !env.plugins.is_enabled(plugin_id) {
                     return Ok(source);
                 }
                 // Handle temporal, node-effect, layer-input, and all native/plugin GPU effects.
@@ -788,8 +794,17 @@ impl ProjectRenderEngine {
         if canonical_id == "timedisplacement"
             && let Some(tctx) = temporal_ctx.as_deref_mut()
         {
-            let max_disp = f64::from(reg_params.float_or("maxDisplacement", 1.0));
-            let num_slices = reg_params.int_or("timeResolution", 30).clamp(2, 64) as u32;
+            let max_disp = f64::from(if reg_params.values.contains_key("maxTime") {
+                reg_params.float_or("maxTime", 1.0)
+            } else {
+                reg_params.float_or("maxDisplacement", 1.0)
+            });
+            let num_slices = if reg_params.values.contains_key("resolution") {
+                reg_params.int_or("resolution", 16)
+            } else {
+                reg_params.int_or("timeResolution", 30)
+            }
+            .clamp(2, 64) as u32;
             if !max_disp.is_finite() || max_disp.abs() < 1e-6 {
                 return Ok(source);
             }
@@ -906,26 +921,31 @@ impl ProjectRenderEngine {
             return Ok(acc_in);
         }
 
-        // Wave 2D B3: `ccwidetime` multi-frame forward/backward weighted tap accumulator!
+        // Wave 2D B3: `ccwidetime` multi-frame forward/backward HDR (`Rgba16Float`) tap accumulator!
+        // Accumulating in 16-bit float eliminates 8-bit quantization across many taps and properly
+        // averages instead of blowing out white when `nativeMotionBlur` is enabled.
         if canonical_id == "ccwidetime"
             && let Some(tctx) = temporal_ctx.as_deref_mut()
         {
-            let fwd = reg_params.int_or("forwardSteps", 2).clamp(0, 16);
-            let bwd = reg_params.int_or("backwardSteps", 2).clamp(0, 16);
-            let native_mb = reg_params.bool_or("nativeMotionBlur", false);
+            let fwd = reg_params.int_or("forwardSteps", 2).clamp(0, 45);
+            let bwd = reg_params.int_or("backwardSteps", 2).clamp(0, 45);
+            let _native_mb = reg_params.bool_or("nativeMotionBlur", false);
             let total = 1 + fwd + bwd;
             if total <= 1 {
                 return Ok(source);
             }
-            let weight = 1.0 / (total as f32);
+            let res_f = [width as f32, height as f32];
+            let inv_total = 1.0 / (total as f32);
             let mut acc_in =
                 self.targets
-                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
+                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba16Float)?;
             let mut acc_out =
                 self.targets
+                    .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba16Float)?;
+            let final_dst =
+                self.targets
                     .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
-            let mut is_first = true;
-            for step in -bwd..=fwd {
+            for (idx, step) in (-bwd..=fwd).enumerate() {
                 let sampled_opt = if step == 0 {
                     None
                 } else {
@@ -940,28 +960,43 @@ impl ProjectRenderEngine {
                         Err(err) => {
                             self.targets.release(acc_in);
                             self.targets.release(acc_out);
+                            self.targets.release(final_dst);
                             self.targets.release(source);
                             return Err(err);
                         }
                     }
                 };
                 let tap_view = sampled_opt.as_ref().map_or(&source.view, |t| &t.view);
+                let is_first = idx == 0;
+                let is_last = (idx as i32) + 1 == total;
+                let target_fmt = if is_last {
+                    wgpu::TextureFormat::Rgba8Unorm
+                } else {
+                    wgpu::TextureFormat::Rgba16Float
+                };
+                let out_view = if is_last {
+                    &final_dst.view
+                } else {
+                    &acc_out.view
+                };
                 let mut encoder =
                     self.ctx
                         .device
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("zc-ccwidetime-tap-encoder"),
+                            label: Some("zc-ccwidetime-hdr-tap-encoder"),
                         });
-                let res = self.effects.run_wide_time_tap(
+                let res = self.effects.run_shutter_accumulate(
                     &self.ctx.device,
                     &mut encoder,
                     &acc_in.view,
                     tap_view,
-                    &acc_out.view,
-                    &reg_params,
-                    weight,
+                    out_view,
+                    res_f,
+                    1.0,
+                    inv_total,
                     is_first,
-                    native_mb,
+                    is_last,
+                    target_fmt,
                 );
                 if let Err(err) = res {
                     if let Some(st) = sampled_opt {
@@ -969,6 +1004,7 @@ impl ProjectRenderEngine {
                     }
                     self.targets.release(acc_in);
                     self.targets.release(acc_out);
+                    self.targets.release(final_dst);
                     self.targets.release(source);
                     return Err(RenderError::Effect(err.to_string()));
                 }
@@ -976,12 +1012,14 @@ impl ProjectRenderEngine {
                 if let Some(st) = sampled_opt {
                     self.targets.release(st);
                 }
-                is_first = false;
-                std::mem::swap(&mut acc_in, &mut acc_out);
+                if !is_last {
+                    std::mem::swap(&mut acc_in, &mut acc_out);
+                }
             }
+            self.targets.release(acc_in);
             self.targets.release(acc_out);
             self.targets.release(source);
-            return Ok(acc_in);
+            return Ok(final_dst);
         }
 
         // Wave 2D B3: `timedifference` renders offset frame as `aux` into `timedifference` shader!
@@ -1039,13 +1077,70 @@ impl ProjectRenderEngine {
             };
         }
 
-        // Wave 2D B4: `vhs` temporal persistence tap (`-1.0` frame offset) when `persistence > 0.0`.
+        // Wave 2D B4: `vhs` multi-frame exponential persistence trail (`2 + round(persistence * 8)` taps, decay 0.6).
         if canonical_id == "vhs"
             && let Some(tctx) = temporal_ctx.as_deref_mut()
             && reg_params.float_or("persistence", 0.35) > 0.0
             && env.frame >= 1.0
         {
-            let prev_target = self.render_temporal_layer_sample(tctx, env, -1.0, width, height)?;
+            let pers = reg_params.float_or("persistence", 0.35).clamp(0.0, 1.0);
+            let max_taps = ((2.0 + (pers * 8.0).round()) as u32)
+                .clamp(1, 10)
+                .min(env.frame.floor() as u32);
+            let mut trail_opt =
+                self.render_temporal_layer_sample(tctx, env, -1.0, width, height)?;
+            if max_taps > 1
+                && let Some(mut trail_acc) = trail_opt.take()
+            {
+                let mut acc_w = 1.0_f32;
+                let mut tap_w = 0.6_f32;
+                for k in 2..=max_taps {
+                    let Some(older) =
+                        self.render_temporal_layer_sample(tctx, env, -f64::from(k), width, height)?
+                    else {
+                        break;
+                    };
+                    let mix_frac = tap_w / (acc_w + tap_w);
+                    let blended = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )?;
+                    let mut enc =
+                        self.ctx
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("zc-vhs-trail-mix"),
+                            });
+                    let mix_res = self.effects.run_frame_mix(
+                        &self.ctx.device,
+                        &mut enc,
+                        &trail_acc.view,
+                        &older.view,
+                        &blended.view,
+                        [width as f32, height as f32],
+                        mix_frac,
+                        0,
+                    );
+                    self.targets.release(older);
+                    match mix_res {
+                        Ok(()) => {
+                            self.ctx.queue.submit(std::iter::once(enc.finish()));
+                            self.targets.release(trail_acc);
+                            trail_acc = blended;
+                            acc_w += tap_w;
+                            tap_w *= 0.6;
+                        }
+                        Err(_) => {
+                            self.targets.release(blended);
+                            break;
+                        }
+                    }
+                }
+                trail_opt = Some(trail_acc);
+            }
+            let prev_target = trail_opt;
             let dst =
                 self.targets
                     .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
@@ -1090,14 +1185,19 @@ impl ProjectRenderEngine {
             };
         }
 
-        // Wave 2D B4: `datamosh` temporal segment I-frame anchor tap (`floor(frame / interval) * interval` or `-interval`).
+        // Wave 2D B4: `datamosh` temporal segment I-frame anchor (`interval` in frames, clean pass on I-frame `age == 0`).
         if canonical_id == "datamosh"
             && let Some(tctx) = temporal_ctx.as_deref_mut()
         {
-            let interval_sec = f64::from(reg_params.float_or("interval", 1.0).max(0.05));
-            let interval_frames = (interval_sec * env.fps.max(1.0)).max(1.0);
+            let interval_frames = f64::from(reg_params.float_or("interval", 30.0).max(1.0));
             let anchor_frame = (env.frame / interval_frames).floor() * interval_frames;
-            let raw_delta = if (anchor_frame - env.frame).abs() < 1e-4 {
+            let age = env.frame - anchor_frame;
+            let hold = reg_params.float_or("hold", 0.0);
+            // Zoidium `datamosh.js:497-508`: I-frame boundary (`age == 0`) passes clean unless `hold > 0`.
+            if age.abs() < 1e-4 && hold <= 1e-4 && env.frame > 0.0 {
+                return Ok(source);
+            }
+            let raw_delta = if age.abs() < 1e-4 {
                 -interval_frames
             } else {
                 anchor_frame - env.frame
@@ -1108,6 +1208,9 @@ impl ProjectRenderEngine {
             } else {
                 None
             };
+            // `run_datamosh` computes its own macroblock SAD motion field from `(input, aux)`
+            // when `algorithm == 0` and ignores `aux2` in analytic modes (`algorithm >= 1`),
+            // so skip rendering an unused `prev_target`.
             let dst =
                 self.targets
                     .acquire(&self.ctx, width, height, wgpu::TextureFormat::Rgba8Unorm)?;
@@ -1223,13 +1326,6 @@ impl ProjectRenderEngine {
         if matches!(effect_id, "timeremap" | "time-remap")
             && let Some(tctx) = temporal_ctx.as_deref_mut()
         {
-            // Zoidium `remap` option (0 = off / bypass, 1 = enabled).
-            if matches!(
-                reg_params.values.get("remap"),
-                Some(RegParamValue::Int(0) | RegParamValue::Bool(false))
-            ) {
-                return Ok(source);
-            }
             let fps = env.fps.max(1.0);
             let mode = reg_params.int_or("mode", 0);
             let remap_is_float = matches!(
@@ -1241,6 +1337,20 @@ impl ProjectRenderEngine {
                 || (!reg_params.values.contains_key("mode")
                     && (reg_params.values.contains_key("sourceTime")
                         || reg_params.values.contains_key("time")));
+            // Zoidium `timeremap.js:218-285`: `remap: 0` ONLY disables Remap mode (`mode == 1`),
+            // never Speed mode (`mode == 0`)!
+            if has_direct_time
+                && matches!(
+                    reg_params.values.get("remap"),
+                    Some(RegParamValue::Int(0) | RegParamValue::Bool(false))
+                )
+            {
+                return Ok(source);
+            }
+            let norm_speed = |s: f64| -> f64 {
+                // Support both Zoidium percentage speeds (`100` = 1x, `50` = 0.5x) and normalized `1.0`.
+                if s.abs() > 10.0 { s / 100.0 } else { s }
+            };
             let target_frame = if has_direct_time {
                 let src_time = if remap_is_float {
                     f64::from(reg_params.float_or("remap", env.time as f32))
@@ -1262,7 +1372,7 @@ impl ProjectRenderEngine {
                 let mut acc = 0.0_f64;
                 let eval_sp = |f: f64| -> f64 {
                     let e = env_at_frame(env, f);
-                    eval_f64(speed_track, &e)
+                    norm_speed(eval_f64(speed_track, &e))
                 };
                 let mut prev_s = eval_sp(0.0);
                 for i in 1..=steps {
@@ -1272,7 +1382,7 @@ impl ProjectRenderEngine {
                 }
                 acc
             } else {
-                let speed = f64::from(reg_params.float_or("speed", 1.0));
+                let speed = norm_speed(f64::from(reg_params.float_or("speed", 1.0)));
                 env.frame * speed
             };
             if !target_frame.is_finite() {
@@ -1572,8 +1682,393 @@ impl ProjectRenderEngine {
                 };
             }
 
+            // HDR `Rgba16Float` accumulation path for `echo-legacy`: eliminates 8-bit quantization
+            // and intermediate `[0, 1]` clamp-darkening in smear mode while honoring `mode`,
+            // `threshold`, and wet/dry `strength` against the original `source` frame.
+            if is_legacy {
+                let legacy_mode = reg_params.int_or("mode", 0).clamp(0, 3);
+                let strength = reg_params.float_or("strength", 1.0).clamp(0.0, 1.0);
+                let threshold = reg_params.float_or("threshold", 0.0).clamp(0.0, 1.0);
+                let res_f = [width as f32, height as f32];
+
+                let mut tap_weights = Vec::with_capacity(num_echoes as usize);
+                let mut expected_wsum = 1.0_f32;
+                for k in 1..=num_echoes {
+                    let w = if starting_intensity.is_finite() && decay.is_finite() {
+                        (starting_intensity * decay.powi((k - 1) as i32)).max(0.0)
+                    } else {
+                        0.0
+                    };
+                    tap_weights.push(w);
+                    expected_wsum += w;
+                }
+
+                // Fast exact HDR smear path when no luminance gate threshold is active.
+                if legacy_mode == 0 && threshold <= 1e-3 {
+                    let mut acc_in = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba16Float,
+                    )?;
+                    let mut acc_out = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba16Float,
+                    )?;
+                    let wet_dst = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )?;
+                    // Seed accumulator with `source` at weight 1.0.
+                    {
+                        let mut enc = self.ctx.device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("zc-echo-legacy-hdr-init"),
+                            },
+                        );
+                        if let Err(err) = self.effects.run_shutter_accumulate(
+                            &self.ctx.device,
+                            &mut enc,
+                            &acc_in.view,
+                            &source.view,
+                            &acc_out.view,
+                            res_f,
+                            1.0,
+                            1.0,
+                            true,
+                            false,
+                            wgpu::TextureFormat::Rgba16Float,
+                        ) {
+                            self.targets.release(acc_in);
+                            self.targets.release(acc_out);
+                            self.targets.release(wet_dst);
+                            self.targets.release(source);
+                            return Err(RenderError::Effect(err.to_string()));
+                        }
+                        self.ctx.queue.submit(std::iter::once(enc.finish()));
+                        std::mem::swap(&mut acc_in, &mut acc_out);
+                    }
+
+                    let mut actual_wsum = 1.0_f32;
+                    for (idx, &tap_weight) in tap_weights.iter().enumerate() {
+                        let k = (idx as u32) + 1;
+                        let is_last = k == num_echoes;
+                        let frame_offset = f64::from(k) * frame_step;
+                        let tap_opt = match self.render_temporal_layer_sample(
+                            tctx,
+                            env,
+                            frame_offset,
+                            width,
+                            height,
+                        ) {
+                            Ok(opt) => opt,
+                            Err(err) => {
+                                self.targets.release(acc_in);
+                                self.targets.release(acc_out);
+                                self.targets.release(wet_dst);
+                                self.targets.release(source);
+                                return Err(err);
+                            }
+                        };
+                        let eff_w = if tap_opt.is_some() { tap_weight } else { 0.0 };
+                        actual_wsum += eff_w;
+                        let tap_view = tap_opt.as_ref().map_or(&source.view, |t| &t.view);
+                        let target_fmt = if is_last {
+                            wgpu::TextureFormat::Rgba8Unorm
+                        } else {
+                            wgpu::TextureFormat::Rgba16Float
+                        };
+                        let out_view = if is_last {
+                            &wet_dst.view
+                        } else {
+                            &acc_out.view
+                        };
+                        let mut enc = self.ctx.device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("zc-echo-legacy-hdr-smear"),
+                            },
+                        );
+                        let res = self.effects.run_shutter_accumulate(
+                            &self.ctx.device,
+                            &mut enc,
+                            &acc_in.view,
+                            tap_view,
+                            out_view,
+                            res_f,
+                            eff_w,
+                            1.0 / actual_wsum.max(1e-4),
+                            false,
+                            is_last,
+                            target_fmt,
+                        );
+                        if let Some(tt) = tap_opt {
+                            self.targets.release(tt);
+                        }
+                        if let Err(err) = res {
+                            self.targets.release(acc_in);
+                            self.targets.release(acc_out);
+                            self.targets.release(wet_dst);
+                            self.targets.release(source);
+                            return Err(RenderError::Effect(err.to_string()));
+                        }
+                        self.ctx.queue.submit(std::iter::once(enc.finish()));
+                        if !is_last {
+                            std::mem::swap(&mut acc_in, &mut acc_out);
+                        }
+                    }
+                    self.targets.release(acc_in);
+                    self.targets.release(acc_out);
+
+                    if strength < 0.999 {
+                        let mixed = self.targets.acquire(
+                            &self.ctx,
+                            width,
+                            height,
+                            wgpu::TextureFormat::Rgba8Unorm,
+                        )?;
+                        let mut enc = self.ctx.device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("zc-echo-legacy-strength-mix"),
+                            },
+                        );
+                        let mix_res = self.effects.run_frame_mix(
+                            &self.ctx.device,
+                            &mut enc,
+                            &source.view,
+                            &wet_dst.view,
+                            &mixed.view,
+                            res_f,
+                            strength,
+                            0,
+                        );
+                        self.targets.release(wet_dst);
+                        self.targets.release(source);
+                        return match mix_res {
+                            Ok(()) => {
+                                self.ctx.queue.submit(std::iter::once(enc.finish()));
+                                Ok(mixed)
+                            }
+                            Err(err) => {
+                                self.targets.release(mixed);
+                                Err(RenderError::Effect(err.to_string()))
+                            }
+                        };
+                    }
+                    self.targets.release(source);
+                    return Ok(wet_dst);
+                }
+
+                // General HDR `Rgba16Float` path for `echo-legacy` (modes 1/2/3 or threshold-gated smear):
+                // for mode 0 smear, pre-normalize `source` and each tap by `1 / expected_wsum` so
+                // intermediate sums remain strictly inside `[0, 1]` without clamp-darkening.
+                let inv_norm = if legacy_mode == 0 {
+                    1.0 / expected_wsum.max(1e-4)
+                } else {
+                    1.0
+                };
+                let hdr_canonical = match self.effects.ensure_pipeline_for_format(
+                    &self.ctx.device,
+                    "echo",
+                    false,
+                    wgpu::TextureFormat::Rgba16Float,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.targets.release(source);
+                        return Err(RenderError::Effect(e.to_string()));
+                    }
+                };
+                let ldr_canonical = match self.effects.ensure_pipeline_for_format(
+                    &self.ctx.device,
+                    "echo",
+                    false,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.targets.release(source);
+                        return Err(RenderError::Effect(e.to_string()));
+                    }
+                };
+
+                let mut acc_in = self.targets.acquire(
+                    &self.ctx,
+                    width,
+                    height,
+                    wgpu::TextureFormat::Rgba16Float,
+                )?;
+                let mut acc_out = self.targets.acquire(
+                    &self.ctx,
+                    width,
+                    height,
+                    wgpu::TextureFormat::Rgba16Float,
+                )?;
+                let wet_dst = self.targets.acquire(
+                    &self.ctx,
+                    width,
+                    height,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                )?;
+                {
+                    let mut enc =
+                        self.ctx
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("zc-echo-legacy-hdr-seed"),
+                            });
+                    if let Err(err) = self.effects.run_shutter_accumulate(
+                        &self.ctx.device,
+                        &mut enc,
+                        &acc_in.view,
+                        &source.view,
+                        &acc_out.view,
+                        res_f,
+                        inv_norm,
+                        1.0,
+                        true,
+                        false,
+                        wgpu::TextureFormat::Rgba16Float,
+                    ) {
+                        self.targets.release(acc_in);
+                        self.targets.release(acc_out);
+                        self.targets.release(wet_dst);
+                        self.targets.release(source);
+                        return Err(RenderError::Effect(err.to_string()));
+                    }
+                    self.ctx.queue.submit(std::iter::once(enc.finish()));
+                    std::mem::swap(&mut acc_in, &mut acc_out);
+                }
+
+                for (idx, &tap_weight) in tap_weights.iter().enumerate() {
+                    let k = (idx as u32) + 1;
+                    let is_last = k == num_echoes;
+                    let frame_offset = f64::from(k) * frame_step;
+                    let tap_opt = match self.render_temporal_layer_sample(
+                        tctx,
+                        env,
+                        frame_offset,
+                        width,
+                        height,
+                    ) {
+                        Ok(opt) => opt,
+                        Err(err) => {
+                            self.targets.release(acc_in);
+                            self.targets.release(acc_out);
+                            self.targets.release(wet_dst);
+                            self.targets.release(source);
+                            return Err(err);
+                        }
+                    };
+                    let eff_w = if tap_opt.is_some() {
+                        tap_weight * inv_norm
+                    } else {
+                        0.0
+                    };
+                    let mut tap_params = reg_params.clone();
+                    tap_params.set("legacyMode", RegParamValue::Bool(true));
+                    tap_params.set("mode", RegParamValue::Int(legacy_mode));
+                    tap_params.set("startingIntensity", RegParamValue::Float(eff_w));
+                    tap_params.set("weight", RegParamValue::Float(eff_w));
+                    tap_params.set("strength", RegParamValue::Float(1.0));
+                    tap_params.set("threshold", RegParamValue::Float(threshold));
+                    tap_params.set("wsum", RegParamValue::Float(1.0));
+                    tap_params.set("finalize", RegParamValue::Bool(false));
+
+                    let target_fmt = if is_last {
+                        wgpu::TextureFormat::Rgba8Unorm
+                    } else {
+                        wgpu::TextureFormat::Rgba16Float
+                    };
+                    let canonical = if is_last {
+                        ldr_canonical
+                    } else {
+                        hdr_canonical
+                    };
+                    let out_view = if is_last {
+                        &wet_dst.view
+                    } else {
+                        &acc_out.view
+                    };
+                    let tap_view = tap_opt.as_ref().map_or(&source.view, |t| &t.view);
+                    let uniforms = crate::effects::pack_effect_uniforms(
+                        "echo-legacy",
+                        &tap_params,
+                        true,
+                        false,
+                    );
+                    let mut enc =
+                        self.ctx
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("zc-echo-legacy-hdr-tap"),
+                            });
+                    self.effects.encode_pass(
+                        &self.ctx.device,
+                        &mut enc,
+                        (canonical, false, target_fmt),
+                        &uniforms,
+                        &acc_in.view,
+                        out_view,
+                        Some(tap_view),
+                        None,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    );
+                    self.ctx.queue.submit(std::iter::once(enc.finish()));
+                    if let Some(tt) = tap_opt {
+                        self.targets.release(tt);
+                    }
+                    if !is_last {
+                        std::mem::swap(&mut acc_in, &mut acc_out);
+                    }
+                }
+                self.targets.release(acc_in);
+                self.targets.release(acc_out);
+
+                if strength < 0.999 {
+                    let mixed = self.targets.acquire(
+                        &self.ctx,
+                        width,
+                        height,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )?;
+                    let mut enc =
+                        self.ctx
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("zc-echo-legacy-strength-mix"),
+                            });
+                    let mix_res = self.effects.run_frame_mix(
+                        &self.ctx.device,
+                        &mut enc,
+                        &source.view,
+                        &wet_dst.view,
+                        &mixed.view,
+                        res_f,
+                        strength,
+                        0,
+                    );
+                    self.targets.release(wet_dst);
+                    self.targets.release(source);
+                    return match mix_res {
+                        Ok(()) => {
+                            self.ctx.queue.submit(std::iter::once(enc.finish()));
+                            Ok(mixed)
+                        }
+                        Err(err) => {
+                            self.targets.release(mixed);
+                            Err(RenderError::Effect(err.to_string()))
+                        }
+                    };
+                }
+                self.targets.release(source);
+                return Ok(wet_dst);
+            }
+
             let mut accum = source;
-            let mut total_wsum = 1.0_f32;
             for k in 1..=num_echoes {
                 let frame_offset = f64::from(k) * frame_step;
                 let tap_target =
@@ -1591,24 +2086,10 @@ impl ProjectRenderEngine {
                 } else {
                     0.0
                 };
-                total_wsum += tap_weight;
                 let mut tap_params = reg_params.clone();
                 tap_params.set("startingIntensity", RegParamValue::Float(tap_weight));
                 tap_params.set("weight", RegParamValue::Float(tap_weight));
-                if is_legacy {
-                    tap_params.set("legacyMode", RegParamValue::Bool(true));
-                    tap_params.set("mode", RegParamValue::Int(reg_params.int_or("mode", 0)));
-                    tap_params.set(
-                        "strength",
-                        RegParamValue::Float(reg_params.float_or("strength", 1.0)),
-                    );
-                    tap_params.set(
-                        "threshold",
-                        RegParamValue::Float(reg_params.float_or("threshold", 0.0)),
-                    );
-                    tap_params.set("wsum", RegParamValue::Float(total_wsum));
-                    tap_params.set("finalize", RegParamValue::Bool(k == num_echoes));
-                } else if !tap_params.values.contains_key("operator") {
+                if !tap_params.values.contains_key("operator") {
                     tap_params.set("operator", RegParamValue::Int(op_code));
                 }
                 let dst = match self.targets.acquire(
@@ -1674,11 +2155,18 @@ impl ProjectRenderEngine {
             if crate::effects::should_bypass(canonical_id, &reg_params) {
                 return Ok(source);
             }
-            let use_shutter_samples = reg_params.int_or("reconstruction", 0) == 1
-                || reg_params.string("reconstruction").is_some_and(|s| {
-                    let low = s.to_ascii_lowercase();
-                    low.contains("shutter") || low.contains("sample")
-                });
+            // Zoidium `smart-motion-blur/math.js:38`: 0=Automatic (Shutter on Scene3D, Flow otherwise),
+            // 1=Optical Flow, 2=Shutter Samples.
+            let recon_code = reg_params.int_or("reconstruction", 0);
+            let is_lite = effect_id == "smart-motion-blur-lite"
+                || reg_params.values.contains_key("trackFrame");
+            let use_shutter_samples = !is_lite
+                && (recon_code == 2
+                    || (recon_code == 0 && tctx.track_is_3d)
+                    || reg_params.string("reconstruction").is_some_and(|s| {
+                        let low = s.to_ascii_lowercase();
+                        low.contains("shutter") || low.contains("sample")
+                    }));
             if use_shutter_samples {
                 let samples = reg_params.int_or("samples", 8).clamp(2, 32) as u32;
                 let shutter_angle =
@@ -1786,11 +2274,16 @@ impl ProjectRenderEngine {
                 }
             }
 
-            // Optical Flow mode: honor `analysis` (0=Both, 1=Prev, 2=Next) and `analysisFrames` (step 1..=4).
-            let analysis = reg_params.int_or("analysis", 0);
+            // Optical Flow mode: honor `trackFrame` (SMB Lite: 0=Previous, 1=Next) OR `analysis` (0=Both, 1=Prev, 2=Next).
+            let (want_prev, want_next) = if is_lite && reg_params.values.contains_key("trackFrame")
+            {
+                let tf = reg_params.int_or("trackFrame", 0);
+                (tf == 0, tf != 0)
+            } else {
+                let analysis = reg_params.int_or("analysis", 0);
+                (analysis != 2, analysis != 1)
+            };
             let step = f64::from(reg_params.float_or("analysisFrames", 1.0).clamp(1.0, 4.0));
-            let want_prev = analysis != 2;
-            let want_next = analysis != 1;
             let prev_target = if want_prev && env.frame >= step {
                 match self.render_temporal_layer_sample(tctx, env, -step, width, height) {
                     Ok(t) => t,

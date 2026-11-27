@@ -250,6 +250,7 @@ pub(crate) struct ClipPaintInfo {
     pub(crate) time_end: f64,
     pub(crate) time_animated: bool,
     pub(crate) has_time_keyframes: bool,
+    pub(crate) is_precomp: bool,
 }
 
 /// Lightweight per-frame track painting snapshot (avoids deep-cloning `Vec<SessionTrack>`).
@@ -263,7 +264,17 @@ pub(crate) struct TrackPaintRow {
     pub(crate) clips: Vec<ClipPaintInfo>,
 }
 
-pub(crate) fn snapshot_track_paint_rows(src: &[SessionTrack]) -> Vec<TrackPaintRow> {
+pub(crate) fn is_precomp_session_clip(session: &Session, clip: &SessionClip) -> bool {
+    clip.kind.eq_ignore_ascii_case("precomp")
+        || clip.kind.to_ascii_lowercase().contains("precomp")
+        || precomp_target_composition_id(session, clip).is_some()
+}
+
+pub(crate) fn snapshot_track_paint_rows(
+    src: &[SessionTrack],
+    session: &Session,
+    kind: TrackKind,
+) -> Vec<TrackPaintRow> {
     src.iter()
         .map(|track| TrackPaintRow {
             id: track.id.clone(),
@@ -287,10 +298,367 @@ pub(crate) fn snapshot_track_paint_rows(src: &[SessionTrack]) -> Vec<TrackPaintR
                         .properties
                         .get("time")
                         .is_some_and(|p| !p.keyframes.is_empty()),
+                    is_precomp: kind == TrackKind::Video && is_precomp_session_clip(session, clip),
                 })
                 .collect(),
         })
         .collect()
+}
+
+/// Collects all unlocked selected clips across BOTH video and audio tracks so users can drag
+/// linked / multi-selected video and audio clips simultaneously in lockstep.
+pub(crate) fn collect_all_selected_clips(session: &Session) -> Vec<DraggedClipInfo> {
+    let mut out = collect_selected_clips_of_kind(session, TrackKind::Video);
+    out.extend(collect_selected_clips_of_kind(session, TrackKind::Audio));
+    out
+}
+
+/// Handles active clip drags that span BOTH video and audio tracks simultaneously.
+/// Returns `true` when it handled a cross-domain drag (caller should skip `process_active_drag_state`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_cross_domain_clip_drag(
+    ui: &mut Ui,
+    session: &mut Session,
+    state: &mut TimelineViewState,
+    palette: &ThemePalette,
+    video_lanes_rect: Rect,
+    audio_lanes_rect: Rect,
+    fps: f64,
+    action: &mut TimelineAction,
+) -> bool {
+    let is_cross_domain = matches!(
+        &state.drag_state,
+        TimelineDragState::DraggingClips(drag)
+            if drag.clips.iter().any(|c| c.kind != drag.anchor_kind)
+    );
+    if !is_cross_domain {
+        return false;
+    }
+
+    let pointer_pos = ui.input(|i| i.pointer.latest_pos());
+    let primary_down = ui.input(|i| i.pointer.primary_down());
+    let modifiers = ui.input(|i| i.modifiers);
+    let snap_active = state.snap_enabled ^ modifiers.alt;
+    state.snap_guide_x = None;
+
+    let TimelineDragState::DraggingClips(mut drag) = std::mem::take(&mut state.drag_state) else {
+        return false;
+    };
+
+    let exclude: BTreeSet<String> = drag.clips.iter().map(|c| c.clip_id.clone()).collect();
+    let targets = collect_clip_snap_targets(session, &exclude);
+    let effective_audio_h = effective_track_row_height(
+        TrackKind::Audio,
+        &session.document().audio_tracks,
+        state.audio_track_height,
+        audio_lanes_rect.height(),
+    );
+    let (anchor_lanes_rect, anchor_track_h, anchor_scroll_y, anchor_track_count) =
+        match drag.anchor_kind {
+            TrackKind::Video => (
+                video_lanes_rect,
+                state.video_track_height,
+                state.video_scroll_y,
+                session.document().video_tracks.len(),
+            ),
+            TrackKind::Audio => (
+                audio_lanes_rect,
+                effective_audio_h,
+                state.audio_scroll_y,
+                session.document().audio_tracks.len(),
+            ),
+        };
+
+    if let Some(pos) = pointer_pos {
+        if (pos - drag.pointer_start).length() > 2.0 {
+            drag.moved = true;
+        }
+        let content_x = f64::from(pos.x - anchor_lanes_rect.left()) + state.scroll_x;
+        let raw_start = px_to_frame(content_x + drag.grab_offset_px, fps, state.zoom).round();
+        let raw_end = raw_start + drag.anchor_length;
+        let (snapped_l, hit_l) = snap_frame(raw_start, &targets, fps, state.zoom, snap_active);
+        let (snapped_r, hit_r) = snap_frame(raw_end, &targets, fps, state.zoom, snap_active);
+
+        let (snapped_start, snap_abs) = match (hit_l, hit_r) {
+            (Some(tl), Some(tr)) => {
+                let dl = (frame_to_px(tl, fps, state.zoom)
+                    - frame_to_px(raw_start, fps, state.zoom))
+                .abs();
+                let dr = (frame_to_px(tr, fps, state.zoom) - frame_to_px(raw_end, fps, state.zoom))
+                    .abs();
+                if dl <= dr {
+                    (snapped_l, Some(tl))
+                } else {
+                    (snapped_r - drag.anchor_length, Some(tr))
+                }
+            }
+            (Some(tl), None) => (snapped_l, Some(tl)),
+            (None, Some(tr)) => (snapped_r - drag.anchor_length, Some(tr)),
+            (None, None) => (raw_start, None),
+        };
+
+        if let Some(sa) = snap_abs {
+            state.snap_guide_x = Some(
+                anchor_lanes_rect.left()
+                    + (frame_to_px(sa, fps, state.zoom) - state.scroll_x) as f32,
+            );
+        }
+
+        let min_start = drag
+            .clips
+            .iter()
+            .map(|c| c.orig_start)
+            .fold(f64::INFINITY, f64::min);
+        drag.preview_delta_frames = (snapped_start - drag.anchor_orig_start).max(-min_start);
+
+        // Vertical track transfer applies to clips matching `drag.anchor_kind`; clips in the
+        // opposite domain keep their own tracks while shifting horizontally in lockstep.
+        if anchor_track_count > 0 {
+            let hovered_idx = y_to_track_index(
+                drag.anchor_kind,
+                pos.y,
+                anchor_track_h,
+                anchor_lanes_rect,
+                anchor_scroll_y,
+                anchor_track_count,
+            );
+            let raw_delta = hovered_idx as isize - drag.anchor_orig_track_index as isize;
+            let min_ti = drag
+                .clips
+                .iter()
+                .filter(|c| c.kind == drag.anchor_kind)
+                .map(|c| c.orig_track_index)
+                .min()
+                .unwrap_or(0) as isize;
+            let max_ti = drag
+                .clips
+                .iter()
+                .filter(|c| c.kind == drag.anchor_kind)
+                .map(|c| c.orig_track_index)
+                .max()
+                .unwrap_or(0) as isize;
+            let lo = -min_ti;
+            let hi = ((anchor_track_count as isize - 1) - max_ti).max(lo);
+            drag.preview_track_delta = raw_delta.clamp(lo, hi);
+        }
+    }
+
+    let mut moves = Vec::with_capacity(drag.clips.len());
+    let mut proxy_boxes: Vec<(TrackKind, usize, f64, f64)> = Vec::with_capacity(drag.clips.len());
+    let mut all_valid = !drag.clips.is_empty();
+    {
+        let doc = session.document();
+        let mut placed_on_track: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
+        for c in &drag.clips {
+            let tracks_slice = match c.kind {
+                TrackKind::Video => &doc.video_tracks,
+                TrackKind::Audio => &doc.audio_tracks,
+            };
+            if tracks_slice.is_empty() {
+                all_valid = false;
+                continue;
+            }
+            let track_delta = if c.kind == drag.anchor_kind {
+                drag.preview_track_delta
+            } else {
+                0
+            };
+            let dest_ti = (c.orig_track_index as isize + track_delta)
+                .clamp(0, tracks_slice.len().saturating_sub(1) as isize)
+                as usize;
+            let dest_track = &tracks_slice[dest_ti];
+            let proposed_start = (c.orig_start + drag.preview_delta_frames).max(0.0);
+            if dest_track.locked {
+                all_valid = false;
+                proxy_boxes.push((c.kind, dest_ti, proposed_start, c.length));
+                continue;
+            }
+            let max_shift = if track_delta != 0 {
+                Some(
+                    px_to_frame(24.0, fps, state.zoom)
+                        .max(12.0)
+                        .min(c.length * 0.5),
+                )
+            } else {
+                None
+            };
+            if let Some(valid_start) = resolve_non_overlapping_start_within_range(
+                dest_track,
+                proposed_start,
+                c.length,
+                &exclude,
+                max_shift,
+            ) {
+                let valid_end = valid_start + c.length;
+                let entry = placed_on_track.entry(dest_track.id.clone()).or_default();
+                if entry
+                    .iter()
+                    .any(|&(s, e)| valid_start < e - 1e-6 && s < valid_end - 1e-6)
+                {
+                    all_valid = false;
+                }
+                entry.push((valid_start, valid_end));
+                proxy_boxes.push((c.kind, dest_ti, valid_start, c.length));
+                moves.push((c.clip_id.clone(), dest_track.id.clone(), valid_start));
+            } else {
+                all_valid = false;
+                proxy_boxes.push((c.kind, dest_ti, proposed_start, c.length));
+            }
+        }
+    }
+    drag.overlap_blocked = !all_valid;
+
+    let proxy_fill = if drag.overlap_blocked {
+        Color32::from_rgba_unmultiplied(0xb7, 0x1e, 0x1e, 140)
+    } else {
+        rgb_to_color32_alpha(palette.clip_selected, 130)
+    };
+    for &(kind, dest_ti, draw_start, length) in &proxy_boxes {
+        let (lanes_rect, track_h, scroll_y) = match kind {
+            TrackKind::Video => (
+                video_lanes_rect,
+                state.video_track_height,
+                state.video_scroll_y,
+            ),
+            TrackKind::Audio => (audio_lanes_rect, effective_audio_h, state.audio_scroll_y),
+        };
+        let proxy_painter = ui.painter().with_clip_rect(lanes_rect);
+        let (y0, y1) = track_row_y_bounds(kind, dest_ti, track_h, lanes_rect, scroll_y);
+        let (cy0, cy1) = clip_y_bounds(kind, y0, y1);
+        let x0 =
+            lanes_rect.left() + (frame_to_px(draw_start, fps, state.zoom) - state.scroll_x) as f32;
+        let x1 = lanes_rect.left()
+            + (frame_to_px(draw_start + length, fps, state.zoom) - state.scroll_x) as f32;
+        let proxy_rect = Rect::from_min_max(pos2(x0, cy0), pos2(x1.max(x0 + 2.0), cy1));
+        proxy_painter.rect_filled(proxy_rect, CornerRadius::ZERO, proxy_fill);
+        paint_crisp_border_1px(&proxy_painter, proxy_rect, Color32::BLACK);
+    }
+
+    if primary_down {
+        ui.ctx().set_cursor_icon(if drag.overlap_blocked {
+            CursorIcon::NotAllowed
+        } else {
+            CursorIcon::Grabbing
+        });
+        state.drag_state = TimelineDragState::DraggingClips(drag);
+    } else if drag.moved && drag.overlap_blocked {
+        state.set_status_toast(
+            "Track occupied — drop on an open slot or empty track",
+            ui.input(|i| i.time),
+        );
+    } else if drag.moved
+        && (drag.preview_delta_frames.abs() > 1e-6 || drag.preview_track_delta != 0)
+        && all_valid
+        && !moves.is_empty()
+        && session.move_clips_atomic(&moves).is_ok()
+    {
+        action.clips_modified = true;
+    }
+    true
+}
+
+/// Returns all clip IDs in visual top-to-bottom, left-to-right timeline order
+/// (video tracks from top to bottom, then audio tracks from top to bottom; clips sorted by `start`).
+pub(crate) fn ordered_timeline_clip_ids(session: &Session) -> Vec<String> {
+    let doc = session.document();
+    let mut ordered = Vec::new();
+    let push_track = |track: &SessionTrack, out: &mut Vec<String>| {
+        let mut clips: Vec<(f64, usize, &str)> = track
+            .clips
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.start, i, c.id.as_str()))
+            .collect();
+        clips.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        out.extend(clips.into_iter().map(|(_, _, id)| id.to_owned()));
+    };
+    // Video tracks render bottom-up (V1 at bottom, higher tracks above), so visual top-down is `rev()`.
+    for track in doc.video_tracks.iter().rev() {
+        push_track(track, &mut ordered);
+    }
+    for track in &doc.audio_tracks {
+        push_track(track, &mut ordered);
+    }
+    ordered
+}
+
+/// Applies timeline clip click selection supporting plain click, `Shift`-click range selection
+/// (from anchor to clicked clip in visual order), and `Ctrl/Cmd`-click individual toggle.
+pub(crate) fn apply_timeline_clip_click(
+    session: &mut Session,
+    state: &mut TimelineViewState,
+    clicked_clip_id: &str,
+    shift: bool,
+    ctrl_cmd: bool,
+) {
+    if shift {
+        let ordered = ordered_timeline_clip_ids(session);
+        let clicked_pos = ordered.iter().position(|id| id == clicked_clip_id);
+        let anchor_id = state
+            .clip_selection_anchor
+            .as_deref()
+            .filter(|aid| ordered.iter().any(|id| id == aid))
+            .map(str::to_owned)
+            .or_else(|| {
+                session
+                    .selection
+                    .clip_ids
+                    .last()
+                    .filter(|aid| ordered.iter().any(|id| id == *aid))
+                    .cloned()
+            });
+        let anchor_pos = anchor_id
+            .as_deref()
+            .and_then(|aid| ordered.iter().position(|id| id == aid));
+
+        if let (Some(a_idx), Some(c_idx)) = (anchor_pos, clicked_pos) {
+            let lo = a_idx.min(c_idx);
+            let hi = a_idx.max(c_idx);
+            let range = &ordered[lo..=hi];
+            if !ctrl_cmd {
+                if let Some(first) = range.first() {
+                    let _ = session.selection.select_clip(first, None, false);
+                }
+                for id in range.iter().skip(1) {
+                    if !session.selection.clip_ids.contains(id) {
+                        session.selection.clip_ids.push(id.clone());
+                    }
+                }
+                session.selection.clip_base_type = None;
+            } else {
+                session.selection.clip_base_type = None;
+                for id in range {
+                    if !session.selection.clip_ids.contains(id) {
+                        session.selection.clip_ids.push(id.clone());
+                    }
+                }
+            }
+            if state.clip_selection_anchor.is_none() {
+                state.clip_selection_anchor = anchor_id;
+            }
+            return;
+        }
+
+        // No valid anchor yet: select clicked clip and establish it as the anchor.
+        let _ = session.selection.select_clip(clicked_clip_id, None, false);
+        state.clip_selection_anchor = Some(clicked_clip_id.to_owned());
+        return;
+    }
+
+    if ctrl_cmd {
+        // Clear any stale single-type tag (e.g. `Some("scene")` set by initial/Media selection)
+        // so toggling clips across the timeline always succeeds cleanly.
+        session.selection.clip_base_type = None;
+        if let Ok(selected_now) = session.selection.select_clip(clicked_clip_id, None, true)
+            && selected_now
+        {
+            state.clip_selection_anchor = Some(clicked_clip_id.to_owned());
+        }
+        return;
+    }
+
+    let _ = session.selection.select_clip(clicked_clip_id, None, false);
+    state.clip_selection_anchor = Some(clicked_clip_id.to_owned());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -314,8 +682,12 @@ pub(crate) fn paint_and_interact_tracks(
     // Extract lightweight read-only track/clip paint metadata without cloning properties,
     // 3D object graphs, effects, or keyframes.
     let tracks: Vec<TrackPaintRow> = match kind {
-        TrackKind::Video => snapshot_track_paint_rows(&session.document().video_tracks),
-        TrackKind::Audio => snapshot_track_paint_rows(&session.document().audio_tracks),
+        TrackKind::Video => {
+            snapshot_track_paint_rows(&session.document().video_tracks, session, kind)
+        }
+        TrackKind::Audio => {
+            snapshot_track_paint_rows(&session.document().audio_tracks, session, kind)
+        }
     };
 
     let (strip_rects, track_header_rect, track_lanes_rect) =
@@ -690,11 +1062,36 @@ pub(crate) fn paint_and_interact_tracks(
                 lane_painter.rect_filled(right_bar, CornerRadius::ZERO, COLOR_TRIM_SELECTED);
             }
 
-            // Sticky clip label pinned inside visible lane left edge, cleanly ellipsized with `…`
-            // to fit inside the clip's padded inner width, and skipped when clipped vertically < 14 px.
+            // Sticky clip label pinned inside visible lane left edge, with a compact `COMP`
+            // pill badge on Precomp video clips, cleanly ellipsized with `…` to fit inside the
+            // clip's padded inner width, and skipped when clipped vertically < 14 px.
             if visible_clip_rect.width() >= 12.0 && visible_clip_rect.height() >= 14.0 {
                 let clipped_label_painter = ui.painter().with_clip_rect(visible_clip_rect);
-                let sticky_x = clip_rect.left().max(track_lanes_rect.left()) + 4.0;
+                let mut sticky_x = clip_rect.left().max(track_lanes_rect.left()) + 4.0;
+                if kind == TrackKind::Video && clip.is_precomp && visible_clip_rect.width() >= 40.0
+                {
+                    let pill_w = 32.0_f32;
+                    let pill_h = 14.0_f32.min((visible_clip_rect.height() - 4.0).max(10.0));
+                    let pill_rect = Rect::from_center_size(
+                        pos2(sticky_x + pill_w * 0.5, visible_clip_rect.center().y),
+                        vec2(pill_w, pill_h),
+                    );
+                    clipped_label_painter.rect(
+                        pill_rect,
+                        CornerRadius::same(2),
+                        Color32::from_rgb(0x24, 0x38, 0x54),
+                        Stroke::new(1.0, Color32::from_rgb(0x7c, 0xa8, 0xe8)),
+                        StrokeKind::Inside,
+                    );
+                    clipped_label_painter.text(
+                        pill_rect.center(),
+                        Align2::CENTER_CENTER,
+                        "COMP",
+                        FontId::monospace(9.0),
+                        Color32::from_rgb(0xe8, 0xf2, 0xff),
+                    );
+                    sticky_x = pill_rect.right() + 4.0;
+                }
                 let max_label_w = (visible_clip_rect.right() - 4.0 - sticky_x).max(0.0);
                 if let Some(galley) = layout_ellipsized_clip_label(
                     &clipped_label_painter,
@@ -736,6 +1133,7 @@ pub(crate) fn paint_and_interact_tracks(
                 claim_timeline_focus(ui, state, action);
                 if !is_selected {
                     let _ = session.selection.select_clip(&clip.id, None, false);
+                    state.clip_selection_anchor = Some(clip.id.clone());
                 }
                 let menu_pos = body_resp
                     .interact_pointer_pos()
@@ -764,6 +1162,7 @@ pub(crate) fn paint_and_interact_tracks(
                 claim_timeline_focus(ui, state, action);
                 if !is_selected {
                     let _ = session.selection.select_clip(&clip.id, None, false);
+                    state.clip_selection_anchor = Some(clip.id.clone());
                 }
                 state.drag_state = TimelineDragState::TrimmingLeft(TrimDragState {
                     clip_id: clip.id.clone(),
@@ -786,6 +1185,7 @@ pub(crate) fn paint_and_interact_tracks(
                 claim_timeline_focus(ui, state, action);
                 if !is_selected {
                     let _ = session.selection.select_clip(&clip.id, None, false);
+                    state.clip_selection_anchor = Some(clip.id.clone());
                 }
                 state.drag_state = TimelineDragState::TrimmingRight(TrimDragState {
                     clip_id: clip.id.clone(),
@@ -844,20 +1244,25 @@ pub(crate) fn paint_and_interact_tracks(
                 return;
             }
 
-            // Clip selection click (handles Shift+Click toggle exactly once; never double-toggle
-            // across drag_started_by and clicked_by). Always surrenders stale TextEdit/popup focus
-            // and claims timeline focus even when clicking an already-selected clip.
+            // Clip selection click: plain click selects one, Shift+Click selects a visual range
+            // from the anchor clip, and Ctrl/Cmd+Click toggles membership. Always surrenders stale
+            // TextEdit/popup focus and claims timeline focus even when clicking an already-selected clip.
             if body_resp.clicked_by(PointerButton::Primary)
                 || left_resp.clicked_by(PointerButton::Primary)
                 || right_resp.clicked_by(PointerButton::Primary)
             {
                 interacted_clip = true;
                 claim_timeline_focus(ui, state, action);
-                let _ = session
-                    .selection
-                    .select_clip(&clip.id, None, modifiers.shift);
+                apply_timeline_clip_click(
+                    session,
+                    state,
+                    &clip.id,
+                    modifiers.shift,
+                    modifiers.ctrl || modifiers.command,
+                );
             } else if body_resp.drag_started_by(PointerButton::Primary)
                 && !modifiers.ctrl
+                && !modifiers.command
                 && !track.locked
             {
                 // Clip body drag-move start.
@@ -865,6 +1270,7 @@ pub(crate) fn paint_and_interact_tracks(
                 claim_timeline_focus(ui, state, action);
                 if !modifiers.shift && !is_selected {
                     let _ = session.selection.select_clip(&clip.id, None, false);
+                    state.clip_selection_anchor = Some(clip.id.clone());
                 }
                 if !modifiers.shift || is_selected {
                     let pointer = ui
@@ -872,7 +1278,7 @@ pub(crate) fn paint_and_interact_tracks(
                         .unwrap_or(clip_rect.min);
                     let content_x = f64::from(pointer.x - track_lanes_rect.left()) + state.scroll_x;
                     let clip_px = frame_to_px(clip.start, fps, state.zoom);
-                    let dragged_clips = collect_selected_clips_of_kind(session, kind);
+                    let dragged_clips = collect_all_selected_clips(session);
                     if !dragged_clips.is_empty() {
                         state.drag_state = TimelineDragState::DraggingClips(ClipDragState {
                             anchor_clip_id: clip.id.clone(),
@@ -907,9 +1313,14 @@ pub(crate) fn paint_and_interact_tracks(
             state.context_menu = Some(TimelineContextMenu::Lane { pos, tracks_height });
             state.context_menu_opened_this_frame = true;
             state.context_menu_sys_clipboard = None;
-        } else if lane_bg_resp.clicked_by(PointerButton::Primary) && !modifiers.shift {
+        } else if lane_bg_resp.clicked_by(PointerButton::Primary)
+            && !modifiers.shift
+            && !modifiers.ctrl
+            && !modifiers.command
+        {
             claim_timeline_focus(ui, state, action);
             session.selection.clear_clips();
+            state.clip_selection_anchor = None;
         } else if lane_bg_resp.drag_started_by(PointerButton::Primary)
             && matches!(state.drag_state, TimelineDragState::None)
             && let Some(origin) = lane_bg_resp.interact_pointer_pos()

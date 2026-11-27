@@ -3,12 +3,127 @@
 
 use super::*;
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::AtomicU8;
+
+#[cfg(not(target_arch = "wasm32"))]
+static EXPORT_HW_ACCEL_IDX: AtomicU8 = AtomicU8::new(0);
+#[cfg(not(target_arch = "wasm32"))]
+static EXPORT_SPEED_PRESET_IDX: AtomicU8 = AtomicU8::new(1);
+#[cfg(not(target_arch = "wasm32"))]
+static HW_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(not(target_arch = "wasm32"))]
+static HW_PROBE_BITS: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(not(target_arch = "wasm32"))]
+const HW_BIT_PROBED: u8 = 1 << 7;
+#[cfg(not(target_arch = "wasm32"))]
+const HW_BIT_H264_VT: u8 = 1 << 0;
+#[cfg(not(target_arch = "wasm32"))]
+const HW_BIT_HEVC_VT: u8 = 1 << 1;
+#[cfg(not(target_arch = "wasm32"))]
+const HW_BIT_H264_NVENC: u8 = 1 << 2;
+#[cfg(not(target_arch = "wasm32"))]
+const HW_BIT_HEVC_NVENC: u8 = 1 << 3;
+#[cfg(not(target_arch = "wasm32"))]
+const HW_BIT_H264_VAAPI: u8 = 1 << 4;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn export_hardware_acceleration() -> zc_export::HardwareAcceleration {
+    match EXPORT_HW_ACCEL_IDX.load(Ordering::Relaxed) {
+        1 => zc_export::HardwareAcceleration::Auto,
+        2 => zc_export::HardwareAcceleration::VideoToolbox,
+        3 => zc_export::HardwareAcceleration::Nvenc,
+        4 => zc_export::HardwareAcceleration::Vaapi,
+        _ => zc_export::HardwareAcceleration::Off,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn set_export_hardware_acceleration(hw: zc_export::HardwareAcceleration) {
+    let idx = match hw {
+        zc_export::HardwareAcceleration::Off => 0,
+        zc_export::HardwareAcceleration::Auto => 1,
+        zc_export::HardwareAcceleration::VideoToolbox => 2,
+        zc_export::HardwareAcceleration::Nvenc => 3,
+        zc_export::HardwareAcceleration::Vaapi => 4,
+    };
+    EXPORT_HW_ACCEL_IDX.store(idx, Ordering::Relaxed);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn export_speed_preset() -> zc_export::EncoderSpeedPreset {
+    match EXPORT_SPEED_PRESET_IDX.load(Ordering::Relaxed) {
+        0 => zc_export::EncoderSpeedPreset::Fast,
+        2 => zc_export::EncoderSpeedPreset::Slow,
+        _ => zc_export::EncoderSpeedPreset::Balanced,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn set_export_speed_preset(preset: zc_export::EncoderSpeedPreset) {
+    let idx = match preset {
+        zc_export::EncoderSpeedPreset::Fast => 0,
+        zc_export::EncoderSpeedPreset::Balanced => 1,
+        zc_export::EncoderSpeedPreset::Slow => 2,
+    };
+    EXPORT_SPEED_PRESET_IDX.store(idx, Ordering::Relaxed);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn ensure_hw_encoders_probed(
+    ffmpeg_path: Option<&Path>,
+) -> Option<zc_export::AvailableHwEncoders> {
+    let bits = HW_PROBE_BITS.load(Ordering::Acquire);
+    if bits & HW_BIT_PROBED != 0 {
+        return Some(zc_export::AvailableHwEncoders {
+            h264_videotoolbox: bits & HW_BIT_H264_VT != 0,
+            hevc_videotoolbox: bits & HW_BIT_HEVC_VT != 0,
+            h264_nvenc: bits & HW_BIT_H264_NVENC != 0,
+            hevc_nvenc: bits & HW_BIT_HEVC_NVENC != 0,
+            h264_vaapi: bits & HW_BIT_H264_VAAPI != 0,
+        });
+    }
+    if !HW_PROBE_STARTED.swap(true, Ordering::AcqRel) {
+        let owned_path = ffmpeg_path.map(Path::to_path_buf);
+        let _ = thread::Builder::new()
+            .name("zc-hw-encoder-probe".to_owned())
+            .spawn(move || {
+                let probed = zc_export::probe_hardware_encoders(owned_path.as_deref());
+                let mut packed = HW_BIT_PROBED;
+                if probed.h264_videotoolbox {
+                    packed |= HW_BIT_H264_VT;
+                }
+                if probed.hevc_videotoolbox {
+                    packed |= HW_BIT_HEVC_VT;
+                }
+                if probed.h264_nvenc {
+                    packed |= HW_BIT_H264_NVENC;
+                }
+                if probed.hevc_nvenc {
+                    packed |= HW_BIT_HEVC_NVENC;
+                }
+                if probed.h264_vaapi {
+                    packed |= HW_BIT_H264_VAAPI;
+                }
+                HW_PROBE_BITS.store(packed, Ordering::Release);
+            });
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Background Export Worker (Zero-Leak Cooperative Cancel + Join on Drop)
 // ---------------------------------------------------------------------------
 
 pub(crate) enum ExportWorkerEvent {
     Progress(ExportProgress),
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    PreviewFrame {
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
     Finished(Result<ExportReport, String>),
 }
 
@@ -38,7 +153,8 @@ impl ActiveExportJob {
         {
             loop {
                 match self.rx.try_recv() {
-                    Ok(ExportWorkerEvent::Progress(_)) => {}
+                    Ok(ExportWorkerEvent::Progress(_) | ExportWorkerEvent::PreviewFrame { .. }) => {
+                    }
                     Ok(ExportWorkerEvent::Finished(_)) | Err(TryRecvError::Disconnected) => {
                         return true;
                     }
@@ -103,6 +219,10 @@ pub(crate) struct ExportQueueSnapshot {
     pub(crate) plugins: PluginRegistry,
     pub(crate) active_composition_id: Option<String>,
     pub(crate) decoded_audio: HashMap<String, Arc<AudioBuffer>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) hw_accel: zc_export::HardwareAcceleration,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) speed_preset: zc_export::EncoderSpeedPreset,
 }
 
 impl ExportQueueSnapshot {
@@ -415,9 +535,18 @@ pub(crate) fn open_output_folder_in_os(path: &Path) -> Result<(), String> {
     res.map(|_| ()).map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn poll_export_job(
     job: &ActiveExportJob,
     status: &mut ExportStatus,
+) -> Option<Result<ExportReport, String>> {
+    poll_export_job_with_preview(job, status, None)
+}
+
+pub(crate) fn poll_export_job_with_preview(
+    job: &ActiveExportJob,
+    status: &mut ExportStatus,
+    mut preview_out: Option<&mut Option<(u32, u32, Vec<u8>)>>,
 ) -> Option<Result<ExportReport, String>> {
     let mut finished_result: Option<Result<ExportReport, String>> = None;
     let mut disconnected = false;
@@ -450,6 +579,19 @@ pub(crate) fn poll_export_job(
                     ),
                 };
             }
+            Ok(ExportWorkerEvent::PreviewFrame {
+                width,
+                height,
+                rgba,
+            }) => {
+                if let Some(slot) = preview_out.as_deref_mut()
+                    && width > 0
+                    && height > 0
+                    && rgba.len() == (width as usize) * (height as usize) * 4
+                {
+                    *slot = Some((width, height, rgba));
+                }
+            }
             Ok(ExportWorkerEvent::Finished(res)) => {
                 finished_result = Some(res);
             }
@@ -476,17 +618,29 @@ impl ZoidCraftApp {
             Ok(Ok(version)) => {
                 self.workspace.panels.export_status.ffmpeg_available = true;
                 self.workspace.panels.export_status.ffmpeg_version = version;
+                let resolved = zc_render::video::resolve_ffmpeg_binary_path();
+                self.workspace.panels.export_status.ffmpeg_resolved_path =
+                    Some(resolved.to_string_lossy().into_owned());
+                self.ffmpeg_setup.banner_visible = false;
                 self.ffmpeg_probe_rx = None;
             }
             Ok(Err(err)) => {
                 self.workspace.panels.export_status.ffmpeg_available = false;
                 self.workspace.panels.export_status.ffmpeg_version = format!("unavailable ({err})");
+                self.workspace.panels.export_status.ffmpeg_resolved_path = None;
+                if !self.workspace.panels.app_settings.ffmpeg_setup_dismissed {
+                    self.ffmpeg_setup.banner_visible = true;
+                }
                 self.ffmpeg_probe_rx = None;
             }
             Err(TryRecvError::Disconnected) => {
                 self.workspace.panels.export_status.ffmpeg_available = false;
                 self.workspace.panels.export_status.ffmpeg_version =
                     "unavailable (probe aborted)".to_owned();
+                self.workspace.panels.export_status.ffmpeg_resolved_path = None;
+                if !self.workspace.panels.app_settings.ffmpeg_setup_dismissed {
+                    self.ffmpeg_setup.banner_visible = true;
+                }
                 self.ffmpeg_probe_rx = None;
             }
             Err(TryRecvError::Empty) => {
@@ -502,7 +656,11 @@ impl ZoidCraftApp {
             .retain_mut(|job| !job.try_reap_finished());
 
         let finished_result = if let Some(job) = &self.active_export {
-            let res = poll_export_job(job, &mut self.workspace.panels.export_status);
+            let res = poll_export_job_with_preview(
+                job,
+                &mut self.workspace.panels.export_status,
+                Some(&mut self.workspace.panels.export_preview_rgba),
+            );
             if res.is_none() {
                 ctx.request_repaint_after(Duration::from_millis(33));
             }
@@ -512,6 +670,7 @@ impl ZoidCraftApp {
         };
 
         if let Some(res) = finished_result {
+            self.workspace.panels.export_preview_rgba = None;
             let finished_queue_id = if let Some(job) = self.active_export.take() {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -526,6 +685,7 @@ impl ZoidCraftApp {
             } else {
                 None
             };
+            self.workspace.panels.export_preview_rgba = None;
             self.workspace.panels.export_status.exporting = false;
             self.workspace.panels.export_status.live_fps = None;
             self.workspace.panels.export_status.eta_secs = None;
@@ -598,17 +758,24 @@ impl ZoidCraftApp {
             return;
         }
 
-        // Single-frame PNG snapshot mode.
+        // Single-frame image snapshot mode (PNG / JPEG / WebP + aspect-ratio fit).
         #[cfg(not(target_arch = "wasm32"))]
         if ui_cfg.mode == ExportMode::Frame {
             self.pause_playback_for_modal_dialog();
+            let frame_fmt = self.workspace.panels.export_frame_format;
+            let aspect_mode = self.workspace.panels.export_aspect_mode;
+            let (fmt_label, fmt_ext) = match frame_fmt {
+                1 => ("JPEG Image", "jpg"),
+                2 => ("WebP Image", "webp"),
+                _ => ("PNG Image", "png"),
+            };
             let default_name = format!(
-                "{}_frame_{}.png",
+                "{}_frame_{}.{fmt_ext}",
                 sanitize_filename(&self.session.document().project_name),
                 self.session.playback.current_frame.round() as i64
             );
             let chosen = rfd::FileDialog::new()
-                .add_filter("PNG Image", &["png"])
+                .add_filter(fmt_label, &[fmt_ext])
                 .set_file_name(default_name)
                 .save_file();
             self.last_tick = Instant::now();
@@ -617,13 +784,15 @@ impl ZoidCraftApp {
             };
 
             let frame = self.session.playback.current_frame;
+            let seq_res = self.session.document().resolution;
+            let (render_w, render_h) = zc_export::compute_aspect_fit_render_size(
+                seq_res,
+                ui_cfg.width,
+                ui_cfg.height,
+                aspect_mode,
+            );
             let render_res = if let Some(renderer) = self.renderer.as_mut() {
-                renderer.render_frame_straight_rgba8(
-                    &mut self.session,
-                    frame,
-                    ui_cfg.width,
-                    ui_cfg.height,
-                )
+                renderer.render_frame_straight_rgba8(&mut self.session, frame, render_w, render_h)
             } else {
                 let active_comp_id = self.session.document().active_composition_id;
                 let plugins = &self.session.plugins;
@@ -636,8 +805,8 @@ impl ZoidCraftApp {
                                 render_project,
                                 plugins,
                                 frame,
-                                ui_cfg.width,
-                                ui_cfg.height,
+                                render_w,
+                                render_h,
                             )
                         },
                     )?;
@@ -646,18 +815,45 @@ impl ZoidCraftApp {
             };
 
             match render_res
-                .and_then(|straight_rgba| encode_png(&straight_rgba, ui_cfg.width, ui_cfg.height))
+                .map(|raw| {
+                    if (render_w, render_h) == (ui_cfg.width, ui_cfg.height) {
+                        raw
+                    } else {
+                        let mut fitted = Vec::new();
+                        zc_export::fit_rgba_frame_into(
+                            &raw,
+                            (render_w, render_h),
+                            (ui_cfg.width, ui_cfg.height),
+                            ui_cfg.transparent_alpha,
+                            &mut fitted,
+                        );
+                        fitted
+                    }
+                })
                 .map_err(|e| e.to_string())
-                .and_then(|png| write_atomic(&path, &png).map_err(|e| e.to_string()))
+                .and_then(|straight_rgba| {
+                    zc_export::encode_single_frame_image(
+                        &straight_rgba,
+                        ui_cfg.width,
+                        ui_cfg.height,
+                        frame_fmt,
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .and_then(|bytes| write_atomic(&path, &bytes).map_err(|e| e.to_string()))
             {
                 Ok(()) => {
-                    let msg = format!("Exported PNG frame -> {}", path.display());
+                    let msg = format!(
+                        "Exported {} frame -> {}",
+                        fmt_ext.to_ascii_uppercase(),
+                        path.display()
+                    );
                     self.workspace.panels.export_status.last_completed_output = Some(path);
                     self.workspace.panels.export_status.status_message = msg.clone();
                     self.show_toast(msg);
                 }
                 Err(err) => {
-                    let msg = format!("PNG export failed: {err}");
+                    let msg = format!("Frame export failed: {err}");
                     self.workspace.panels.export_status.status_message = msg.clone();
                     self.show_toast(msg);
                 }
@@ -670,6 +866,13 @@ impl ZoidCraftApp {
         if let Err(msg) = self.validate_export_pre_dialog(&ui_cfg) {
             self.workspace.panels.export_status.status_message = msg.clone();
             self.show_toast(msg);
+            #[cfg(not(target_arch = "wasm32"))]
+            if ui_cfg.container.requires_ffmpeg()
+                && !self.workspace.panels.export_status.ffmpeg_available
+                && self.ffmpeg_probe_rx.is_none()
+            {
+                self.open_ffmpeg_setup_modal();
+            }
             return;
         }
 
@@ -780,6 +983,10 @@ impl ZoidCraftApp {
             plugins,
             active_composition_id,
             decoded_audio,
+            #[cfg(not(target_arch = "wasm32"))]
+            hw_accel: export_hardware_acceleration(),
+            #[cfg(not(target_arch = "wasm32"))]
+            speed_preset: export_speed_preset(),
         }
     }
 
@@ -904,6 +1111,12 @@ impl ZoidCraftApp {
         queue_job_id: Option<u64>,
         queued_snapshot: Option<ExportQueueSnapshot>,
     ) -> Result<(), String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let (hw_accel, speed_preset) = queued_snapshot.as_ref().map_or_else(
+            || (export_hardware_acceleration(), export_speed_preset()),
+            |snap| (snap.hw_accel, snap.speed_preset),
+        );
+
         let (seq_fps, mut export_project, export_plugins, active_composition_id, audio_source) =
             if let Some(snap) = queued_snapshot {
                 let fps = snap.effective_fps();
@@ -1014,10 +1227,42 @@ impl ZoidCraftApp {
                 start_seq_frame,
                 end_seq_frame,
                 single_frame,
+                frame_format: self.workspace.panels.export_frame_format,
+                aspect_mode: self.workspace.panels.export_aspect_mode,
                 cancel: cancel_worker,
                 events: tx,
             },
         )?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let aspect_mode = self.workspace.panels.export_aspect_mode;
+        #[cfg(not(target_arch = "wasm32"))]
+        let datamosh_mode = if export_plugins.is_enabled("openzoid-legacy") {
+            zc_export::DatamoshMode::from_index(ui_cfg.datamosh_mode)
+        } else {
+            zc_export::DatamoshMode::Off
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let cut_times_ms: Vec<u64> = {
+            let start_f = f64::from(start_seq_frame);
+            let end_f = f64::from(end_seq_frame);
+            let mut cuts = Vec::new();
+            for track in &export_project.sequence.video_tracks {
+                for clip in &track.clips {
+                    for edge in [clip.start, clip.start + clip.length] {
+                        if edge > start_f + 1e-3 && edge < end_f - 1e-3 {
+                            let ms = (((edge - start_f) / seq_fps.max(1.0)) * 1000.0).round();
+                            if ms.is_finite() && ms >= 0.0 {
+                                cuts.push(ms as u64);
+                            }
+                        }
+                    }
+                }
+            }
+            cuts.sort_unstable();
+            cuts.dedup();
+            cuts
+        };
 
         #[cfg(not(target_arch = "wasm32"))]
         let handle = thread::Builder::new()
@@ -1064,27 +1309,89 @@ impl ZoidCraftApp {
                         let w = core_settings.width;
                         let h = core_settings.height;
                         let transparent = core_settings.transparent_alpha;
-                        export_video_with_progress(
+                        let (render_w, render_h) = zc_export::compute_aspect_fit_render_size(
+                            export_session.document().resolution,
+                            w,
+                            h,
+                            aspect_mode,
+                        );
+                        let mut scratch_rgba = Vec::new();
+                        let mut last_thumb_at: Option<Instant> = None;
+                        let encode_options = zc_export::ExportEncodeOptions::default()
+                            .with_hardware_acceleration(hw_accel)
+                            .with_speed_preset(speed_preset)
+                            .with_datamosh_cuts(datamosh_mode, cut_times_ms.clone());
+                        zc_export::export_video_with_options(
                             &core_settings,
+                            &encode_options,
                             audio_mix.as_deref(),
                             &cancel_worker,
                             |output_step, rgba_out: &mut Vec<u8>| {
                                 let seq_frame = f64::from(start_seq_frame)
                                     + f64::from(output_step) * frame_advance;
-                                render_export_frame_into(
-                                    &mut export_engine,
-                                    &export_session,
-                                    seq_frame,
-                                    w,
-                                    h,
-                                    transparent,
-                                    rgba_out,
-                                )
+                                if (render_w, render_h) == (w, h) {
+                                    render_export_frame_into(
+                                        &mut export_engine,
+                                        &export_session,
+                                        seq_frame,
+                                        w,
+                                        h,
+                                        transparent,
+                                        rgba_out,
+                                    )?;
+                                } else {
+                                    render_export_frame_into(
+                                        &mut export_engine,
+                                        &export_session,
+                                        seq_frame,
+                                        render_w,
+                                        render_h,
+                                        transparent,
+                                        &mut scratch_rgba,
+                                    )?;
+                                    zc_export::fit_rgba_frame_into(
+                                        &scratch_rgba,
+                                        (render_w, render_h),
+                                        (w, h),
+                                        transparent,
+                                        rgba_out,
+                                    );
+                                }
+                                let should_emit_thumb = last_thumb_at
+                                    .is_none_or(|t| t.elapsed() >= Duration::from_millis(250));
+                                if should_emit_thumb {
+                                    last_thumb_at = Some(Instant::now());
+                                    let (tw, th, thumb_rgba) =
+                                        zc_export::downsample_rgba_thumbnail(rgba_out, w, h, 240);
+                                    if tw > 0 && th > 0 {
+                                        let _ = tx.send(ExportWorkerEvent::PreviewFrame {
+                                            width: tw,
+                                            height: th,
+                                            rgba: thumb_rgba,
+                                        });
+                                    }
+                                }
+                                Ok(())
                             },
                             |progress| {
                                 let _ = tx.send(ExportWorkerEvent::Progress(progress));
                             },
                         )
+                    })
+                    .and_then(|report| {
+                        if datamosh_mode != zc_export::DatamoshMode::Off
+                            && matches!(
+                                core_settings.container,
+                                CoreExportContainer::Webm | CoreExportContainer::Mkv
+                            )
+                        {
+                            let _ = zc_export::post_process_webm_datamosh_file(
+                                &report.output_path,
+                                datamosh_mode,
+                                &cut_times_ms,
+                            )?;
+                        }
+                        Ok(report)
                     })
                     .map_err(|err| err.to_string());
 
@@ -1093,6 +1400,7 @@ impl ZoidCraftApp {
 
         #[cfg(not(target_arch = "wasm32"))]
         let join_handle = handle.map_err(|err| format!("Failed to spawn export worker: {err}"))?;
+        self.workspace.panels.export_preview_rgba = None;
         self.workspace.panels.export_status.exporting = true;
         self.workspace.panels.export_status.progress = 0.0;
         self.workspace.panels.export_status.live_fps = None;
@@ -1136,6 +1444,7 @@ impl ZoidCraftApp {
             job.request_cancel();
             self.retired_exports.push(job);
         }
+        self.workspace.panels.export_preview_rgba = None;
         self.workspace.panels.export_status.exporting = false;
         self.workspace.panels.export_status.progress = 0.0;
         self.workspace.panels.export_status.live_fps = None;

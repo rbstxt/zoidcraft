@@ -350,6 +350,17 @@ impl DofPassParams {
         self.blur_amount(linear_depth, resolution_x)
             * self.max_blur_radius(resolution_x, resolution_y)
     }
+
+    /// Computes signed Circle-of-Confusion radius in pixels (negative for near-field blur,
+    /// positive for far-field blur, `0.0` inside the focus zone).
+    pub fn signed_coc(&self, linear_depth: f32, resolution_x: f32, resolution_y: f32) -> f32 {
+        let radius = self.blur_radius(linear_depth, resolution_x, resolution_y);
+        if linear_depth < self.focus_distance {
+            -radius
+        } else {
+            radius
+        }
+    }
 }
 
 /// Optional extended rendering controls passed to [`Scene3DRenderer::render_with_options`].
@@ -721,6 +732,8 @@ pub enum ParticleBlend {
     #[default]
     Normal,
     Additive,
+    Subtractive,
+    Multiply,
 }
 
 /// Per-instance GPU data for one camera-facing point-sprite particle quad.
@@ -872,7 +885,7 @@ pub(crate) struct OpticalFlareUniforms {
     pub(crate) color_brightness: [f32; 4],
     /// `x = scale`, `y = anamorphic`, `z = ring_intensity`, `w = rotation_rad`.
     pub(crate) shape_params: [f32; 4],
-    /// `x = ghosts`, `y = starburst_rays`, `z = occlusion_enabled (0.0/1.0)`, `w = 0.0`.
+    /// `x = ghosts`, `y = starburst_rays`, `z = occlusion_enabled (0.0/1.0)`, `w = dispersion_strength`.
     pub(crate) counts_occlusion: [f32; 4],
 }
 

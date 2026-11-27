@@ -9,6 +9,9 @@ pub(super) struct EvalNode3D<'a> {
     pub(super) parent: Option<usize>,
     pub(super) children: Vec<usize>,
     pub(super) render_enabled: bool,
+    /// Inherited CM3/Zoidium `reflectionVisibility` mode:
+    /// `0` = normal (main camera only), `1` = reflection only (env cubemap only), `2` = both.
+    pub(super) reflection_visibility: u32,
     pub(super) local_pos: Vec3,
     pub(super) local_rot: Quat,
     pub(super) local_scale: Vec3,
@@ -43,6 +46,36 @@ pub(super) fn evaluate_scene_graph_3d<'a>(
     evaluate_scene_graph_3d_depth(objects, root_world, env, 0)
 }
 
+fn eval_object_reflection_visibility(obj: &Object3D) -> Option<u32> {
+    if let Object3DKind::Group {
+        reflection_visibility,
+        ..
+    } = &obj.kind
+    {
+        return Some((*reflection_visibility).min(2));
+    }
+    let raw = obj.preserved.get("reflectionVisibility")?;
+    if let Some(n) = raw.as_u64() {
+        return Some((n as u32).min(2));
+    }
+    if let Some(f) = raw.as_f64() {
+        return Some((f.round().clamp(0.0, 2.0)) as u32);
+    }
+    if let Some(s) = raw.as_str() {
+        return match s.trim().to_ascii_lowercase().as_str() {
+            "reflection only" | "reflection_only" | "1" => Some(1),
+            "both" | "2" => Some(2),
+            "normal" | "no reflection" | "no_reflection" | "0" => Some(0),
+            _ => None,
+        };
+    }
+    raw.get("value").and_then(|v| {
+        v.as_u64()
+            .map(|n| (n as u32).min(2))
+            .or_else(|| v.as_f64().map(|f| (f.round().clamp(0.0, 2.0)) as u32))
+    })
+}
+
 pub(super) fn evaluate_scene_graph_3d_depth<'a>(
     objects: &'a [Object3D],
     root_world: Mat4,
@@ -60,6 +93,7 @@ pub(super) fn evaluate_scene_graph_3d_depth<'a>(
         parent_idx: Option<usize>,
         parent_world: Mat4,
         parent_render_enabled: bool,
+        parent_reflection_visibility: u32,
         env: &EvalEnv<'_>,
         nodes: &mut Vec<EvalNode3D<'a>>,
         by_uuid: &mut HashMap<Uuid, usize>,
@@ -73,6 +107,12 @@ pub(super) fn evaluate_scene_graph_3d_depth<'a>(
                 true,
             );
             let render_enabled = parent_render_enabled && self_enabled;
+            // Inherit non-normal reflection visibility (`1` = reflection only, `2` = both)
+            // from ancestor groups down to descendants when a child leaves visibility at default `0`.
+            let reflection_visibility = match eval_object_reflection_visibility(obj) {
+                Some(v) if v != 0 => v,
+                _ => parent_reflection_visibility,
+            };
             // P5 P2: Disabled Group still updates transforms when it contains a Camera descendant
             // (matching Zoidium `object3d-enabled.js:mustUpdateGroup`).
             let has_cam = matches!(&obj.kind, Object3DKind::Group { children, .. } if subtree_has_camera(children));
@@ -127,6 +167,7 @@ pub(super) fn evaluate_scene_graph_3d_depth<'a>(
                 } else {
                     render_enabled
                 },
+                reflection_visibility,
                 local_pos: pos,
                 local_rot,
                 local_scale: scale,
@@ -165,6 +206,7 @@ pub(super) fn evaluate_scene_graph_3d_depth<'a>(
                     Some(idx),
                     world_mat,
                     render_enabled,
+                    reflection_visibility,
                     &child_env,
                     nodes,
                     by_uuid,
@@ -179,6 +221,7 @@ pub(super) fn evaluate_scene_graph_3d_depth<'a>(
         None,
         root_world,
         true,
+        0,
         env,
         &mut nodes,
         &mut by_uuid,
@@ -488,10 +531,18 @@ pub(super) fn evaluate_active_camera_layer(
                         if !cam.active {
                             continue;
                         }
+                        let parent_mat = node
+                            .parent
+                            .map_or(Mat4::IDENTITY, |p| graph.nodes[p].world_mat);
                         let obj_env = layer_env.with_object(node.obj.id);
-                        return Some(build_camera_params_without_vibrate(
+                        return Some(build_camera_params_from_node(
                             cam,
-                            node.world_mat,
+                            node.obj,
+                            parent_mat,
+                            node.local_pos,
+                            node.local_rot,
+                            node.local_scale,
+                            node.euler_order,
                             &obj_env,
                             viewport_dims,
                         ));
@@ -501,7 +552,7 @@ pub(super) fn evaluate_active_camera_layer(
             if !camera.active {
                 continue;
             }
-            // Fallback: build camera from layer transform + `CameraData`.
+            // Fallback: build camera from layer transform + `CameraData` (preserving Camera+ Vibrate).
             let pos2d = eval_vec2(&clip.layer.position, &layer_env);
             let rot_z = eval_f32(&clip.layer.rotation, &layer_env);
             let (depth, rot_x, rot_y) = sequence
@@ -515,10 +566,17 @@ pub(super) fn evaluate_active_camera_layer(
                     )
                 })
                 .unwrap_or((100.0, 0.0, 0.0));
+            let (vib_pos, vib_euler) = apply_camera_vibrate_to_trs(
+                camera,
+                None,
+                Vec3::new(pos2d[0], pos2d[1], depth),
+                Vec3::new(rot_x, rot_y, rot_z),
+                &layer_env,
+            );
             let world = Mat4::from_scale_rotation_translation(
                 Vec3::ONE,
-                euler_to_quat(Vec3::new(rot_x, rot_y, rot_z), GeomEulerOrder::XYZ),
-                Vec3::new(pos2d[0], pos2d[1], depth),
+                euler_to_quat(vib_euler, GeomEulerOrder::XYZ),
+                vib_pos,
             );
             return Some(build_camera_params_without_vibrate(
                 camera,
@@ -526,6 +584,132 @@ pub(super) fn evaluate_active_camera_layer(
                 &layer_env,
                 viewport_dims,
             ));
+        }
+    }
+    None
+}
+
+/// Evaluates the highest active `LayerKind::CameraLayer`'s Depth-of-Field parameters at `env.abs_frame`.
+pub(super) fn evaluate_active_camera_layer_dof(env: &EvalEnv<'_>) -> Option<DofPassParams> {
+    if !env.plugins.is_enabled("camera-plus") {
+        return None;
+    }
+    let fps = env.fps.max(1.0);
+    let empty_parent_props = BTreeMap::new();
+    for track in env.sequence.video_tracks.iter().rev() {
+        if !track.enabled {
+            continue;
+        }
+        for clip in &track.clips {
+            if env.abs_frame < clip.start || env.abs_frame >= clip.start + clip.length {
+                continue;
+            }
+            let LayerKind::CameraLayer { camera } = &clip.layer.kind else {
+                continue;
+            };
+            let local_frame = (env.abs_frame - clip.start).max(0.0);
+            let clip_time = eval_track_keyframes_only(&clip.time_curve, local_frame)
+                .as_f64()
+                .unwrap_or(local_frame / fps);
+            let mapped_frame = clip_time * fps;
+            let layer_env = EvalEnv {
+                project: env.project,
+                sequence: env.sequence,
+                plugins: env.plugins,
+                frame: mapped_frame,
+                abs_frame: env.abs_frame,
+                time: clip_time,
+                fps,
+                sequence_resolution: env.sequence_resolution,
+                active_clip_id: Some(clip.id),
+                active_layer_id: Some(clip.layer.id),
+                active_object_id: None,
+                active_effect_id: None,
+                active_property_id: None,
+                controls: env.controls,
+                expr_stack: env.expr_stack,
+                parent_props: &empty_parent_props,
+            };
+            if let Some(cam_objects) = env.sequence.camera_layer_objects.get(&clip.layer.id)
+                && !cam_objects.is_empty()
+            {
+                let graph = evaluate_scene_graph_3d(cam_objects, Mat4::IDENTITY, &layer_env);
+                for node in &graph.nodes {
+                    if !node.render_enabled {
+                        continue;
+                    }
+                    if let Object3DKind::Camera(cam) = &node.obj.kind
+                        && cam.active
+                    {
+                        let obj_env = layer_env.with_object(node.obj.id);
+                        return eval_camera_dof(cam, &obj_env);
+                    }
+                }
+            }
+            if !camera.active {
+                continue;
+            }
+            return eval_camera_dof(camera, &layer_env);
+        }
+    }
+    None
+}
+
+/// Evaluates the highest active `LayerKind::CameraLayer`'s Motion Blur parameters at `env.abs_frame`.
+pub(super) fn evaluate_active_camera_layer_motion_blur(
+    env: &EvalEnv<'_>,
+) -> Option<zc_project::CameraMotionBlurParams> {
+    if !env.plugins.is_enabled("camera-plus") {
+        return None;
+    }
+    let fps = env.fps.max(1.0);
+    let empty_parent_props = BTreeMap::new();
+    for track in env.sequence.video_tracks.iter().rev() {
+        if !track.enabled {
+            continue;
+        }
+        for clip in &track.clips {
+            if env.abs_frame < clip.start || env.abs_frame >= clip.start + clip.length {
+                continue;
+            }
+            let LayerKind::CameraLayer { camera } = &clip.layer.kind else {
+                continue;
+            };
+            let local_frame = (env.abs_frame - clip.start).max(0.0);
+            let clip_time = eval_track_keyframes_only(&clip.time_curve, local_frame)
+                .as_f64()
+                .unwrap_or(local_frame / fps);
+            let mapped_frame = clip_time * fps;
+            let layer_env = EvalEnv {
+                project: env.project,
+                sequence: env.sequence,
+                plugins: env.plugins,
+                frame: mapped_frame,
+                abs_frame: env.abs_frame,
+                time: clip_time,
+                fps,
+                sequence_resolution: env.sequence_resolution,
+                active_clip_id: Some(clip.id),
+                active_layer_id: Some(clip.layer.id),
+                active_object_id: None,
+                active_effect_id: None,
+                active_property_id: None,
+                controls: env.controls,
+                expr_stack: env.expr_stack,
+                parent_props: &empty_parent_props,
+            };
+            if let Some(cam_objects) = env.sequence.camera_layer_objects.get(&clip.layer.id)
+                && !cam_objects.is_empty()
+                && let Some(mb) = find_active_camera_motion_blur(cam_objects, &layer_env)
+            {
+                return Some(mb);
+            }
+            if camera.active
+                && let Some(mb) = camera.motion_blur.as_ref()
+                && mb.enabled
+            {
+                return Some(mb.clone());
+            }
         }
     }
     None
@@ -1077,20 +1261,13 @@ pub(super) fn vibrate_sample_noise(x: f64, seed: f64, stepped: bool) -> f64 {
     vibrate_hash_noise(i, seed) * (1.0 - a) + vibrate_hash_noise(i + 1.0, seed) * a
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn build_camera_params_from_node(
+pub(super) fn apply_camera_vibrate_to_trs(
     cam: &zc_project::CameraData,
-    obj: &Object3D,
-    parent_world: Mat4,
+    preserved: Option<&BTreeMap<String, serde_json::Value>>,
     mut local_pos: Vec3,
-    local_rot: Quat,
-    local_scale: Vec3,
-    euler_order: GeomEulerOrder,
+    mut local_euler: Vec3,
     env: &EvalEnv<'_>,
-    viewport_dims: [f32; 2],
-) -> CameraParams {
-    let mut local_euler = zc_geom::quat_to_euler(local_rot, euler_order);
-
+) -> (Vec3, Vec3) {
     // P5 P0: Camera+ Vibrate uses Zoidium's exact sine-hash noise, channel seeds
     // (`seed + 17*h` for pos, `seed + 101 + 17*f` for rot), `env.frame` time base,
     // degree->radian rotation conversion, and additive local position + Euler offsets.
@@ -1101,17 +1278,16 @@ pub(super) fn build_camera_params_from_node(
         let seed = f64::from(vib.seed);
         let t = env.frame;
         let stepped = vib.regular_pulse
-            || obj
-                .preserved
-                .get("vibrate.regularPulse")
-                .or_else(|| obj.preserved.get("regularPulse"))
+            || preserved
+                .and_then(|p| {
+                    p.get("vibrate.regularPulse")
+                        .or_else(|| p.get("regularPulse"))
+                })
                 .and_then(serde_json::Value::as_f64)
                 .is_some_and(|v| v >= 0.5);
         let relative = vib.relative
-            || obj
-                .preserved
-                .get("vibrate.relative")
-                .or_else(|| obj.preserved.get("relative"))
+            || preserved
+                .and_then(|p| p.get("vibrate.relative").or_else(|| p.get("relative")))
                 .and_then(serde_json::Value::as_f64)
                 .is_some_and(|v| v >= 0.5);
 
@@ -1121,15 +1297,13 @@ pub(super) fn build_camera_params_from_node(
         let rot_freq = f64::from(eval_f32(&vib.rotation_frequency, env)).max(0.0);
 
         let enable_pos = vib.enable_position
-            || obj
-                .preserved
-                .get("vibrate.enablePosition")
+            || preserved
+                .and_then(|p| p.get("vibrate.enablePosition"))
                 .and_then(serde_json::Value::as_f64)
                 .is_some_and(|v| v >= 0.5);
         let enable_rot = vib.enable_rotation
-            || obj
-                .preserved
-                .get("vibrate.enableRotation")
+            || preserved
+                .and_then(|p| p.get("vibrate.enableRotation"))
                 .and_then(serde_json::Value::as_f64)
                 .is_some_and(|v| v >= 0.5);
 
@@ -1162,6 +1336,24 @@ pub(super) fn build_camera_params_from_node(
             local_euler = Vec3::from_array(out);
         }
     }
+    (local_pos, local_euler)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_camera_params_from_node(
+    cam: &zc_project::CameraData,
+    obj: &Object3D,
+    parent_world: Mat4,
+    local_pos: Vec3,
+    local_rot: Quat,
+    local_scale: Vec3,
+    euler_order: GeomEulerOrder,
+    env: &EvalEnv<'_>,
+    viewport_dims: [f32; 2],
+) -> CameraParams {
+    let base_euler = zc_geom::quat_to_euler(local_rot, euler_order);
+    let (local_pos, local_euler) =
+        apply_camera_vibrate_to_trs(cam, Some(&obj.preserved), local_pos, base_euler, env);
 
     let local_tf = Transform3D {
         position: local_pos,

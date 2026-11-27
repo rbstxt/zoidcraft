@@ -204,8 +204,31 @@ pub fn show_easing_plus_panel(
     } = state.drag_state
     {
         if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
+            // 40 px arm / 24 px release overshoot hysteresis (Zoidium Easing+ parity).
+            const OVERSHOOT_ARM_PX: f32 = 40.0;
+            const OVERSHOOT_RELEASE_PX: f32 = 24.0;
+            if pos.y < plot.top() - OVERSHOOT_ARM_PX {
+                state.overshoot_top = true;
+            } else if state.overshoot_top
+                && pos.y > plot.top() + OVERSHOOT_RELEASE_PX
+                && state.easing_plus_curve[1] <= 1.0 + 1e-6
+                && state.easing_plus_curve[3] <= 1.0 + 1e-6
+            {
+                state.overshoot_top = false;
+            }
+            if pos.y > plot.bottom() + OVERSHOOT_ARM_PX {
+                state.overshoot_bottom = true;
+            } else if state.overshoot_bottom
+                && pos.y < plot.bottom() - OVERSHOOT_RELEASE_PX
+                && state.easing_plus_curve[1] >= -1e-6
+                && state.easing_plus_curve[3] >= -1e-6
+            {
+                state.overshoot_bottom = false;
+            }
             let (nx, ny) = pt_to_norm(pos);
-            let clamped_y = ny.clamp(-1.5, 2.5);
+            let lo_y = if state.overshoot_bottom { -10.0 } else { 0.0 };
+            let hi_y = if state.overshoot_top { 10.0 } else { 1.0 };
+            let clamped_y = ny.clamp(lo_y, hi_y);
             if handle_idx == 0 {
                 state.easing_plus_curve[0] = nx;
                 state.easing_plus_curve[1] = clamped_y;
@@ -221,9 +244,13 @@ pub fn show_easing_plus_panel(
         if pad_resp.drag_stopped() || !primary_down {
             if state.easing_plus_curve[1] > 1.05 || state.easing_plus_curve[3] > 1.05 {
                 state.overshoot_top = true;
+            } else if state.easing_plus_curve[1] <= 1.0 && state.easing_plus_curve[3] <= 1.0 {
+                state.overshoot_top = false;
             }
             if state.easing_plus_curve[1] < -0.05 || state.easing_plus_curve[3] < -0.05 {
                 state.overshoot_bottom = true;
+            } else if state.easing_plus_curve[1] >= 0.0 && state.easing_plus_curve[3] >= 0.0 {
+                state.overshoot_bottom = false;
             }
             if session.history.is_in_transaction() {
                 let _ = session.commit_transaction(changed);
@@ -320,7 +347,7 @@ pub fn show_easing_plus_panel(
                 .add(
                     egui::DragValue::new(&mut ny1)
                         .speed(0.005)
-                        .range(-2.0..=3.0)
+                        .range(-100.0..=100.0)
                         .fixed_decimals(3),
                 )
                 .changed()
@@ -356,7 +383,7 @@ pub fn show_easing_plus_panel(
                 .add(
                     egui::DragValue::new(&mut ny2)
                         .speed(0.005)
-                        .range(-2.0..=3.0)
+                        .range(-100.0..=100.0)
                         .fixed_decimals(3),
                 )
                 .changed()
@@ -413,9 +440,9 @@ pub fn show_easing_plus_panel(
         if curve_edited {
             state.easing_plus_curve = [
                 nx1.clamp(0.0, 1.0),
-                ny1.clamp(-2.0, 3.0),
+                ny1.clamp(-100.0, 100.0),
                 nx2.clamp(0.0, 1.0),
-                ny2.clamp(-2.0, 3.0),
+                ny2.clamp(-100.0, 100.0),
             ];
             if ny1 > 1.0 + 1e-8 || ny2 > 1.0 + 1e-8 {
                 state.overshoot_top = true;
@@ -593,6 +620,177 @@ pub fn sync_handles_from_tracks(
                     continuous: kf.continuous_tangent,
                 },
             );
+        }
+    }
+}
+
+fn control_points_approx_eq(a: ([[f64; 2]; 2], bool), b: ([[f64; 2]; 2], bool)) -> bool {
+    a.1 == b.1
+        && (a.0[0][0] - b.0[0][0]).abs() < 1e-6
+        && (a.0[0][1] - b.0[0][1]).abs() < 1e-6
+        && (a.0[1][0] - b.0[1][0]).abs() < 1e-6
+        && (a.0[1][1] - b.0[1][1]).abs() < 1e-6
+}
+
+/// Syncs Bezier handles from `tracks` into `state.handles` while preserving independent
+/// per-channel handle overrides for vector properties (e.g. `position.X` vs `.Y`/`.Z`).
+/// If an external change (Undo/Redo/Paste) altered the underlying session `control_points`,
+/// stale overrides for that keyframe are automatically cleared.
+pub fn sync_handles_from_tracks_preserving_channels(
+    state: &mut GraphEditorState,
+    tracks: &[CurveTrack],
+) {
+    let mut invalidated: Vec<(String, String, u64)> = Vec::new();
+    for (prop_key, last_cp) in &state.last_persisted_cp {
+        let mut found_match = false;
+        let mut found_any = false;
+        for track in tracks {
+            if track.target_id == prop_key.0
+                && track.property == prop_key.1
+                && let Some(kf) = track
+                    .keyframes
+                    .iter()
+                    .find(|k| canonical_bits(k.local_frame) == prop_key.2)
+            {
+                found_any = true;
+                if control_points_approx_eq((kf.control_points, kf.continuous_tangent), *last_cp) {
+                    found_match = true;
+                }
+                break;
+            }
+        }
+        if !found_any || !found_match {
+            invalidated.push(prop_key.clone());
+        }
+    }
+    for prop_key in invalidated {
+        state.last_persisted_cp.remove(&prop_key);
+        state.channel_handle_overrides.retain(|kid, _| {
+            !(kid.target_id == prop_key.0
+                && kid.property == prop_key.1
+                && kid.frame_bits == prop_key.2)
+        });
+    }
+
+    for track in tracks {
+        for kf in &track.keyframes {
+            let kid = GraphKeyId::new(
+                &track.target_id,
+                &track.property,
+                track.channel_index,
+                kf.local_frame,
+            );
+            let pair = if let Some(&ovr) = state.channel_handle_overrides.get(&kid) {
+                ovr
+            } else {
+                BezierHandlePair {
+                    in_tangent: kf.control_points[0],
+                    out_tangent: kf.control_points[1],
+                    continuous: kf.continuous_tangent,
+                }
+            };
+            state.handles.insert(kid, pair);
+        }
+    }
+}
+
+/// Computes smooth Catmull-Rom Bezier tangents for a keyframe from its previous & next neighbors,
+/// with monotone clamping against overshoot at extrema and sharp corners.
+#[must_use]
+pub fn compute_auto_catmull_rom_handles(
+    prev: Option<(f64, f64)>,
+    curr: (f64, f64),
+    next: Option<(f64, f64)>,
+) -> BezierHandlePair {
+    let (f, v) = curr;
+    let hx_in = prev
+        .map(|(fp, _)| ((f - fp) / 3.0).max(0.0))
+        .unwrap_or(10.0);
+    let hx_out = next
+        .map(|(fn_, _)| ((fn_ - f) / 3.0).max(0.0))
+        .unwrap_or(10.0);
+
+    let slope = match (prev, next) {
+        (Some((fp, vp)), Some((fn_, vn))) => {
+            let dt_in = f - fp;
+            let dt_out = fn_ - f;
+            let dt_total = fn_ - fp;
+            if dt_in > 1e-9 && dt_out > 1e-9 && dt_total > 1e-9 {
+                let s_in = (v - vp) / dt_in;
+                let s_out = (vn - v) / dt_out;
+                // Flat zero slope at local extrema prevents overshoot.
+                if s_in * s_out <= 0.0 {
+                    0.0
+                } else {
+                    let raw = (vn - vp) / dt_total;
+                    // Clamp slope against overshoot (Fritsch-Carlson / monotone cubic bound).
+                    let max_slope = 3.0 * s_in.abs().min(s_out.abs());
+                    raw.clamp(-max_slope, max_slope)
+                }
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    };
+
+    BezierHandlePair {
+        in_tangent: [-hx_in, -slope * hx_in],
+        out_tangent: [hx_out, slope * hx_out],
+        continuous: true,
+    }
+}
+
+/// Applies Catmull-Rom smooth Auto tangents (`continuous = true` + computed Bezier handles)
+/// to all selected keyframes, enabling Bezier interpolation on their adjacent segments.
+pub fn apply_auto_tangents_on_selected(
+    session: &mut Session,
+    state: &mut GraphEditorState,
+    tracks: &[CurveTrack],
+    action: &mut GraphEditorAction,
+) {
+    if state.selected_keys.is_empty() {
+        return;
+    }
+    let selected = state.selected_keys.clone();
+    if session.begin_transaction("Auto Smooth Tangents").is_ok() {
+        let mut changed = false;
+        for kid in &selected {
+            let Some(track) = tracks.iter().find(|t| t.track_key == kid.track_key()) else {
+                continue;
+            };
+            let Some(idx) = track
+                .keyframes
+                .iter()
+                .position(|k| (k.local_frame - kid.local_frame()).abs() < 1e-6)
+            else {
+                continue;
+            };
+            let curr = &track.keyframes[idx];
+            let prev = idx
+                .checked_sub(1)
+                .and_then(|p| track.keyframes.get(p))
+                .map(|k| (k.local_frame, k.value));
+            let next = track
+                .keyframes
+                .get(idx + 1)
+                .map(|k| (k.local_frame, k.value));
+            let auto_pair =
+                compute_auto_catmull_rom_handles(prev, (curr.local_frame, curr.value), next);
+
+            if persist_graph_handle_edit(session, state, tracks, kid, auto_pair) {
+                changed = true;
+            }
+            if prev.is_some() {
+                ensure_bezier_tween_for_handle(session, tracks, kid, false, action);
+            }
+            if next.is_some() {
+                ensure_bezier_tween_for_handle(session, tracks, kid, true, action);
+            }
+        }
+        let _ = session.commit_transaction(changed);
+        if changed {
+            action.curves_modified = true;
         }
     }
 }
@@ -888,8 +1086,10 @@ pub fn hit_test_bezier_handle(
                 .get(idx + 1)
                 .map_or(kf.local_frame, |k| k.local_frame);
 
+            let disp_val = state.display_value_for_track(track, kf.value);
             if let Some(eff_in) = effective_in_tangent(state, track, idx, hp) {
-                let pos = compute_handle_screen_pos(state, rect, abs_f, kf.value, eff_in, false);
+                let disp_in = [eff_in[0], state.display_delta_for_track(track, eff_in[1])];
+                let pos = compute_handle_screen_pos(state, rect, abs_f, disp_val, disp_in, false);
                 let d = pointer.distance(pos);
                 if d < best_dist {
                     best_dist = d;
@@ -905,7 +1105,8 @@ pub fn hit_test_bezier_handle(
                 }
             }
             if let Some(eff_out) = effective_out_tangent(state, track, idx, hp) {
-                let pos = compute_handle_screen_pos(state, rect, abs_f, kf.value, eff_out, true);
+                let disp_out = [eff_out[0], state.display_delta_for_track(track, eff_out[1])];
+                let pos = compute_handle_screen_pos(state, rect, abs_f, disp_val, disp_out, true);
                 let d = pointer.distance(pos);
                 if d < best_dist {
                     best_dist = d;
@@ -1056,7 +1257,7 @@ pub fn show_g2_toolbar(
                     active_continuous == Some(true),
                     palette,
                 ) {
-                    set_continuous_on_selected(session, state, true, action);
+                    apply_auto_tangents_on_selected(session, state, tracks, action);
                 }
 
                 // 50x30 Custom Easings popup button.
@@ -1204,6 +1405,9 @@ pub fn show_g2_toolbar(
                     palette,
                 ) {
                     state.normalize_curves = !state.normalize_curves;
+                    let fps = session.document().fps.max(1.0);
+                    let doc = session.document().clone();
+                    state.fit_curves_for_mode(tracks, &doc, fps, est_canvas_size);
                 }
                 if g2_tool_tile(
                     ui,
@@ -1566,5 +1770,221 @@ pub fn show_g2_status_bar(
             COLOR_TEXT,
         );
         x += approx_w + 8.0;
+    }
+}
+
+#[cfg(test)]
+mod wave1_graph_editor_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_track(
+        target_id: &str,
+        property: &str,
+        channel_index: Option<usize>,
+        points: &[(f64, f64)],
+    ) -> CurveTrack {
+        CurveTrack {
+            track_key: channel_track_key(target_id, property, channel_index),
+            target_id: target_id.to_owned(),
+            property: property.to_owned(),
+            channel_index,
+            display_name: property.to_owned(),
+            color: COLOR_AXIS_X,
+            frame_offset: 0.0,
+            is_expression: false,
+            expression: None,
+            keyframes: points
+                .iter()
+                .map(|&(f, v)| CurveKeyframe {
+                    local_frame: f,
+                    value: v,
+                    full_value: json!(v),
+                    tween: 1,
+                    control_points: [[-10.0, 0.0], [10.0, 0.0]],
+                    continuous_tangent: true,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn norm_curve_mapping_normalizes_and_inverts_drag_deltas_consistently() {
+        let mut state = GraphEditorState::new();
+        let opacity = sample_track("clip-1", "opacity", None, &[(0.0, 0.0), (30.0, 100.0)]);
+        let pos_x = sample_track(
+            "clip-1",
+            "position",
+            Some(0),
+            &[(0.0, -500.0), (15.0, 0.0), (30.0, 500.0)],
+        );
+        let constant = sample_track("clip-1", "scale", None, &[(0.0, 42.0), (30.0, 42.0)]);
+
+        // Norm OFF: identity mapping.
+        assert!(!state.normalize_curves);
+        assert!((state.display_value_for_track(&pos_x, 500.0) - 500.0).abs() < 1e-9);
+        assert!((state.raw_delta_from_display(&pos_x, 0.25) - 0.25).abs() < 1e-9);
+
+        // Norm ON: every visible curve normalizes to [0.0, 1.0], constant centers at 0.5.
+        state.normalize_curves = true;
+        assert!((state.display_value_for_track(&opacity, 0.0) - 0.0).abs() < 1e-9);
+        assert!((state.display_value_for_track(&opacity, 100.0) - 1.0).abs() < 1e-9);
+        assert!((state.display_value_for_track(&pos_x, -500.0) - 0.0).abs() < 1e-9);
+        assert!((state.display_value_for_track(&pos_x, 0.0) - 0.5).abs() < 1e-9);
+        assert!((state.display_value_for_track(&pos_x, 500.0) - 1.0).abs() < 1e-9);
+        assert!((state.display_value_for_track(&constant, 42.0) - 0.5).abs() < 1e-9);
+
+        // Vertical drag inverse mapping: display delta 0.2 -> raw delta +200.0 on [-500, 500].
+        let raw_dv = state.raw_delta_from_display(&pos_x, 0.2);
+        assert!((raw_dv - 200.0).abs() < 1e-9);
+        assert!((state.display_delta_for_track(&pos_x, raw_dv) - 0.2).abs() < 1e-9);
+
+        // Hit-testing under Norm uses the exact same normalized screen Y as painting.
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 200.0));
+        let tracks = vec![opacity, pos_x];
+        state.fit_curves(&tracks, rect.size());
+        let expected_pt = pos2(
+            state.frame_to_screen_x(15.0, rect),
+            state.track_value_to_screen_y(&tracks[1], 0.0, rect),
+        );
+        let hit = hit_test_keyframe(&state, &tracks, rect, expected_pt)
+            .expect("must hit normalized keyframe at its painted screen position");
+        assert_eq!(hit.0.track_key, tracks[1].track_key);
+        assert_eq!(hit.1, 1);
+    }
+
+    #[test]
+    fn auto_catmull_rom_computes_smooth_slopes_and_clamps_overshoot() {
+        // Linear ramp: (0,0) -> (10,10) -> (20,20) => slope = 1.0, hx = 10/3.
+        let ramp =
+            compute_auto_catmull_rom_handles(Some((0.0, 0.0)), (10.0, 10.0), Some((20.0, 20.0)));
+        assert!(ramp.continuous);
+        assert!((ramp.in_tangent[0] + 10.0 / 3.0).abs() < 1e-9);
+        assert!((ramp.in_tangent[1] + 10.0 / 3.0).abs() < 1e-9);
+        assert!((ramp.out_tangent[0] - 10.0 / 3.0).abs() < 1e-9);
+        assert!((ramp.out_tangent[1] - 10.0 / 3.0).abs() < 1e-9);
+
+        // Local extremum peak: (0,0) -> (10,100) -> (20,0) => zero slope to prevent overshoot.
+        let peak =
+            compute_auto_catmull_rom_handles(Some((0.0, 0.0)), (10.0, 100.0), Some((20.0, 0.0)));
+        assert!(peak.continuous);
+        assert!(peak.in_tangent[1].abs() < 1e-9);
+        assert!(peak.out_tangent[1].abs() < 1e-9);
+
+        // Steep asymmetric ramp: (0,0) -> (10,1) -> (20,100) => raw slope 5.0 clamped to 3 * 0.1 = 0.3.
+        let corner =
+            compute_auto_catmull_rom_handles(Some((0.0, 0.0)), (10.0, 1.0), Some((20.0, 100.0)));
+        assert!(corner.continuous);
+        let eff_slope = corner.out_tangent[1] / corner.out_tangent[0];
+        assert!((eff_slope - 0.3).abs() < 1e-9);
+
+        // Boundary keyframe: flat horizontal tangent.
+        let boundary = compute_auto_catmull_rom_handles(None, (0.0, 5.0), Some((15.0, 50.0)));
+        assert!(boundary.continuous);
+        assert!((boundary.out_tangent[0] - 5.0).abs() < 1e-9);
+        assert!(boundary.out_tangent[1].abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_auto_tangents_writes_bezier_handles_and_enables_bezier_tween() {
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        for (f, v) in [(0.0, 0.0), (15.0, 0.5), (30.0, 1.0)] {
+            session
+                .execute(Command::SetKeyframe {
+                    target_id: clip_id.clone(),
+                    property: "opacity".to_owned(),
+                    frame: f,
+                    value: json!(v),
+                    tween: Some(1),
+                })
+                .expect("set keyframe");
+        }
+        session.selection.clip_ids = vec![clip_id.clone()];
+
+        let mut state = GraphEditorState::new();
+        let tracks = collect_curve_tracks(&session, &state, true);
+        let mid_key = GraphKeyId::new(&clip_id, "opacity", None, 15.0);
+        state.selected_keys = vec![mid_key.clone()];
+        let mut action = GraphEditorAction::default();
+
+        apply_auto_tangents_on_selected(&mut session, &mut state, &tracks, &mut action);
+        assert!(action.curves_modified);
+
+        let tracks_after = collect_curve_tracks(&session, &state, true);
+        let opacity_track = tracks_after
+            .iter()
+            .find(|t| t.target_id == clip_id && t.property == "opacity")
+            .expect("opacity track");
+        let mid_kf = &opacity_track.keyframes[1];
+        assert!(mid_kf.continuous_tangent);
+        // dt = 15 => hx = 5, slope = 1/30 => hy = 5/30 = 1/6.
+        assert!((mid_kf.control_points[1][0] - 5.0).abs() < 1e-6);
+        assert!((mid_kf.control_points[1][1] - (1.0 / 6.0)).abs() < 1e-6);
+        assert!((mid_kf.control_points[0][0] + 5.0).abs() < 1e-6);
+        assert!((mid_kf.control_points[0][1] + (1.0 / 6.0)).abs() < 1e-6);
+        // Adjacent segments must have Bezier interpolation enabled.
+        let (mode_mid, _) = InterpolationMode::from_cm3_tween_code(mid_kf.tween);
+        let (mode_end, _) =
+            InterpolationMode::from_cm3_tween_code(opacity_track.keyframes[2].tween);
+        assert_eq!(mode_mid, InterpolationMode::Bezier);
+        assert_eq!(mode_end, InterpolationMode::Bezier);
+    }
+
+    #[test]
+    fn dragging_single_vector_channel_handle_preserves_sibling_channels() {
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        session
+            .execute(Command::SetKeyframe {
+                target_id: clip_id.clone(),
+                property: "position".to_owned(),
+                frame: 0.0,
+                value: json!([0.0, 0.0, 0.0]),
+                tween: Some(InterpolationMode::Bezier.to_cm3_tween_code(EasingKind::Linear)),
+            })
+            .expect("kf0");
+        session
+            .execute(Command::SetKeyframe {
+                target_id: clip_id.clone(),
+                property: "position".to_owned(),
+                frame: 30.0,
+                value: json!([100.0, 200.0, 300.0]),
+                tween: Some(InterpolationMode::Bezier.to_cm3_tween_code(EasingKind::Linear)),
+            })
+            .expect("kf1");
+        session.selection.clip_ids = vec![clip_id.clone()];
+
+        let mut state = GraphEditorState::new();
+        let tracks = collect_curve_tracks(&session, &state, true);
+        sync_handles_from_tracks_preserving_channels(&mut state, &tracks);
+
+        let key_x = GraphKeyId::new(&clip_id, "position", Some(0), 0.0);
+        let key_y = GraphKeyId::new(&clip_id, "position", Some(1), 0.0);
+        let key_z = GraphKeyId::new(&clip_id, "position", Some(2), 0.0);
+        let orig_y = state.handles.get(&key_y).copied().unwrap_or_default();
+        let orig_z = state.handles.get(&key_z).copied().unwrap_or_default();
+
+        let edited_x = BezierHandlePair {
+            in_tangent: [-5.0, -20.0],
+            out_tangent: [12.0, 45.0],
+            continuous: false,
+        };
+        assert!(persist_graph_handle_edit(
+            &mut session,
+            &mut state,
+            &tracks,
+            &key_x,
+            edited_x
+        ));
+
+        // On the next frame, syncing handles from freshly collected tracks must preserve
+        // X's new tangent WITHOUT overwriting sibling channels Y and Z!
+        let tracks_next = collect_curve_tracks(&session, &state, true);
+        sync_handles_from_tracks_preserving_channels(&mut state, &tracks_next);
+
+        assert_eq!(state.handles.get(&key_x).copied(), Some(edited_x));
+        assert_eq!(state.handles.get(&key_y).copied(), Some(orig_y));
+        assert_eq!(state.handles.get(&key_z).copied(), Some(orig_z));
     }
 }

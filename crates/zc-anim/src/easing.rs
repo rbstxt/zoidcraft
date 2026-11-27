@@ -949,6 +949,41 @@ pub fn handles_from_curve(
     }
 }
 
+/// Rescales relative Bezier handles `(out_h, in_h)` when segment endpoints move from
+/// `(old_f0, old_v0) -> (old_f1, old_v1)` to `(new_f0, new_v0) -> (new_f1, new_v1)`,
+/// preserving the normalized `[x1, y1, x2, y2]` easing shape (Zoidium Easing+ parity).
+#[allow(clippy::too_many_arguments)]
+pub fn rescale_segment_handles(
+    old_f0: f64,
+    old_v0: f64,
+    old_f1: f64,
+    old_v1: f64,
+    new_f0: f64,
+    new_v0: f64,
+    new_f1: f64,
+    new_v1: f64,
+    out_h: [f64; 2],
+    in_h: [f64; 2],
+) -> ([f64; 2], [f64; 2]) {
+    if has_native_bezier_defaults(out_h, in_h) {
+        return (out_h, in_h);
+    }
+    let old_dur = old_f1 - old_f0;
+    let new_dur = new_f1 - new_f0;
+    if !old_dur.is_finite() || old_dur <= 1e-8 || !new_dur.is_finite() || new_dur <= 1e-8 {
+        return (out_h, in_h);
+    }
+    let bez = curve_from_segment(BezierSegment {
+        start_frame: old_f0,
+        start_value: old_v0,
+        out_tangent: out_h,
+        end_frame: old_f1,
+        end_value: old_v1,
+        in_tangent: in_h,
+    });
+    handles_from_curve(new_f0, new_v0, new_f1, new_v1, bez)
+}
+
 /// Uniform Catmull-Rom spline interpolation between `p1` and `p2` at `t in [0, 1]` (Spec 02 §3.3).
 pub fn catmull_rom(p0: f64, p1: f64, p2: f64, p3: f64, t: f64) -> f64 {
     let t2 = t * t;
@@ -1647,6 +1682,46 @@ mod tests {
                     w[0] * 10.0 + w[1] * (10.0 + s * 12.0) + w[2] * (90.0 + s * -8.0) + w[3] * 90.0;
                 assert!(approx_eq(direct, via_weights, 1e-12));
             }
+        }
+    }
+
+    #[test]
+    fn rescale_segment_handles_preserves_normalized_curve_shape() {
+        let old_seg = BezierSegment {
+            start_frame: 0.0,
+            start_value: 0.0,
+            out_tangent: [12.0, 20.0],
+            end_frame: 30.0,
+            end_value: 100.0,
+            in_tangent: [-9.0, -15.0],
+        };
+        let (new_out, new_in) = rescale_segment_handles(
+            old_seg.start_frame,
+            old_seg.start_value,
+            old_seg.end_frame,
+            old_seg.end_value,
+            10.0,
+            50.0,
+            70.0,
+            250.0,
+            old_seg.out_tangent,
+            old_seg.in_tangent,
+        );
+        let new_seg = BezierSegment {
+            start_frame: 10.0,
+            start_value: 50.0,
+            out_tangent: new_out,
+            end_frame: 70.0,
+            end_value: 250.0,
+            in_tangent: new_in,
+        };
+        for &u in &[0.1, 0.25, 0.5, 0.75, 0.9] {
+            let v_old = (eval_segment_bezier(old_seg, 30.0 * u) - 0.0) / 100.0;
+            let v_new = (eval_segment_bezier(new_seg, 10.0 + 60.0 * u) - 50.0) / 200.0;
+            assert!(
+                approx_eq(v_old, v_new, 1e-6),
+                "normalized value at u={u} drifted: old={v_old} new={v_new}"
+            );
         }
     }
 }

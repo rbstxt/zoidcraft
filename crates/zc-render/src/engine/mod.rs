@@ -46,25 +46,25 @@ use zc_scene::{
     DeformAxis, DelayMode, DelayParams, EffectorField, EffectorFieldType, FieldFalloffCurve,
     FractureDistribution, GradientStop as ParticleGradientStop, MAX_REPEATS, MeshData,
     ParticleBlending, ParticleSystemParams, PlainParams, PositionDistribution, RepeaterMode,
-    RepeaterParams, SPRING_CYCLES, SPRING_DAMPING, Text3DExtendedOptions, Text3DParams,
-    TextAlignMode, TextScaleMode, TwistParams, UvMode, VelocityDistribution, Vertex3D,
-    VoronoiFractureParams, WarpAxis, WarpParams, apply_delay, apply_normalized_uv_layout,
-    apply_plain, apply_repeater_with_params, apply_twist_with_params,
-    apply_voronoi_fracture_with_params, apply_warp_with_params, build_box, build_capsule,
-    build_circle, build_cylinder, build_dodecahedron, build_donut, build_fallback_text_mesh,
+    RepeaterParams, SPRING_CYCLES, SPRING_DAMPING, ShearParams, Text3DExtendedOptions,
+    Text3DParams, TextAlignMode, TextScaleMode, TwistParams, UvMode, VelocityDistribution,
+    Vertex3D, VoronoiFractureParams, VoronoiFractureStage, WarpAxis, WarpParams, apply_delay,
+    apply_normalized_uv_layout, apply_plain, apply_repeater_with_params, apply_shear_with_params,
+    apply_twist_with_params, apply_voronoi_fracture_with_params, apply_voronoi_fragment_motion,
+    apply_warp_with_params, build_box, build_capsule, build_circle, build_cylinder,
+    build_dodecahedron, build_donut, build_fallback_text_mesh,
     build_fallback_text_mesh_with_options, build_icosahedron, build_octahedron, build_preset_model,
     build_rectangle, build_sphere, build_tetrahedron, build_text3d_mesh_with_fallback,
-    build_wire_in_bounds, compute_deformer_frame, compute_shared_deformer_bounds,
-    evaluate_camera_shake, evaluate_particles_cm3_lut, font_has_missing_glyphs,
-    generate_particle_sprite_by_name, parse_character_ranges, parse_gltf_or_glb, parse_obj,
-    repeater_echo_frames, repeater_instance_transform,
+    build_voronoi_fracture_stage, build_wire_in_bounds, compute_deformer_frame,
+    compute_shared_deformer_bounds, evaluate_camera_shake, evaluate_particles_cm3_lut,
+    font_has_missing_glyphs, generate_particle_sprite_by_name, parse_character_ranges,
+    parse_gltf_or_glb, parse_obj, repeater_echo_frames, repeater_instance_transform,
 };
 use zc_shader::{
     CompileOptions, CompiledCustomShader, CompiledNodeEffect, GradientColorSpace,
     GradientInterpolation, GradientSpec, GradientStop as ShaderGradientStop,
     OpacityStop as ShaderOpacityStop, UniformType, UniformValue, bake_gradient_rgba8,
-    bake_gradient_rgba8_with_opacity, bake_node_material_maps, compile_node_effect_to_glsl,
-    pack_uniforms,
+    bake_gradient_rgba8_with_opacity, compile_node_effect_to_glsl, pack_uniforms,
 };
 
 use crate::cache::{FrameCache, FrameCacheKey};
@@ -328,8 +328,26 @@ struct CachedGifFrame {
 struct CachedGifAnimation {
     content_hash: u64,
     total_duration_sec: f64,
+    loop_count: Option<u16>,
     frames: Vec<CachedGifFrame>,
     last_used: u64,
+}
+
+/// Parses the optional NETSCAPE2.0 / ANIMEXTS1.0 loop count from raw GIF bytes.
+/// Returns `Some(0)` for infinite looping, `Some(n)` for `n` repeats after first play,
+/// or `None` if no application loop extension is present.
+pub(crate) fn parse_gif_loop_count(bytes: &[u8]) -> Option<u16> {
+    const NETSCAPE: &[u8] = b"\x21\xFF\x0BNETSCAPE2.0";
+    const ANIMEXTS: &[u8] = b"\x21\xFF\x0BANIMEXTS1.0";
+    for sig in [NETSCAPE, ANIMEXTS] {
+        if let Some(pos) = bytes.windows(sig.len()).position(|w| w == sig) {
+            let sub = pos + sig.len();
+            if sub + 4 <= bytes.len() && bytes[sub] == 3 && bytes[sub + 1] == 1 {
+                return Some(u16::from_le_bytes([bytes[sub + 2], bytes[sub + 3]]));
+            }
+        }
+    }
+    None
 }
 
 struct CachedNodeMaterial {
@@ -382,6 +400,11 @@ struct CachedNodeEffect {
     last_used: u64,
 }
 
+pub(super) struct CachedVoronoiStage {
+    pub(super) stage: Arc<VoronoiFractureStage>,
+    pub(super) last_used: u64,
+}
+
 struct CachedCustomPipeline {
     compiled: CompiledCustomShader,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -411,6 +434,18 @@ struct EvalEnv<'a> {
 }
 
 impl<'a> EvalEnv<'a> {
+    fn with_frame(&self, frame: f64) -> Self {
+        let delta = frame - self.frame;
+        let abs_frame = self.abs_frame + delta;
+        let fps = self.fps.max(1.0);
+        Self {
+            frame,
+            abs_frame,
+            time: abs_frame / fps,
+            ..self.clone()
+        }
+    }
+
     fn with_object(&self, object_id: Uuid) -> Self {
         Self {
             active_object_id: Some(object_id),
@@ -505,6 +540,7 @@ pub struct ProjectRenderEngine {
     text_char_mesh_cache: HashMap<TextCharMeshCacheKey, CachedTextCharMeshes>,
     cube_lut_cache: HashMap<u64, CachedCubeLut>,
     node_effect_cache: HashMap<u64, CachedNodeEffect>,
+    voronoi_stage_cache: HashMap<u64, CachedVoronoiStage>,
     unit_quad_mesh: Option<Arc<GpuMesh>>,
     readback_staging: Option<(wgpu::Buffer, u64)>,
     registered_custom_3d_materials: HashSet<String>,
@@ -585,6 +621,7 @@ impl ProjectRenderEngine {
             text_char_mesh_cache: HashMap::new(),
             cube_lut_cache: HashMap::new(),
             node_effect_cache: HashMap::new(),
+            voronoi_stage_cache: HashMap::new(),
             unit_quad_mesh: None,
             readback_staging: None,
             registered_custom_3d_materials: HashSet::new(),
@@ -1167,4 +1204,21 @@ fn count_non_black_rgb_pixels(rgba: &[u8]) -> usize {
         .iter()
         .filter(|px| px[0] > 2 || px[1] > 2 || px[2] > 2)
         .count()
+}
+
+#[cfg(test)]
+mod gif_loop_tests {
+    use super::parse_gif_loop_count;
+
+    #[test]
+    fn parse_gif_netscape_loop_count() {
+        assert_eq!(parse_gif_loop_count(b"GIF89a\x01\x00\x01\x00"), None);
+        let mut infinite = b"GIF89a".to_vec();
+        infinite.extend_from_slice(b"\x21\xFF\x0BNETSCAPE2.0\x03\x01\x00\x00\x00");
+        assert_eq!(parse_gif_loop_count(&infinite), Some(0));
+
+        let mut finite = b"GIF89a".to_vec();
+        finite.extend_from_slice(b"\x21\xFF\x0BNETSCAPE2.0\x03\x01\x03\x00\x00");
+        assert_eq!(parse_gif_loop_count(&finite), Some(3));
+    }
 }

@@ -90,6 +90,7 @@ pub enum NodeParamKind {
     Choice(&'static [&'static str]),
     ColorRgb,
     ColorRamp,
+    RgbCurves,
     Text,
 }
 
@@ -179,6 +180,10 @@ pub struct NodeGraphEditorState {
     pub nodes: Vec<GraphNode>,
     pub links: Vec<GraphLink>,
     pub selected_node: Option<String>,
+    pub selected_nodes: BTreeSet<String>,
+    pub collapsed_nodes: BTreeSet<String>,
+    pub marquee_drag: Option<(Pos2, Pos2)>,
+    pub clipboard_nodes: Vec<GraphNode>,
     pub pan: Vec2,
     pub zoom: f32,
     pub palette_open: bool,
@@ -204,6 +209,10 @@ impl Default for NodeGraphEditorState {
             nodes: Vec::new(),
             links: Vec::new(),
             selected_node: None,
+            selected_nodes: BTreeSet::new(),
+            collapsed_nodes: BTreeSet::new(),
+            marquee_drag: None,
+            clipboard_nodes: Vec::new(),
             pan: Vec2::new(40.0, 40.0),
             zoom: 1.0,
             palette_open: false,
@@ -891,7 +900,8 @@ impl NodeGraphEditorState {
                         + usize::from(baked.roughness.is_some())
                         + usize::from(baked.metalness.is_some())
                         + usize::from(baked.normal.is_some())
-                        + usize::from(baked.opacity.is_some());
+                        + usize::from(baked.opacity.is_some())
+                        + usize::from(baked.fresnel.is_some());
                     let node_word = if self.nodes.len() == 1 {
                         "node"
                     } else {
@@ -1020,6 +1030,17 @@ pub fn make_default_node(
                             {"pos": 0.5, "color": [0.22, 0.62, 0.92]},
                             {"pos": 1.0, "color": [0.98, 0.96, 0.92]}
                         ]),
+                    );
+                }
+                NodeParamKind::RgbCurves => {
+                    params.insert(
+                        p.key.into(),
+                        json!({
+                            "c": [[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]],
+                            "r": [[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]],
+                            "g": [[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]],
+                            "b": [[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]]
+                        }),
                     );
                 }
                 NodeParamKind::Text => {
@@ -1206,14 +1227,104 @@ pub fn show_node_canvas_ui(
         }
     }
 
-    // Keyboard delete selected node
-    if canvas_resp.hovered()
-        && !ui.ctx().egui_wants_keyboard_input()
-        && ui.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace))
-        && let Some(sel) = state.selected_node.clone()
-        && state.remove_node(&sel)
-    {
-        changed = true;
+    // Keyboard shortcuts: Delete/Backspace, Ctrl/Cmd+C/V/D, F/Home frame all
+    if canvas_resp.hovered() && !ui.ctx().egui_wants_keyboard_input() {
+        let (k_del, k_copy, k_paste, k_dup, k_frame) = ui.input(|i| {
+            let cmd = i.modifiers.command || i.modifiers.ctrl;
+            let no_mod = !cmd && !i.modifiers.alt;
+            (
+                i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
+                cmd && i.key_pressed(Key::C),
+                cmd && i.key_pressed(Key::V),
+                cmd && i.key_pressed(Key::D),
+                no_mod && (i.key_pressed(Key::F) || i.key_pressed(Key::Home)),
+            )
+        });
+        if k_del {
+            let to_delete: Vec<String> = if !state.selected_nodes.is_empty() {
+                state.selected_nodes.iter().cloned().collect()
+            } else {
+                state.selected_node.iter().cloned().collect()
+            };
+            for nid in to_delete {
+                if state.remove_node(&nid) {
+                    state.selected_nodes.remove(&nid);
+                    changed = true;
+                }
+            }
+        } else if k_copy {
+            let ids: BTreeSet<String> = if !state.selected_nodes.is_empty() {
+                state.selected_nodes.clone()
+            } else {
+                state.selected_node.iter().cloned().collect()
+            };
+            state.clipboard_nodes = state
+                .nodes
+                .iter()
+                .filter(|n| ids.contains(&n.id) && n.kind != "output")
+                .cloned()
+                .collect();
+        } else if k_paste && !state.clipboard_nodes.is_empty() {
+            state.selected_nodes.clear();
+            let copies = state.clipboard_nodes.clone();
+            for src in copies {
+                let id = format!("n{}", state.next_node_seq);
+                state.next_node_seq += 1;
+                state.nodes.push(GraphNode {
+                    id: id.clone(),
+                    kind: src.kind,
+                    title: src.title,
+                    pos: [src.pos[0] + 36.0, src.pos[1] + 36.0],
+                    params: src.params,
+                });
+                state.selected_node = Some(id.clone());
+                state.selected_nodes.insert(id);
+                changed = true;
+            }
+            if changed {
+                state.dirty = true;
+                state.revalidate();
+            }
+        } else if k_dup {
+            let ids: Vec<String> = if !state.selected_nodes.is_empty() {
+                state.selected_nodes.iter().cloned().collect()
+            } else {
+                state.selected_node.iter().cloned().collect()
+            };
+            let mut new_sel = BTreeSet::new();
+            for nid in ids {
+                if let Some(new_id) = state.duplicate_node(&nid) {
+                    new_sel.insert(new_id);
+                    changed = true;
+                }
+            }
+            if !new_sel.is_empty() {
+                state.selected_nodes = new_sel;
+            }
+        } else if k_frame && !state.nodes.is_empty() {
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+            for n in &state.nodes {
+                let sz = node_size_graph_space(find_node_spec(state.target_kind, &n.kind));
+                min_x = min_x.min(n.pos[0]);
+                min_y = min_y.min(n.pos[1]);
+                max_x = max_x.max(n.pos[0] + sz.x);
+                max_y = max_y.max(n.pos[1] + sz.y);
+            }
+            let bw = (max_x - min_x).max(120.0) + 64.0;
+            let bh = (max_y - min_y).max(120.0) + 64.0;
+            state.zoom = (canvas_rect.width() / bw)
+                .min(canvas_rect.height() / bh)
+                .clamp(0.45, 1.35);
+            let cx = 0.5 * (min_x + max_x);
+            let cy = 0.5 * (min_y + max_y);
+            state.pan = Vec2::new(
+                canvas_rect.width() * 0.5 - cx * state.zoom,
+                canvas_rect.height() * 0.5 - cy * state.zoom,
+            );
+        }
     }
 
     // Compute screen positions of every node and every socket
@@ -1231,15 +1342,23 @@ pub fn show_node_canvas_ui(
 
     for (idx, node) in state.nodes.iter().enumerate() {
         let spec = find_node_spec(state.target_kind, &node.kind);
-        let base_sz = node_size_graph_space(spec);
+        let collapsed = state.collapsed_nodes.contains(&node.id);
+        let base_sz = if collapsed {
+            Vec2::new(NODE_BASE_WIDTH, NODE_HEADER_H + 4.0)
+        } else {
+            node_size_graph_space(spec)
+        };
         let tl = graph_to_screen(canvas_rect, state.pan, state.zoom, node.pos);
         let rect = Rect::from_min_size(tl, base_sz * state.zoom);
         node_rects.push((idx, rect));
 
         if let Some(spec) = spec {
             for (pi, port) in spec.inputs.iter().enumerate() {
-                let cy =
-                    rect.min.y + (NODE_HEADER_H + (pi as f32 + 0.5) * NODE_PORT_ROW_H) * state.zoom;
+                let cy = if collapsed {
+                    rect.center().y
+                } else {
+                    rect.min.y + (NODE_HEADER_H + (pi as f32 + 0.5) * NODE_PORT_ROW_H) * state.zoom
+                };
                 let center = Pos2::new(rect.min.x, cy);
                 input_sockets.push(PortScreenPos {
                     node_id: node.id.clone(),
@@ -1253,8 +1372,11 @@ pub fn show_node_canvas_ui(
                 );
             }
             for (pi, port) in spec.outputs.iter().enumerate() {
-                let cy =
-                    rect.min.y + (NODE_HEADER_H + (pi as f32 + 0.5) * NODE_PORT_ROW_H) * state.zoom;
+                let cy = if collapsed {
+                    rect.center().y
+                } else {
+                    rect.min.y + (NODE_HEADER_H + (pi as f32 + 0.5) * NODE_PORT_ROW_H) * state.zoom
+                };
                 let center = Pos2::new(rect.max.x, cy);
                 output_sockets.push(PortScreenPos {
                     node_id: node.id.clone(),
@@ -1274,14 +1396,28 @@ pub fn show_node_canvas_ui(
     let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
     let primary_down = ui.input(|i| i.pointer.primary_down());
     let primary_released = ui.input(|i| i.pointer.primary_released());
+    let shift_down = ui.input(|i| i.modifiers.shift);
     let secondary_clicked = canvas_resp.secondary_clicked();
     let primary_clicked = canvas_resp.clicked();
+    let primary_double_clicked = canvas_resp.double_clicked();
     let middle_down = ui.input(|i| i.pointer.middle_down());
     let pointer_delta = ui.input(|i| i.pointer.delta());
 
     let socket_hit_r = (8.0 * state.zoom).clamp(6.0, 12.0);
 
-    // Handle pointer start (socket wire drag, node drag, or canvas pan)
+    // Double-click node header toggles collapsed state
+    if primary_double_clicked
+        && let Some(pos) = pointer_pos.filter(|p| canvas_rect.contains(*p))
+        && let Some((node_idx, rect)) = node_rects.iter().rev().find(|(_, r)| r.contains(pos))
+        && pos.y <= rect.min.y + NODE_HEADER_H * state.zoom
+    {
+        let nid = state.nodes[*node_idx].id.clone();
+        if !state.collapsed_nodes.remove(&nid) {
+            state.collapsed_nodes.insert(nid);
+        }
+    }
+
+    // Handle pointer start (socket wire drag, node drag, marquee, or canvas pan)
     if primary_pressed && let Some(pos) = pointer_pos.filter(|p| canvas_rect.contains(*p)) {
         // 1. Check output sockets to start wiring
         if let Some(out_s) = output_sockets
@@ -1308,19 +1444,44 @@ pub fn show_node_canvas_ui(
             node_rects.iter().rev().find(|(_, rect)| rect.contains(pos))
         {
             let id = state.nodes[*node_idx].id.clone();
-            state.selected_node = Some(id.clone());
+            if shift_down {
+                if !state.selected_nodes.remove(&id) {
+                    state.selected_nodes.insert(id.clone());
+                }
+                state.selected_node = Some(id.clone());
+            } else if !state.selected_nodes.contains(&id) {
+                state.selected_nodes.clear();
+                state.selected_nodes.insert(id.clone());
+                state.selected_node = Some(id.clone());
+            } else {
+                state.selected_node = Some(id.clone());
+            }
             state.dragging_node = Some(id);
+        } else if shift_down {
+            state.marquee_drag = Some((pos, pos));
         }
     }
 
-    // Active dragging: node move or canvas pan
+    // Active dragging: marquee, multi-node move, or canvas pan
     if primary_down {
-        if let Some(drag_id) = state.dragging_node.clone() {
-            if let Some(node) = state.nodes.iter_mut().find(|n| n.id == drag_id) {
-                node.pos[0] += pointer_delta.x / state.zoom.max(0.2);
-                node.pos[1] += pointer_delta.y / state.zoom.max(0.2);
-                if pointer_delta.length_sq() > 0.0 {
-                    state.dirty = true;
+        if let Some((start, _)) = state.marquee_drag {
+            if let Some(pos) = pointer_pos {
+                state.marquee_drag = Some((start, pos));
+            }
+        } else if let Some(drag_id) = state.dragging_node.clone() {
+            let move_ids: BTreeSet<String> = if state.selected_nodes.contains(&drag_id) {
+                state.selected_nodes.clone()
+            } else {
+                BTreeSet::from([drag_id])
+            };
+            let inv_z = 1.0 / state.zoom.max(0.2);
+            for node in &mut state.nodes {
+                if move_ids.contains(&node.id) {
+                    node.pos[0] += pointer_delta.x * inv_z;
+                    node.pos[1] += pointer_delta.y * inv_z;
+                    if pointer_delta.length_sq() > 0.0 {
+                        state.dirty = true;
+                    }
                 }
             }
         } else if state.pending_wire.is_none() && canvas_resp.dragged() {
@@ -1333,8 +1494,19 @@ pub fn show_node_canvas_ui(
         ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
     }
 
-    // Complete wire drop or release node drag
+    // Complete marquee, wire drop, or release node drag
     if primary_released {
+        if let Some((a, b)) = state.marquee_drag.take() {
+            let sel_rect = Rect::from_two_pos(a, b);
+            state.selected_nodes.clear();
+            for (idx, rect) in &node_rects {
+                if sel_rect.intersects(*rect) {
+                    let nid = state.nodes[*idx].id.clone();
+                    state.selected_node = Some(nid.clone());
+                    state.selected_nodes.insert(nid);
+                }
+            }
+        }
         if let Some(pending) = state.pending_wire.take()
             && let Some(pos) = pointer_pos
             && let Some(in_s) = input_sockets
@@ -1451,7 +1623,9 @@ pub fn show_node_canvas_ui(
     for (idx, rect) in &node_rects {
         let node = &state.nodes[*idx];
         let spec = find_node_spec(state.target_kind, &node.kind);
-        let selected = state.selected_node.as_deref() == Some(node.id.as_str());
+        let collapsed = state.collapsed_nodes.contains(&node.id);
+        let selected = state.selected_node.as_deref() == Some(node.id.as_str())
+            || state.selected_nodes.contains(&node.id);
         let rounding = CornerRadius::same((5.0 * state.zoom).clamp(3.0, 8.0) as u8);
 
         // Card drop shadow + body
@@ -1501,9 +1675,9 @@ pub fn show_node_canvas_ui(
             StrokeKind::Outside,
         );
 
-        // Input & output port labels + sockets
+        // Input & output port labels + sockets (hidden labels when collapsed)
         let sock_r = (4.8 * state.zoom).clamp(3.5, 8.0);
-        if let Some(spec) = spec {
+        if !collapsed && let Some(spec) = spec {
             for (pi, port) in spec.inputs.iter().enumerate() {
                 let cy =
                     rect.min.y + (NODE_HEADER_H + (pi as f32 + 0.5) * NODE_PORT_ROW_H) * state.zoom;
@@ -1551,6 +1725,17 @@ pub fn show_node_canvas_ui(
                 );
             }
         }
+    }
+
+    if let Some((a, b)) = state.marquee_drag {
+        let mr = Rect::from_two_pos(a, b);
+        painter.rect(
+            mr,
+            CornerRadius::ZERO,
+            color32_with_alpha(theme.accent(), 42),
+            Stroke::new(1.0, theme.accent()),
+            StrokeKind::Inside,
+        );
     }
 
     // Canvas border
@@ -1791,9 +1976,22 @@ pub fn show_node_inspector_ui(
                             let mut idx = node
                                 .params
                                 .get(param.key)
-                                .and_then(Value::as_u64)
-                                .map(|v| (v as usize).min(options.len().saturating_sub(1)))
-                                .unwrap_or(param.default_f64.round().max(0.0) as usize);
+                                .and_then(|v| {
+                                    v.as_u64()
+                                        .map(|n| (n as usize).min(options.len().saturating_sub(1)))
+                                        .or_else(|| {
+                                            v.as_str().and_then(|s| {
+                                                let low = s.trim().to_ascii_lowercase();
+                                                options
+                                                    .iter()
+                                                    .position(|opt| opt.to_ascii_lowercase() == low)
+                                            })
+                                        })
+                                })
+                                .unwrap_or(
+                                    (param.default_f64.round().max(0.0) as usize)
+                                        .min(options.len().saturating_sub(1)),
+                                );
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new(param.label)
@@ -1901,6 +2099,211 @@ pub fn show_node_inspector_ui(
                                 changed = true;
                             }
                         }
+                        NodeParamKind::RgbCurves => {
+                            ui.label(
+                                egui::RichText::new(param.label)
+                                    .font(theme.font(FONT_SMALL))
+                                    .color(TEXT_STRONG),
+                            );
+                            const CHANNELS: [(&str, &str, Color32); 4] = [
+                                ("c", "Master", Color32::from_rgb(230, 230, 235)),
+                                ("r", "R", Color32::from_rgb(235, 92, 92)),
+                                ("g", "G", Color32::from_rgb(96, 212, 118)),
+                                ("b", "B", Color32::from_rgb(96, 158, 240)),
+                            ];
+                            let ch_state_id =
+                                Id::unique(("node_rgb_curves_ch", &sel_id, param.key));
+                            let drag_pt_id =
+                                Id::unique(("node_rgb_curves_drag", &sel_id, param.key));
+                            let mut active_ch = ui
+                                .ctx()
+                                .data(|d| d.get_temp::<usize>(ch_state_id))
+                                .unwrap_or(0)
+                                .min(3);
+                            ui.horizontal(|ui| {
+                                for (ci, &(_, label, col)) in CHANNELS.iter().enumerate() {
+                                    let selected = active_ch == ci;
+                                    let btn = egui::Button::new(
+                                        egui::RichText::new(label)
+                                            .font(theme.font(FONT_COMPACT))
+                                            .color(if selected { col } else { TEXT_MUTED }),
+                                    )
+                                    .fill(if selected { BG_TITLE } else { BG_BUTTON })
+                                    .stroke(Stroke::new(
+                                        1.0,
+                                        if selected { col } else { BORDER_CONTROL },
+                                    ));
+                                    if ui.add(btn).clicked() {
+                                        active_ch = ci;
+                                        ui.ctx().data_mut(|d| {
+                                            d.insert_temp(ch_state_id, active_ch);
+                                            d.remove_temp::<usize>(drag_pt_id);
+                                        });
+                                    }
+                                }
+                            });
+
+                            let (ch_key, _, ch_color) = CHANNELS[active_ch];
+                            let mut pts =
+                                parse_rgb_curve_channel(node.params.get(param.key), ch_key);
+                            let mut curve_changed = false;
+
+                            // Interactive mini curve preview & drag canvas
+                            let canvas_w = ui.available_width().clamp(140.0, 224.0);
+                            let (curve_rect, curve_resp) = ui.allocate_exact_size(
+                                Vec2::new(canvas_w, 92.0),
+                                Sense::click_and_drag(),
+                            );
+                            let painter = ui.painter().with_clip_rect(curve_rect);
+                            painter.rect_filled(curve_rect, CornerRadius::same(3), BG_SUNKEN);
+                            let grid_col = Color32::from_rgba_unmultiplied(255, 255, 255, 20);
+                            for step in [0.25_f32, 0.5, 0.75] {
+                                let gx = curve_rect.min.x + curve_rect.width() * step;
+                                let gy = curve_rect.min.y + curve_rect.height() * step;
+                                painter.line_segment(
+                                    [
+                                        Pos2::new(gx, curve_rect.min.y),
+                                        Pos2::new(gx, curve_rect.max.y),
+                                    ],
+                                    Stroke::new(1.0, grid_col),
+                                );
+                                painter.line_segment(
+                                    [
+                                        Pos2::new(curve_rect.min.x, gy),
+                                        Pos2::new(curve_rect.max.x, gy),
+                                    ],
+                                    Stroke::new(1.0, grid_col),
+                                );
+                            }
+                            // Identity diagonal reference
+                            painter.line_segment(
+                                [
+                                    Pos2::new(curve_rect.min.x, curve_rect.max.y),
+                                    Pos2::new(curve_rect.max.x, curve_rect.min.y),
+                                ],
+                                Stroke::new(
+                                    1.0,
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 34),
+                                ),
+                            );
+
+                            let to_screen = |pt: [f64; 2]| -> Pos2 {
+                                Pos2::new(
+                                    curve_rect.min.x + (pt[0] as f32) * curve_rect.width(),
+                                    curve_rect.max.y - (pt[1] as f32) * curve_rect.height(),
+                                )
+                            };
+
+                            if curve_resp.drag_started()
+                                && let Some(pointer) = curve_resp.interact_pointer_pos()
+                                && let Some((best_i, dist)) = pts
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, &pt)| (idx, to_screen(pt).distance(pointer)))
+                                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                                && dist <= 14.0
+                            {
+                                ui.ctx().data_mut(|d| d.insert_temp(drag_pt_id, best_i));
+                            }
+                            if curve_resp.dragged()
+                                && let Some(pointer) = curve_resp.interact_pointer_pos()
+                                && let Some(di) = ui.ctx().data(|d| d.get_temp::<usize>(drag_pt_id))
+                                && di < pts.len()
+                            {
+                                let nx = f64::from(
+                                    ((pointer.x - curve_rect.min.x) / curve_rect.width().max(1.0))
+                                        .clamp(0.0, 1.0),
+                                );
+                                let ny = f64::from(
+                                    ((curve_rect.max.y - pointer.y) / curve_rect.height().max(1.0))
+                                        .clamp(0.0, 1.0),
+                                );
+                                pts[di] = [nx, ny];
+                                curve_changed = true;
+                            }
+                            if curve_resp.drag_stopped() {
+                                ui.ctx().data_mut(|d| d.remove_temp::<usize>(drag_pt_id));
+                            }
+
+                            let poly: Vec<Pos2> = pts.iter().map(|&pt| to_screen(pt)).collect();
+                            if poly.len() >= 2 {
+                                painter.add(Shape::line(poly.clone(), Stroke::new(1.75, ch_color)));
+                            }
+                            for pos in poly {
+                                painter.circle_filled(pos, 3.8, ch_color);
+                                painter.circle_stroke(pos, 3.8, Stroke::new(1.0, BG_PANEL));
+                            }
+                            painter.rect_stroke(
+                                curve_rect,
+                                CornerRadius::same(3),
+                                Stroke::new(1.0, BORDER_CONTROL),
+                                StrokeKind::Inside,
+                            );
+
+                            // Control-point numeric rows (Shadows / Midtone / Highlights)
+                            let mut remove_idx = None;
+                            let pts_len = pts.len();
+                            for (pi, pt) in pts.iter_mut().enumerate() {
+                                let pt_label = match (pts_len, pi) {
+                                    (_, 0) => "Shd",
+                                    (n, i) if i + 1 == n => "Hlt",
+                                    (3, 1) => "Mid",
+                                    _ => "Pt",
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(pt_label)
+                                            .font(theme.font(FONT_COMPACT))
+                                            .color(TEXT_MUTED),
+                                    );
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut pt[0])
+                                                .prefix("X:")
+                                                .range(0.0..=1.0)
+                                                .speed(0.01)
+                                                .max_decimals(2),
+                                        )
+                                        .changed()
+                                    {
+                                        curve_changed = true;
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut pt[1])
+                                                .prefix("Y:")
+                                                .range(0.0..=1.0)
+                                                .speed(0.01)
+                                                .max_decimals(2),
+                                        )
+                                        .changed()
+                                    {
+                                        curve_changed = true;
+                                    }
+                                    if pts_len > 2 && ui.small_button("×").clicked() {
+                                        remove_idx = Some(pi);
+                                    }
+                                });
+                            }
+                            if let Some(ri) = remove_idx {
+                                pts.remove(ri);
+                                curve_changed = true;
+                            }
+                            ui.horizontal(|ui| {
+                                if pts.len() < 16 && ui.small_button("+ Add Point").clicked() {
+                                    pts.push([0.5, 0.5]);
+                                    curve_changed = true;
+                                }
+                                if ui.small_button("Reset").clicked() {
+                                    pts = vec![[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]];
+                                    curve_changed = true;
+                                }
+                            });
+                            if curve_changed {
+                                set_rgb_curve_channel(&mut node.params, param.key, ch_key, pts);
+                                changed = true;
+                            }
+                        }
                         NodeParamKind::Text => {
                             let mut txt = node
                                 .params
@@ -1998,6 +2401,78 @@ pub fn parse_ramp_stops(val: Option<&Value>) -> Vec<(f64, [f32; 3])> {
     out
 }
 
+pub fn parse_rgb_curve_channel(val: Option<&Value>, channel: &str) -> Vec<[f64; 2]> {
+    let mut out = Vec::new();
+    let ch_val = val.and_then(|v| {
+        if channel == "c" {
+            v.get("c")
+                .or_else(|| v.get("master"))
+                .or_else(|| v.get("rgb"))
+        } else {
+            v.get(channel)
+        }
+    });
+    if let Some(arr) = ch_val.and_then(Value::as_array) {
+        for item in arr {
+            if let Some(pair) = item.as_array()
+                && pair.len() >= 2
+            {
+                let x = pair[0].as_f64().unwrap_or(0.0).clamp(0.0, 1.0);
+                let y = pair[1].as_f64().unwrap_or(0.0).clamp(0.0, 1.0);
+                out.push([x, y]);
+            } else if let Some(obj) = item.as_object() {
+                let x = obj
+                    .get("x")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                let y = obj
+                    .get("y")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                out.push([x, y]);
+            }
+        }
+    }
+    if out.len() < 2 {
+        out = vec![[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]];
+    }
+    out.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    out
+}
+
+pub fn set_rgb_curve_channel(
+    params: &mut Map<String, Value>,
+    key: &str,
+    channel: &str,
+    mut pts: Vec<[f64; 2]>,
+) {
+    for pt in &mut pts {
+        pt[0] = pt[0].clamp(0.0, 1.0);
+        pt[1] = pt[1].clamp(0.0, 1.0);
+    }
+    pts.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    if pts.len() < 2 {
+        pts = vec![[0.0, 0.0], [1.0, 1.0]];
+    }
+    let serialized: Vec<Value> = pts.into_iter().map(|[x, y]| json!([x, y])).collect();
+    let curves_obj = params.entry(key.to_string()).or_insert_with(|| {
+        json!({
+            "c": [[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]],
+            "r": [[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]],
+            "g": [[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]],
+            "b": [[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]]
+        })
+    });
+    if !curves_obj.is_object() {
+        *curves_obj = json!({});
+    }
+    if let Some(map) = curves_obj.as_object_mut() {
+        map.insert(channel.to_string(), Value::Array(serialized));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Node Graph Type Catalogs (Covering All zc_shader::node_graph Node Types)
 // ---------------------------------------------------------------------------
@@ -2011,22 +2486,54 @@ pub const MIX_MODES: &[&str] = &[
     "Overlay",
     "Darken",
     "Lighten",
+    "Difference",
+    "Soft Light",
     "Color Dodge",
     "Color Burn",
-    "Soft Light",
-    "Hard Light",
-    "Difference",
-    "Exclusion",
+    "Linear Light",
     "Divide",
+    "Exclusion",
     "Hue",
     "Saturation",
     "Color",
     "Luminosity",
+    "Hard Light",
 ];
 
 pub const MATH_MODES: &[&str] = &[
-    "Add", "Subtract", "Multiply", "Divide", "Power", "Min", "Max", "Modulo", "Abs", "Floor",
-    "Ceil", "Fract", "Sqrt", "Sin", "Cos", "Tan", "Step", "Negate", "Round", "Sign", "Log", "Exp",
+    "Add",
+    "Subtract",
+    "Multiply",
+    "Divide",
+    "Min",
+    "Max",
+    "Power",
+    "Modulo",
+    "Abs",
+    "Invert",
+    "Clamp",
+    "Compare",
+    "Sin",
+    "Round",
+    "Sqrt",
+    "Log",
+    "Exp",
+    "Floor",
+    "Ceil",
+    "Fract",
+    "Sign",
+    "Smooth Min",
+    "Smooth Max",
+    "Snap",
+    "Wrap",
+    "Ping-Pong",
+    "Cos",
+    "Tan",
+    "Atan2",
+    "Greater Than",
+    "Less Than",
+    "Step",
+    "Negate",
 ];
 
 pub const VEC_MATH_MODES: &[&str] = &[
@@ -2034,21 +2541,22 @@ pub const VEC_MATH_MODES: &[&str] = &[
     "Subtract",
     "Multiply",
     "Divide",
-    "Scale",
+    "Normalize",
+    "Dot",
     "Length",
     "Distance",
-    "Dot",
-    "Normalize",
+    "Cross",
+    "Scale",
 ];
 
 pub const GRADIENT_MODES: &[&str] = &["Linear", "Radial", "Angular"];
-pub const VORONOI_MODES: &[&str] = &["F1 Distance", "F2 - F1 Edge", "Cell ID"];
+pub const VORONOI_MODES: &[&str] = &["F1 Distance", "F2 Distance", "Edge", "Cell ID"];
 pub const BLUR_MODES: &[&str] = &["Box", "Gaussian", "Directional", "Radial"];
 pub const MIRROR_MODES: &[&str] = &["Horizontal", "Vertical", "Quad"];
 pub const TRIG_MODES: &[&str] = &["Sin", "Cos", "Tan", "Asin", "Acos", "Atan"];
 pub const PARAM_KINDS: &[&str] = &["Float", "Color", "Point"];
-pub const RAMP_INTERP: &[&str] = &["Linear", "Smooth", "Constant"];
-pub const NORMAL_MODES: &[&str] = &["Bump Height", "Tangent Normal"];
+pub const RAMP_INTERP: &[&str] = &["Constant", "Linear", "Smooth", "Cubic"];
+pub const NORMAL_MODES: &[&str] = &["Tangent Normal", "Bump Height"];
 
 #[must_use]
 pub fn node_catalog_for(target_kind: NodeGraphTargetKind) -> &'static [NodeTypeSpec] {
@@ -2067,4 +2575,90 @@ pub fn find_node_spec(
     node_catalog_for(target_kind)
         .iter()
         .find(|s| s.kind.eq_ignore_ascii_case(&lower))
+}
+
+#[cfg(test)]
+mod node_graph_enum_and_curves_tests {
+    use super::*;
+
+    #[test]
+    fn ui_enum_tables_align_with_zc_shader_indices() {
+        assert_eq!(MIX_MODES.len(), 20);
+        assert_eq!(MIX_MODES[8], "Difference");
+        assert_eq!(MIX_MODES[10], "Color Dodge");
+        assert_eq!(MIX_MODES[19], "Hard Light");
+
+        assert_eq!(MATH_MODES.len(), 33);
+        assert_eq!(MATH_MODES[4], "Min");
+        assert_eq!(MATH_MODES[6], "Power");
+        assert_eq!(MATH_MODES[12], "Sin");
+        assert_eq!(MATH_MODES[13], "Round");
+        assert_eq!(MATH_MODES[31], "Step");
+        assert_eq!(MATH_MODES[32], "Negate");
+
+        assert_eq!(VEC_MATH_MODES.len(), 10);
+        assert_eq!(VEC_MATH_MODES[4], "Normalize");
+        assert_eq!(VEC_MATH_MODES[8], "Cross");
+        assert_eq!(VEC_MATH_MODES[9], "Scale");
+
+        assert_eq!(
+            VORONOI_MODES,
+            &["F1 Distance", "F2 Distance", "Edge", "Cell ID"]
+        );
+        assert_eq!(RAMP_INTERP, &["Constant", "Linear", "Smooth", "Cubic"]);
+        assert_eq!(NORMAL_MODES, &["Tangent Normal", "Bump Height"]);
+    }
+
+    #[test]
+    fn rgb_curves_node_initializes_and_edits_control_points_for_baking() {
+        let mut node = make_default_node(
+            NodeGraphTargetKind::NodeMaterial,
+            "n_curves",
+            "rgbCurves",
+            [120.0, 120.0],
+        );
+        let default_c = parse_rgb_curve_channel(node.params.get("curves"), "c");
+        assert_eq!(default_c, vec![[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]]);
+
+        // Lift midtone on Master curve and invert Red channel
+        set_rgb_curve_channel(
+            &mut node.params,
+            "curves",
+            "c",
+            vec![[0.0, 0.0], [0.5, 0.85], [1.0, 1.0]],
+        );
+        set_rgb_curve_channel(
+            &mut node.params,
+            "curves",
+            "r",
+            vec![[0.0, 1.0], [1.0, 0.0]],
+        );
+
+        let edited_c = parse_rgb_curve_channel(node.params.get("curves"), "c");
+        assert_eq!(edited_c, vec![[0.0, 0.0], [0.5, 0.85], [1.0, 1.0]]);
+
+        let graph = json!({
+            "nodes": [
+                { "id": "col", "type": "color", "params": { "color": [0.5, 0.5, 0.5] } },
+                { "id": "cv", "type": "rgbCurves", "params": Value::Object(node.params.clone()) },
+                { "id": "out", "type": "output" }
+            ],
+            "links": [
+                { "from": "col", "fromPort": "color", "to": "cv", "toPort": "color" },
+                { "from": "cv", "fromPort": "out", "to": "out", "toPort": "color" }
+            ]
+        });
+        let baked = bake_node_material_maps(&graph, 32).expect("rgbCurves graph must bake");
+        // Master curve lifts 0.5 -> ~0.85; Green stays ~0.85 while Red inverts ~0.85 -> ~0.15.
+        assert!(
+            baked.base_color_factor[1] > 0.75,
+            "lifted green midtone: {:?}",
+            baked.base_color_factor
+        );
+        assert!(
+            baked.base_color_factor[0] < 0.25,
+            "inverted red channel: {:?}",
+            baked.base_color_factor
+        );
+    }
 }

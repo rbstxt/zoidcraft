@@ -1959,6 +1959,7 @@ pub(crate) fn audio_waveform_batches_all_columns_into_single_mesh() {
         time_end: 2.0,
         time_animated: false,
         has_time_keyframes: false,
+        is_precomp: false,
     };
     let peaks = AudioWaveformPeaks {
         points_per_sec: 100.0,
@@ -1995,4 +1996,125 @@ pub(crate) fn audio_waveform_batches_all_columns_into_single_mesh() {
         "all 100 waveform columns must batch into a single egui::Mesh"
     );
     assert_eq!(total_verts, 100 * 4);
+}
+
+#[test]
+pub(crate) fn marker_hit_test_leaves_top_scrub_band_free_and_hits_lower_pin_and_label() {
+    let mut session = Session::new();
+    session
+        .execute(Command::AddMarker {
+            frame: 45.0,
+            name: "BeatDrop".to_string(),
+            color: Some("#ed6a68".to_string()),
+        })
+        .expect("add marker");
+
+    let fps = 30.0;
+    let zoom = 0.3;
+    let ruler_rect = Rect::from_min_size(pos2(200.0, 0.0), vec2(800.0, RULER_HEIGHT));
+    let m0_x = (ruler_rect.left() + frame_to_px(45.0, fps, zoom) as f32).round();
+    let markers = &session.active_sequence().markers;
+
+    // Top ~57% scrubbing band (including directly above the marker diamond and label)
+    // must NEVER hit a marker so playhead scrubbing is unobstructed.
+    for y_offset in [2.0_f32, 8.0, 12.0, 16.0, 19.0] {
+        assert_eq!(
+            hit_test_marker(markers, ruler_rect, 0.0, fps, zoom, pos2(m0_x, y_offset)),
+            None,
+            "top scrubbing band y={y_offset} above marker pin must never hit marker"
+        );
+        assert_eq!(
+            hit_test_marker(
+                markers,
+                ruler_rect,
+                0.0,
+                fps,
+                zoom,
+                pos2(m0_x + 14.0, y_offset)
+            ),
+            None,
+            "top scrubbing band y={y_offset} above marker label must never hit marker"
+        );
+    }
+
+    // Lower marker band hits the diamond pin and the visible label badge.
+    let cy = marker_pin_center_y(ruler_rect);
+    assert_eq!(
+        hit_test_marker(markers, ruler_rect, 0.0, fps, zoom, pos2(m0_x, cy)),
+        Some(0)
+    );
+    assert_eq!(
+        hit_test_marker(markers, ruler_rect, 0.0, fps, zoom, pos2(m0_x + 14.0, cy)),
+        Some(0)
+    );
+    // Far right of the label misses cleanly.
+    assert_eq!(
+        hit_test_marker(markers, ruler_rect, 0.0, fps, zoom, pos2(m0_x + 80.0, cy)),
+        None
+    );
+}
+
+#[test]
+pub(crate) fn timeline_shift_click_range_and_ctrl_toggle_multi_selection() {
+    let mut session = Session::new();
+    let mut state = TimelineViewState::new();
+    let track_id = session.document().video_tracks[0].id.clone();
+    let c0 = session.document().video_tracks[0].clips[0].id.clone();
+
+    let add = |session: &mut Session, name: &str, start: f64| -> String {
+        session
+            .execute(Command::AddClip {
+                track_id: track_id.clone(),
+                kind: "image".to_owned(),
+                name: Some(name.to_owned()),
+                start,
+                length: 30.0,
+            })
+            .expect("add clip")["clip_id"]
+            .as_str()
+            .expect("clip_id")
+            .to_owned()
+    };
+    let c1 = add(&mut session, "C1", 310.0);
+    let c2 = add(&mut session, "C2", 350.0);
+    let c3 = add(&mut session, "C3", 390.0);
+
+    // Simulate initial single-type clip selection (e.g. from Media tab / default scene)
+    // followed by Shift-click range selection across mixed clip kinds.
+    let _ = session
+        .selection
+        .select_clip(c0.clone(), Some("scene"), false);
+    apply_timeline_clip_click(&mut session, &mut state, &c2, true, false);
+    assert_eq!(
+        session.selection.clip_ids,
+        vec![c0.clone(), c1.clone(), c2.clone()]
+    );
+
+    // Shift-clicking a further clip extends from the original anchor (`c0`).
+    apply_timeline_clip_click(&mut session, &mut state, &c3, true, false);
+    assert_eq!(
+        session.selection.clip_ids,
+        vec![c0.clone(), c1.clone(), c2.clone(), c3.clone()]
+    );
+
+    // Shift-clicking a closer clip shrinks back to `c0..=c1`.
+    apply_timeline_clip_click(&mut session, &mut state, &c1, true, false);
+    assert_eq!(session.selection.clip_ids, vec![c0.clone(), c1.clone()]);
+
+    // Ctrl/Cmd-clicking toggles individual clips without clearing existing selection.
+    apply_timeline_clip_click(&mut session, &mut state, &c3, false, true);
+    assert_eq!(
+        session.selection.clip_ids,
+        vec![c0.clone(), c1.clone(), c3.clone()]
+    );
+    apply_timeline_clip_click(&mut session, &mut state, &c1, false, true);
+    assert_eq!(session.selection.clip_ids, vec![c0.clone(), c3.clone()]);
+
+    // Reverse Shift-click range from `c3` back to `c1`.
+    apply_timeline_clip_click(&mut session, &mut state, &c3, false, false);
+    apply_timeline_clip_click(&mut session, &mut state, &c1, true, false);
+    assert_eq!(
+        session.selection.clip_ids,
+        vec![c1.clone(), c2.clone(), c3.clone()]
+    );
 }

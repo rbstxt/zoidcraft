@@ -24,13 +24,15 @@ pub use effector::{
     DeformAxis, DeformerFrame, DelayMode, DelayParams, EffectorField, EffectorFieldType,
     FieldFalloffCurve, FractureDistribution, MAX_REPEATS, PlainParams, PreparedEffectorField,
     RepeaterMode, RepeaterParams, RepeaterTransform, SPRING_CYCLES, SPRING_DAMPING,
-    SPRING_MIN_TOTAL, TwistParams, VoronoiFractureParams, WarpAxis, WarpParams, apply_delay,
-    apply_plain, apply_repeater, apply_repeater_with_params, apply_twist, apply_twist_with_params,
-    apply_voronoi_fracture, apply_voronoi_fracture_with_params, apply_warp, apply_warp_with_params,
-    compute_deformer_frame, compute_shared_deformer_bounds, connected_pieces, delay_weight,
-    effector_hash_unit_vector, effector_hash01, evaluate_field, generate_voronoi_sites,
-    parse_character_ranges, prepare_field_for_bounds, prepare_field_from_positions,
-    repeater_echo_frames, repeater_instance_transform, rotate_xyz_deg, voronoi_piece_color,
+    SPRING_MIN_TOTAL, ShearParams, TwistParams, VoronoiFractureParams, VoronoiFractureStage,
+    WarpAxis, WarpParams, apply_delay, apply_plain, apply_repeater, apply_repeater_with_params,
+    apply_shear_with_params, apply_twist, apply_twist_with_params, apply_voronoi_fracture,
+    apply_voronoi_fracture_with_params, apply_voronoi_fragment_motion, apply_warp,
+    apply_warp_with_params, build_voronoi_fracture_stage, compute_deformer_frame,
+    compute_shared_deformer_bounds, connected_pieces, delay_weight, effector_hash_unit_vector,
+    effector_hash01, evaluate_field, generate_voronoi_sites, parse_character_ranges,
+    prepare_field_for_bounds, prepare_field_from_positions, repeater_echo_frames,
+    repeater_instance_transform, rotate_xyz_deg, voronoi_piece_color,
 };
 pub use gltf_loader::{GltfLoadError, parse_glb, parse_gltf, parse_gltf_or_glb};
 pub use mesh::{
@@ -55,12 +57,15 @@ pub use primitives::{
     build_rounded_box_ext, build_spline, build_tube,
 };
 pub use text3d::{
-    BevelProfile, BevelSide, Text3DCharacterMesh, Text3DError, Text3DExtendedOptions, Text3DParams,
-    TextAlignMode, TextScaleMode, UvMode, build_fallback_text_mesh,
-    build_fallback_text_mesh_with_options, build_text3d_character_meshes,
+    BevelProfile, BevelSide, GlyphBezierOutline2D, GlyphOutline2D, Text3DCharacterMesh,
+    Text3DError, Text3DExtendedOptions, Text3DParams, TextAlignMode, TextScaleMode, UvMode,
+    build_fallback_text_mesh, build_fallback_text_mesh_with_options, build_text3d_character_meshes,
     build_text3d_character_meshes_with_fallback, build_text3d_mesh,
-    build_text3d_mesh_with_fallback, build_text3d_mesh_with_options, extrude_contours,
-    extrude_contours_with_options, font_has_missing_glyphs,
+    build_text3d_mesh_with_fallback, build_text3d_mesh_with_options,
+    extract_glyph_bezier_outline_2d, extract_glyph_bezier_outline_2d_with_fallback,
+    extract_glyph_outline_2d, extract_glyph_outline_2d_with_fallback, extrude_contours,
+    extrude_contours_with_options, font_has_missing_glyphs, font_kerning_2d,
+    font_kerning_2d_with_fallback,
 };
 
 #[cfg(test)]
@@ -2356,5 +2361,148 @@ f 2 5 6 3
         for (pid, inst) in batch_unsorted.iter().enumerate() {
             assert_eq!(*inst, evaluate_particle(pid as u32, 1.37, &params_unsorted));
         }
+    }
+
+    #[test]
+    fn shear_deformer_matches_zoidium_formula_and_field_weight() {
+        let box_mesh = build_box(2.0, 4.0, 2.0);
+
+        // Zero amount is an identity clone.
+        let identity = apply_shear_with_params(&box_mesh, &ShearParams::default(), None, None);
+        assert_eq!(identity.vertices.len(), box_mesh.vertices.len());
+        for (a, b) in identity.vertices.iter().zip(&box_mesh.vertices) {
+            assert_eq!(a.position, b.position);
+        }
+
+        // Standard shear: along Y, displacing X by amount = 0.5 around pivot [0, -1, 0].
+        let params = ShearParams {
+            amount: 0.5,
+            axis: DeformAxis::Y,
+            direction: DeformAxis::X,
+            pivot: Vec3::new(0.0, -1.0, 0.0),
+            subdivision: 2,
+            field: None,
+        };
+        let sheared = apply_shear_with_params(&box_mesh, &params, None, None);
+        assert!(sheared.vertices.len() > box_mesh.vertices.len());
+        // Top vertices (y = +2) shift X by (2 - (-1)) * 0.5 = +1.5 -> max X becomes 1.0 + 1.5 = 2.5.
+        assert!((sheared.bounds.max.x - 2.5).abs() < 1e-3);
+        // Bottom vertices (y = -2) shift X by (-2 - (-1)) * 0.5 = -0.5 -> min X becomes -1.0 - 0.5 = -1.5.
+        assert!((sheared.bounds.min.x - (-1.5)).abs() < 1e-3);
+        for v in &sheared.vertices {
+            let n_len = Vec3::from_array(v.normal).length();
+            assert!((n_len - 1.0).abs() < 1e-2, "normal should stay unit length");
+        }
+
+        // Inverted infinite field (zero weight everywhere) keeps bounds unchanged.
+        let zero_field = ShearParams {
+            field: Some(EffectorField {
+                field_type: EffectorFieldType::Infinite,
+                invert: true,
+                ..EffectorField::default()
+            }),
+            ..params
+        };
+        let unaffected = apply_shear_with_params(&box_mesh, &zero_field, None, None);
+        assert!((unaffected.bounds.max.x - box_mesh.bounds.max.x).abs() < 1e-3);
+        assert!((unaffected.bounds.min.x - box_mesh.bounds.min.x).abs() < 1e-3);
+    }
+
+    #[test]
+    fn voronoi_fracture_supports_distributions_caps_colors_and_motion() {
+        let box_mesh = build_box(2.0, 2.0, 2.0);
+        for dist in [
+            FractureDistribution::Uniform,
+            FractureDistribution::Surface,
+            FractureDistribution::Center,
+            FractureDistribution::Edges,
+        ] {
+            let params = VoronoiFractureParams {
+                cells: 12,
+                seed: 7,
+                closed: true,
+                distribution: dist,
+                cell_scale: Vec3::new(120.0, 80.0, 100.0),
+                distance: 1.5,
+                scatter: 0.4,
+                offset: 5.0,
+                spin_rad: 0.5,
+                direction: Vec3::new(0.5, 0.0, -0.25),
+                rotation_deg: Vec3::new(15.0, 30.0, 0.0),
+                fragment_scale: 95.0,
+                gravity: 1.2,
+                randomness: 35.0,
+                random_colors: true,
+                field: None,
+            };
+            let fractured = apply_voronoi_fracture_with_params(&box_mesh, &params, None, None);
+            assert!(
+                !fractured.vertices.is_empty() && !fractured.indices.is_empty(),
+                "distribution {dist:?} must produce geometry"
+            );
+            assert_eq!(
+                fractured.colors.len(),
+                fractured.vertices.len(),
+                "random_colors=true must populate per-vertex colors"
+            );
+            assert!(
+                fractured.vertices.iter().any(|v| v.material_slot == 1),
+                "closed=true must generate interior cap faces with material_slot == 1"
+            );
+            assert!(
+                fractured.bounds.min.y < box_mesh.bounds.min.y - 0.5,
+                "gravity + radial distance should push fragments downward"
+            );
+        }
+    }
+
+    #[test]
+    fn glyph_outline_2d_extraction_and_fallback() {
+        let ttf = make_minimal_test_ttf();
+
+        // Primary font contains 'A' with advance 600 / 1000 * 100 = 60.0 and an arched quadratic curve.
+        let outline = extract_glyph_outline_2d(&ttf, 'A', 100.0).expect("glyph 'A' must extract");
+        assert_eq!(outline.contours.len(), 1);
+        assert!(
+            outline.contours[0].len() > 5,
+            "adaptive curve subdivision should refine quadratic curve, got {} pts",
+            outline.contours[0].len()
+        );
+        assert!((outline.advance - 60.0).abs() < 1e-6);
+
+        let min_x = outline.contours[0]
+            .iter()
+            .map(|p| p[0])
+            .fold(f64::INFINITY, f64::min);
+        let max_y = outline.contours[0]
+            .iter()
+            .map(|p| p[1])
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((min_x - 5.0).abs() < 1e-6);
+        assert!(max_y > 55.0 && max_y <= 80.0);
+
+        // Missing glyph returns None so fallback resolution triggers cleanly.
+        assert!(extract_glyph_outline_2d(&ttf, 'Z', 100.0).is_none());
+        assert!(extract_glyph_outline_2d(&ttf, 'A', 0.0).is_none());
+
+        // Fallback resolution: primary misses or invalid -> falls back to second font.
+        let via_fb =
+            extract_glyph_outline_2d_with_fallback(Some(b"not a font"), Some(&ttf), 'A', 50.0)
+                .expect("fallback font must resolve 'A'");
+        assert_eq!(via_fb.contours.len(), 1);
+        assert!((via_fb.advance - 30.0).abs() < 1e-6);
+
+        // Exact cubic Bezier extraction preserves the elevated quadratic handles.
+        let bez = extract_glyph_bezier_outline_2d_with_fallback(Some(&ttf), None, 'A', 100.0)
+            .expect("bezier outline must extract");
+        assert_eq!(bez.contours.len(), 1);
+        assert!(bez.contours[0].len() >= 3);
+        let has_handles = bez.contours[0].iter().any(|v| {
+            v[2].abs() > 1e-3 || v[3].abs() > 1e-3 || v[4].abs() > 1e-3 || v[5].abs() > 1e-3
+        });
+        assert!(
+            has_handles,
+            "quadratic curve must elevate to non-zero cubic handles"
+        );
     }
 }

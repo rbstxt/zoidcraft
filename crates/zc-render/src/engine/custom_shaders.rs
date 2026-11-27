@@ -235,13 +235,20 @@ impl ProjectRenderEngine {
             );
         }
 
-        // Snapshot uniform field types for ctl_* color-to-vec4 promotion without borrowing self.
+        // Snapshot uniform field types and declared `sampler2D` texture names without borrowing self.
         let uniform_field_types: HashMap<String, UniformType> = self.custom_pipelines[&shader_hash]
             .compiled
             .uniform_layout
             .fields
             .iter()
             .map(|f| (f.name.clone(), f.ty))
+            .collect();
+        let declared_samplers: HashSet<String> = self.custom_pipelines[&shader_hash]
+            .compiled
+            .texture_bindings
+            .iter()
+            .filter(|tb| !tb.is_diffuse)
+            .map(|tb| tb.name.clone())
             .collect();
 
         // Populate CM3 + Expressions+ built-in uniforms before custom properties (P8 P0-1, P0-4).
@@ -297,12 +304,8 @@ impl ProjectRenderEngine {
                 .and_then(|t| t.get("zoidiumShader"))
                 .and_then(|s| s.get("kind"))
                 .and_then(serde_json::Value::as_str);
-            let is_layer_source = cp
-                .metadata
-                .get("type")
-                .and_then(|t| t.get("_zoidiumShaderLayerSource"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let is_layer_source = is_custom_shader_layer_input_prop(cp, None, &norm_name);
+            let is_declared_sampler = declared_samplers.contains(&norm_name);
 
             let val = eval_property_track(&cp.track, env);
 
@@ -313,7 +316,7 @@ impl ProjectRenderEngine {
                     .metadata
                     .get("type")
                     .and_then(|t| t.get("zoidiumShader"))
-                    .and_then(|s| s.get("unit"))
+                    .and_then(|s| s.get("units").or_else(|| s.get("unit")))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("frames");
                 let frame_off = if unit.eq_ignore_ascii_case("seconds") {
@@ -364,8 +367,9 @@ impl ProjectRenderEngine {
                 continue;
             }
 
-            // Handle Shader+ `path` property baking (`<Name>` 256x1 RGBA16F `(px, py, tx, ty)`,
-            // `<Name>_length`, `<Name>_closed`, `<Name>_count`).
+            // Handle Shader+ `path` property baking (`<Name>` / `<Name>Points` 256x1 RGBA16F `(px, py, tx, ty)`,
+            // `<Name>_length`/`<Name>Length`, `<Name>_closed`/`<Name>Closed`, `<Name>_count`/`<Name>Count`,
+            // `<Name>Coverage`).
             if shader_kind == Some("path") {
                 let (f16_bits, total_len, is_closed, vert_count) =
                     bake_shader_plus_path_rgba16f(&val, env);
@@ -376,54 +380,75 @@ impl ProjectRenderEngine {
                     let idx = owned_temp_targets.len();
                     owned_temp_targets.push(tex);
                     temp_texture_indices.insert(norm_name.clone(), idx);
+                    temp_texture_indices.insert(format!("{norm_name}Points"), idx);
                 }
-                uniform_values.insert(
-                    format!("{norm_name}_length"),
-                    UniformValue::Float(total_len),
-                );
-                let closed_name = format!("{norm_name}_closed");
-                if uniform_field_types.get(&closed_name).copied() == Some(UniformType::Bool) {
-                    uniform_values.insert(closed_name, UniformValue::Bool(is_closed));
+                for len_name in [format!("{norm_name}_length"), format!("{norm_name}Length")] {
+                    uniform_values.insert(len_name, UniformValue::Float(total_len));
+                }
+                for closed_name in [format!("{norm_name}_closed"), format!("{norm_name}Closed")] {
+                    if uniform_field_types.get(&closed_name).copied() == Some(UniformType::Bool) {
+                        uniform_values.insert(closed_name, UniformValue::Bool(is_closed));
+                    } else {
+                        uniform_values.insert(
+                            closed_name,
+                            UniformValue::Float(if is_closed { 1.0 } else { 0.0 }),
+                        );
+                    }
+                }
+                for count_name in [format!("{norm_name}_count"), format!("{norm_name}Count")] {
+                    if uniform_field_types.get(&count_name).copied() == Some(UniformType::Int) {
+                        uniform_values.insert(count_name, UniformValue::Int(vert_count as i32));
+                    } else {
+                        uniform_values.insert(count_name, UniformValue::Float(vert_count as f32));
+                    }
+                }
+                let cov_name = format!("{norm_name}Coverage");
+                let has_cov = vert_count > 0 && total_len > 1e-6;
+                if uniform_field_types.get(&cov_name).copied() == Some(UniformType::Bool) {
+                    uniform_values.insert(cov_name, UniformValue::Bool(has_cov));
                 } else {
                     uniform_values.insert(
-                        closed_name,
-                        UniformValue::Float(if is_closed { 1.0 } else { 0.0 }),
+                        cov_name,
+                        UniformValue::Float(if has_cov { 1.0 } else { 0.0 }),
                     );
-                }
-                let count_name = format!("{norm_name}_count");
-                if uniform_field_types.get(&count_name).copied() == Some(UniformType::Int) {
-                    uniform_values.insert(count_name, UniformValue::Int(vert_count as i32));
-                } else {
-                    uniform_values.insert(count_name, UniformValue::Float(vert_count as f32));
                 }
                 continue;
             }
 
-            // Handle Layer Input track source (`track:id:<id>` or `_zoidiumShaderLayerSource`).
-            if let Some(s) = val.as_str()
-                && (is_layer_source || s.starts_with("track:id:"))
-            {
-                let stage = cp
-                    .metadata
-                    .get("type")
-                    .and_then(|t| t.get("zoidiumLayerStage"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("effects-masks");
-                if let Some(tctx) = temporal_ctx.as_deref_mut()
-                    && let Ok(Some(captured)) = self.render_track_source(
-                        s,
-                        stage,
-                        env,
-                        source.width,
-                        source.height,
-                        tctx.visited_comps,
-                        tctx.visited_tracks,
-                        tctx.comp_depth,
-                    )
+            // Handle Layer Input track/layer/clip sources (`track:id:<id>`, `track:[...]`,
+            // `layer:<id>`, `_zoidiumShaderLayerSource`, `layerInput`, `sourceLayer`, `inputLayer`).
+            let layer_ref_opt = extract_layer_input_ref(cp, &val);
+            let val_has_layer_prefix = layer_ref_opt.is_some_and(is_layer_input_token_prefix);
+            if is_layer_source || val_has_layer_prefix {
+                if let Some(layer_ref) = layer_ref_opt
+                    && !layer_ref.is_empty()
                 {
-                    let idx = owned_temp_targets.len();
-                    owned_temp_targets.push(captured);
-                    temp_texture_indices.insert(norm_name, idx);
+                    let stage = extract_layer_input_stage(cp, Some(&val));
+                    let mut bound_layer = false;
+                    if let Some(tctx) = temporal_ctx.as_deref_mut()
+                        && let Ok(Some(captured)) = self.render_track_source(
+                            layer_ref,
+                            stage,
+                            env,
+                            source.width,
+                            source.height,
+                            tctx.visited_comps,
+                            tctx.visited_tracks,
+                            tctx.comp_depth,
+                        )
+                    {
+                        let idx = owned_temp_targets.len();
+                        owned_temp_targets.push(captured);
+                        temp_texture_indices.insert(norm_name.clone(), idx);
+                        bound_layer = true;
+                    }
+                    if !bound_layer
+                        && !is_layer_input_token_prefix(layer_ref)
+                        && let Some(tex) =
+                            self.ensure_image_asset_texture(env.project, layer_ref, false)
+                    {
+                        extra_textures.insert(norm_name, tex);
+                    }
                 }
                 continue;
             }
@@ -468,6 +493,25 @@ impl ProjectRenderEngine {
                         self.ensure_image_asset_texture(env.project, &asset_id, false)
                     {
                         extra_textures.insert(norm_name, tex);
+                    } else if is_declared_sampler
+                        && !asset_id.trim().is_empty()
+                        && let Some(tctx) = temporal_ctx.as_deref_mut()
+                    {
+                        let stage = extract_layer_input_stage(cp, None);
+                        if let Ok(Some(captured)) = self.render_track_source(
+                            asset_id.trim(),
+                            stage,
+                            env,
+                            source.width,
+                            source.height,
+                            tctx.visited_comps,
+                            tctx.visited_tracks,
+                            tctx.comp_depth,
+                        ) {
+                            let idx = owned_temp_targets.len();
+                            owned_temp_targets.push(captured);
+                            temp_texture_indices.insert(norm_name, idx);
+                        }
                     }
                 }
                 PropertyValue::Gradient(stops) => {
@@ -586,6 +630,34 @@ impl ProjectRenderEngine {
                         temp_texture_indices.insert(norm_name.clone(), idx);
                     }
                     uniform_values.insert(format!("{norm_name}_range"), UniformValue::Vec2(range));
+                }
+                PropertyValue::Text(ref s) | PropertyValue::List(ref s)
+                    if is_declared_sampler && shader_kind.is_none() =>
+                {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        if let Some(tex) =
+                            self.ensure_image_asset_texture(env.project, trimmed, false)
+                        {
+                            extra_textures.insert(norm_name, tex);
+                        } else if let Some(tctx) = temporal_ctx.as_deref_mut() {
+                            let stage = extract_layer_input_stage(cp, None);
+                            if let Ok(Some(captured)) = self.render_track_source(
+                                trimmed,
+                                stage,
+                                env,
+                                source.width,
+                                source.height,
+                                tctx.visited_comps,
+                                tctx.visited_tracks,
+                                tctx.comp_depth,
+                            ) {
+                                let idx = owned_temp_targets.len();
+                                owned_temp_targets.push(captured);
+                                temp_texture_indices.insert(norm_name, idx);
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1291,76 +1363,700 @@ pub(super) fn expr_value_to_uniform(
     }
 }
 
+/// Strips `/* ... */` and `// ...` comments while preserving line breaks and token boundaries
+/// so identifier and `uniform` declaration scans never match commented-out code.
+fn strip_glsl_comments_for_scan(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    let mut in_block = false;
+    while i < len {
+        if in_block {
+            if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+                in_block = false;
+                out.push(' ');
+                i += 2;
+            } else {
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            in_block = true;
+            out.push(' ');
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        let ch = source[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Returns `true` if the comment-stripped GLSL source declares `uniform ... <ident>`.
+fn shader_declares_uniform(cleaned_shader: &str, ident: &str) -> bool {
+    if ident.is_empty() {
+        return false;
+    }
+    for raw_stmt in cleaned_shader.split(';') {
+        let mut stmt = String::new();
+        for line in raw_stmt.lines() {
+            if !line.trim_start().starts_with('#') {
+                stmt.push_str(line);
+                stmt.push(' ');
+            }
+        }
+        let tokens: Vec<&str> = stmt.split_whitespace().collect();
+        if tokens.len() < 3 || tokens[0] != "uniform" {
+            continue;
+        }
+        let mut idx = 1;
+        while idx < tokens.len() && matches!(tokens[idx], "lowp" | "mediump" | "highp" | "const") {
+            idx += 1;
+        }
+        if idx + 1 >= tokens.len() {
+            continue;
+        }
+        let names_part = tokens[idx + 1..].join(" ");
+        for decl in names_part.split(',') {
+            let name = decl
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .split('[')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if name == ident {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Returns `true` if the comment-stripped GLSL source declares `uniform [prec] sampler2D <ident>`.
+fn shader_declares_sampler2d(cleaned_shader: &str, ident: &str) -> bool {
+    if ident.is_empty() {
+        return false;
+    }
+    for raw_stmt in cleaned_shader.split(';') {
+        let mut stmt = String::new();
+        for line in raw_stmt.lines() {
+            if !line.trim_start().starts_with('#') {
+                stmt.push_str(line);
+                stmt.push(' ');
+            }
+        }
+        let tokens: Vec<&str> = stmt.split_whitespace().collect();
+        let Some(u_idx) = tokens.iter().position(|&t| t == "uniform") else {
+            continue;
+        };
+        let mut idx = u_idx + 1;
+        while idx < tokens.len() && matches!(tokens[idx], "lowp" | "mediump" | "highp" | "const") {
+            idx += 1;
+        }
+        if idx + 1 >= tokens.len() || tokens[idx] != "sampler2D" {
+            continue;
+        }
+        let names_part = tokens[idx + 1..].join(" ");
+        for decl in names_part.split(',') {
+            let name = decl
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .split('[')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if name == ident {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_layer_input_token_prefix(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with("track:id:")
+        || t.starts_with("track:[")
+        || t.starts_with("layer:id:")
+        || t.starts_with("layer:")
+        || t.starts_with("clip:id:")
+        || t.starts_with("clip:")
+}
+
+fn is_layer_input_kind_str(kind: &str) -> bool {
+    matches!(
+        kind.trim().to_ascii_lowercase().as_str(),
+        "layer-input"
+            | "layerinput"
+            | "layer_input"
+            | "layersource"
+            | "layer_source"
+            | "layer-source"
+            | "sourcelayer"
+            | "source_layer"
+            | "source-layer"
+            | "inputlayer"
+            | "input_layer"
+            | "input-layer"
+            | "layer"
+    )
+}
+
+fn is_custom_shader_layer_input_prop(
+    cp: &CustomProperty,
+    cleaned_shader: Option<&str>,
+    norm_name: &str,
+) -> bool {
+    let type_obj = cp.metadata.get("type").filter(|v| v.is_object());
+    for key in [
+        "_zoidiumShaderLayerSource",
+        "_zoidiumLayerSource",
+        "isLayerInput",
+        "is_layer_input",
+    ] {
+        if type_obj
+            .and_then(|t| t.get(key))
+            .and_then(json_as_bool)
+            .or_else(|| cp.metadata.get(key).and_then(json_as_bool))
+            == Some(true)
+        {
+            return true;
+        }
+    }
+    for key in [
+        "layerInput",
+        "layer_input",
+        "sourceLayer",
+        "source_layer",
+        "inputLayer",
+        "input_layer",
+    ] {
+        for candidate in [type_obj.and_then(|t| t.get(key)), cp.metadata.get(key)]
+            .into_iter()
+            .flatten()
+        {
+            if json_as_bool(candidate) == Some(true)
+                || candidate.as_str().is_some_and(|s| !s.trim().is_empty())
+            {
+                return true;
+            }
+        }
+    }
+    for stage_key in [
+        "_zoidiumLayerInputMode",
+        "zoidiumLayerStage",
+        "layerInputMode",
+        "layerStage",
+    ] {
+        if type_obj.and_then(|t| t.get(stage_key)).is_some() || cp.metadata.contains_key(stage_key)
+        {
+            return true;
+        }
+    }
+    let kind_opt = type_obj
+        .and_then(|t| {
+            t.get("zoidiumShader")
+                .and_then(|s| s.get("kind"))
+                .or_else(|| t.get("kind"))
+        })
+        .or_else(|| cp.metadata.get("kind"))
+        .and_then(serde_json::Value::as_str);
+    if kind_opt.is_some_and(is_layer_input_kind_str) {
+        return true;
+    }
+    if let Some(s) = cp.track.value.as_str()
+        && is_layer_input_token_prefix(s)
+    {
+        return true;
+    }
+    if let PropertyValue::Asset(Some(s)) = &cp.track.value
+        && is_layer_input_token_prefix(s)
+    {
+        return true;
+    }
+    if let PropertyValue::Json(v) = &cp.track.value
+        && let Some(obj) = v.as_object()
+        && (obj.contains_key("sourceLayer")
+            || obj.contains_key("inputLayer")
+            || obj.contains_key("layerInput")
+            || obj
+                .get("source")
+                .or_else(|| obj.get("track"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_layer_input_token_prefix))
+    {
+        return true;
+    }
+    if let Some(src) = cleaned_shader
+        && shader_declares_sampler2d(src, norm_name)
+    {
+        return true;
+    }
+    false
+}
+
+fn extract_layer_input_ref<'a>(cp: &'a CustomProperty, val: &'a PropertyValue) -> Option<&'a str> {
+    match val {
+        PropertyValue::Text(s) | PropertyValue::List(s) | PropertyValue::Shader(s) => {
+            let t = s.trim();
+            (!t.is_empty()).then_some(t)
+        }
+        PropertyValue::Asset(Some(s)) => {
+            let t = s.trim();
+            (!t.is_empty()).then_some(t)
+        }
+        PropertyValue::Json(v) => {
+            let obj = v.as_object()?;
+            for key in [
+                "source",
+                "track",
+                "layer",
+                "layerId",
+                "layer_id",
+                "sourceLayer",
+                "source_layer",
+                "inputLayer",
+                "input_layer",
+                "layerInput",
+                "layer_input",
+                "value",
+            ] {
+                if let Some(s) = obj.get(key).and_then(serde_json::Value::as_str) {
+                    let t = s.trim();
+                    if !t.is_empty() {
+                        return Some(t);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+    .or_else(|| {
+        let type_obj = cp.metadata.get("type").filter(|v| v.is_object());
+        for key in [
+            "sourceLayer",
+            "source_layer",
+            "inputLayer",
+            "input_layer",
+            "layerInput",
+            "layer_input",
+        ] {
+            for candidate in [type_obj.and_then(|t| t.get(key)), cp.metadata.get(key)]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(s) = candidate.as_str() {
+                    let t = s.trim();
+                    if !t.is_empty() {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+        None
+    })
+}
+
+fn extract_layer_input_stage<'a>(
+    cp: &'a CustomProperty,
+    val: Option<&'a PropertyValue>,
+) -> &'a str {
+    if let Some(PropertyValue::Json(v)) = val
+        && let Some(obj) = v.as_object()
+    {
+        for key in [
+            "_zoidiumLayerInputMode",
+            "zoidiumLayerStage",
+            "layerInputMode",
+            "layerStage",
+            "sourceMode",
+            "mode",
+            "stage",
+        ] {
+            if let Some(s) = obj.get(key).and_then(serde_json::Value::as_str) {
+                let t = s.trim();
+                if !t.is_empty() {
+                    return t;
+                }
+            }
+        }
+    }
+    let type_obj = cp.metadata.get("type").filter(|v| v.is_object());
+    let shader_obj = type_obj.and_then(|t| t.get("zoidiumShader"));
+    for key in [
+        "_zoidiumLayerInputMode",
+        "zoidiumLayerStage",
+        "layerInputMode",
+        "layerStage",
+        "sourceMode",
+        "stage",
+        "mode",
+    ] {
+        for candidate in [
+            type_obj.and_then(|t| t.get(key)),
+            shader_obj.and_then(|s| s.get(key)),
+            cp.metadata.get(key),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(s) = candidate.as_str() {
+                let t = s.trim();
+                if !t.is_empty() {
+                    return t;
+                }
+            }
+        }
+    }
+    "effects-masks"
+}
+
+/// Returns `true` if `ident` appears as a whole GLSL identifier in comment-stripped source.
+fn shader_references_ident(cleaned_shader: &str, ident: &str) -> bool {
+    if ident.is_empty() {
+        return false;
+    }
+    let bytes = cleaned_shader.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            i += 1;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            if &cleaned_shader[start..i] == ident {
+                return true;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Sanitizes a Dropdown / StaticDropdown item label to a valid GLSL identifier suffix
+/// matching Zoidium `plugins/shader-plus/kinds.js:90-93`.
+fn sanitize_dropdown_item_ident(label: &str) -> String {
+    let mut out = String::new();
+    let mut prev_underscore = false;
+    for ch in label.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_underscore = false;
+        } else if !prev_underscore {
+            out.push('_');
+            prev_underscore = true;
+        }
+    }
+    if out.is_empty() {
+        "_".to_owned()
+    } else if out.as_bytes()[0].is_ascii_digit() {
+        format!("_{out}")
+    } else {
+        out
+    }
+}
+
+fn json_as_bool(v: &serde_json::Value) -> Option<bool> {
+    v.as_bool()
+        .or_else(|| v.as_i64().map(|n| n != 0))
+        .or_else(|| v.as_f64().filter(|n| n.is_finite()).map(|n| n != 0.0))
+}
+
+fn format_glsl_define_float(v: f64) -> String {
+    let clean = if v == 0.0 { 0.0 } else { v };
+    let s = format!("{clean}");
+    if s.contains(['.', 'e', 'E']) {
+        s
+    } else {
+        format!("{s}.0")
+    }
+}
+
+fn property_value_to_define(val: &PropertyValue) -> Option<String> {
+    match val {
+        PropertyValue::Number(v) if v.is_finite() => {
+            let clean = if *v == 0.0 { 0.0 } else { *v };
+            Some(format!("{clean}"))
+        }
+        PropertyValue::Option(v) => Some(format!("{v}")),
+        PropertyValue::Bool(v) => Some(if *v { "1" } else { "0" }.to_owned()),
+        PropertyValue::Vec2(v) if v.iter().all(|x| x.is_finite()) => Some(format!(
+            "vec2({}, {})",
+            format_glsl_define_float(v[0]),
+            format_glsl_define_float(v[1])
+        )),
+        PropertyValue::Vec3(v) | PropertyValue::Color(v) if v.iter().all(|x| x.is_finite()) => {
+            Some(format!(
+                "vec3({}, {}, {})",
+                format_glsl_define_float(v[0]),
+                format_glsl_define_float(v[1]),
+                format_glsl_define_float(v[2])
+            ))
+        }
+        PropertyValue::Vec4(v) | PropertyValue::ColorRgba(v) if v.iter().all(|x| x.is_finite()) => {
+            Some(format!(
+                "vec4({}, {}, {}, {})",
+                format_glsl_define_float(v[0]),
+                format_glsl_define_float(v[1]),
+                format_glsl_define_float(v[2]),
+                format_glsl_define_float(v[3])
+            ))
+        }
+        PropertyValue::Text(s) => {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() && !trimmed.contains(['\n', '\r']) {
+                Some(trimmed.to_owned())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn insert_json_define_map(
+    val: &serde_json::Value,
+    cleaned_shader: &str,
+    defines: &mut BTreeMap<String, String>,
+) {
+    let Some(obj) = val.as_object() else {
+        return;
+    };
+    for (raw_k, v) in obj {
+        let k = fix_property_name(raw_k);
+        if k.is_empty() || shader_declares_uniform(cleaned_shader, &k) {
+            continue;
+        }
+        let formatted = match v {
+            serde_json::Value::Bool(true) => Some("1".to_owned()),
+            serde_json::Value::Bool(false) => None,
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Some(i.to_string())
+                } else {
+                    n.as_f64()
+                        .filter(|x| x.is_finite())
+                        .map(|x| format!("{}", if x == 0.0 { 0.0 } else { x }))
+                }
+            }
+            serde_json::Value::String(s) => {
+                let t = s.trim();
+                if !t.is_empty() && !t.contains(['\n', '\r']) {
+                    Some(t.to_owned())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(dv) = formatted {
+            defines.insert(k, dv);
+        }
+    }
+}
+
 pub(super) fn build_custom_shader_compile_options(
     frag_shader: &str,
     custom_properties: &[CustomProperty],
     env: &EvalEnv<'_>,
 ) -> CompileOptions {
     let mut opts = CompileOptions::default();
-    let mut has_time_samples = frag_shader.contains("ZOIDIUM_TIME_SAMPLES");
+    let cleaned_shader = strip_glsl_comments_for_scan(frag_shader);
+    let mut has_time_samples = shader_references_ident(&cleaned_shader, "ZOIDIUM_TIME_SAMPLES");
 
     for cp in custom_properties {
         let norm_name = fix_property_name(&cp.name);
-        let type_obj = cp.metadata.get("type");
+        let type_obj = cp.metadata.get("type").filter(|v| v.is_object());
         let shader_kind = type_obj
             .and_then(|t| t.get("zoidiumShader"))
             .and_then(|s| s.get("kind"))
-            .and_then(serde_json::Value::as_str);
-        if shader_kind == Some("timeSample") {
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| cp.metadata.get("kind").and_then(serde_json::Value::as_str));
+        let shader_kind_lower = shader_kind.map(str::to_ascii_lowercase);
+        if shader_kind_lower.as_deref() == Some("timesample") {
             has_time_samples = true;
         }
-        let is_layer_source = type_obj
-            .and_then(|t| t.get("_zoidiumShaderLayerSource"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+
+        // Emit explicit `defines` / `constants` / `macros` maps attached to metadata or `type`.
+        for map_key in ["defines", "constants", "macros"] {
+            if let Some(map_val) = type_obj.and_then(|t| t.get(map_key)) {
+                insert_json_define_map(map_val, &cleaned_shader, &mut opts.defines);
+            }
+            if let Some(map_val) = cp.metadata.get(map_key) {
+                insert_json_define_map(map_val, &cleaned_shader, &mut opts.defines);
+            }
+        }
+
+        let is_layer_source =
+            is_custom_shader_layer_input_prop(cp, Some(&cleaned_shader), &norm_name);
         let is_texture_or_array = is_layer_source
             || matches!(
-                shader_kind,
-                Some("gradient" | "curve" | "palette" | "text" | "path" | "timeSample")
+                shader_kind_lower.as_deref(),
+                Some("gradient" | "curve" | "palette" | "text" | "path" | "timesample")
             )
+            || matches!(cp.prop_type, Some(8 | 11))
             || matches!(
                 cp.track.value,
                 PropertyValue::Asset(_) | PropertyValue::Gradient(_) | PropertyValue::Curve(_)
             );
 
-        // Emit `Name_Item` constants for Dropdown / StaticDropdown if referenced in source.
+        if is_texture_or_array {
+            continue;
+        }
+
+        // Emit `Name_Item` constants for Dropdown / StaticDropdown if referenced in source
+        // (matching Zoidium `plugins/shader-plus/runtime.js:144-151` and `kinds.js:90-109`).
+        let mut dropdown_items: Vec<String> = Vec::new();
         if let Some(items_str) = type_obj
             .and_then(|t| t.get("items"))
             .and_then(serde_json::Value::as_str)
+            .or_else(|| cp.metadata.get("items").and_then(serde_json::Value::as_str))
         {
-            for (idx, raw_item) in items_str.split(';').enumerate() {
-                let clean = sanitize_ctl_name(raw_item.trim());
-                if !clean.is_empty() {
-                    let const_name = format!("{norm_name}_{clean}");
-                    if frag_shader.contains(&const_name) {
-                        opts.defines.insert(const_name, idx.to_string());
+            dropdown_items.extend(items_str.split(';').map(|s| s.trim().to_owned()));
+        } else if let Some(items_arr) = type_obj
+            .and_then(|t| {
+                t.get("zoidiumShader")
+                    .and_then(|s| s.get("items"))
+                    .or_else(|| t.get("items"))
+            })
+            .or_else(|| cp.metadata.get("items"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for item in items_arr {
+                if let Some(s) = item.as_str() {
+                    dropdown_items.push(s.trim().to_owned());
+                } else if let Some(s) = item
+                    .get("label")
+                    .or_else(|| item.get("name"))
+                    .or_else(|| item.get("value"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    dropdown_items.push(s.trim().to_owned());
+                }
+            }
+        }
+        for (idx, raw_item) in dropdown_items.iter().enumerate() {
+            let clean = sanitize_dropdown_item_ident(raw_item);
+            let const_name = format!("{norm_name}_{clean}");
+            if shader_references_ident(&cleaned_shader, &const_name)
+                && !shader_declares_uniform(&cleaned_shader, &const_name)
+            {
+                opts.defines
+                    .entry(const_name)
+                    .or_insert_with(|| idx.to_string());
+            }
+        }
+
+        // Determine whether this custom property is a compile-time `#define` constant.
+        // In CM3 (`PZ.property.create`), static properties such as Static Number (`SAMPLES`)
+        // omit `"dynamic"` in `type` (`{ custom: true, type: 0, value: ... }`), whereas dynamic
+        // uniform properties explicitly set `"dynamic": true`.
+        let explicit_dynamic = type_obj
+            .and_then(|t| t.get("dynamic"))
+            .and_then(json_as_bool)
+            .or_else(|| cp.metadata.get("dynamic").and_then(json_as_bool));
+
+        let mut custom_define_name: Option<String> = None;
+        let mut explicit_static = false;
+        for flag_key in [
+            "static",
+            "compileTime",
+            "compile_time",
+            "define",
+            "isDefine",
+            "macro",
+        ] {
+            for candidate in [
+                type_obj.and_then(|t| t.get(flag_key)),
+                cp.metadata.get(flag_key),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if json_as_bool(candidate) == Some(true) {
+                    explicit_static = true;
+                } else if matches!(flag_key, "define" | "macro")
+                    && let Some(s) = candidate.as_str()
+                {
+                    let trimmed = fix_property_name(s.trim());
+                    if !trimmed.is_empty() {
+                        explicit_static = true;
+                        custom_define_name = Some(trimmed);
                     }
                 }
             }
         }
 
-        // Native static `#define <Name> <value>` when `dynamic == false` and not texture/array.
-        let is_dynamic = type_obj
-            .and_then(|t| t.get("dynamic"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
-        if (!is_dynamic || shader_kind == Some("staticDropdown")) && !is_texture_or_array {
+        let is_known_static_kind = matches!(
+            shader_kind_lower.as_deref(),
+            Some(
+                "staticdropdown"
+                    | "staticnumber"
+                    | "staticint"
+                    | "staticfloat"
+                    | "staticslider"
+                    | "staticcheckbox"
+                    | "statictoggle"
+                    | "staticbool"
+                    | "statictext"
+                    | "staticoption"
+                    | "define"
+                    | "macro"
+                    | "constant"
+            )
+        );
+        let is_known_dynamic_kind = matches!(
+            shader_kind_lower.as_deref(),
+            Some("point" | "checkbox" | "dropdown" | "slider" | "angle" | "seed" | "color4")
+        );
+        let has_dynamic_track = cp.track.animated
+            || !cp.track.keyframes.is_empty()
+            || cp.track.expression.is_some()
+            || !cp.track.channels.is_empty();
+
+        let define_name = custom_define_name.unwrap_or(norm_name);
+        let declares_uniform = shader_declares_uniform(&cleaned_shader, &define_name);
+
+        let is_static_define = if declares_uniform {
+            false
+        } else if is_known_static_kind || explicit_static || explicit_dynamic == Some(false) {
+            true
+        } else if explicit_dynamic == Some(true) || is_known_dynamic_kind {
+            false
+        } else if type_obj.is_some() {
+            // CM3 `PZ.property.create`: `type` object without `"dynamic": true` -> `PZ.property.static`.
+            !has_dynamic_track
+        } else {
+            // Primitive/bare custom property without a CM3 `type` object: treat as compile-time
+            // `#define` when it has no dynamic track, is not declared as a `uniform`, and is
+            // referenced as an identifier in the shader source.
+            !has_dynamic_track && shader_references_ident(&cleaned_shader, &define_name)
+        };
+
+        if is_static_define {
             let val = eval_property_track(&cp.track, env);
-            let define_val = match val {
-                PropertyValue::Number(v) => Some(format!("{v}")),
-                PropertyValue::Option(v) => Some(format!("{v}")),
-                PropertyValue::Bool(v) => Some(if v { "1" } else { "0" }.to_owned()),
-                PropertyValue::Vec2(v) => Some(format!("vec2({}, {})", v[0], v[1])),
-                PropertyValue::Vec3(v) | PropertyValue::Color(v) => {
-                    Some(format!("vec3({}, {}, {})", v[0], v[1], v[2]))
-                }
-                PropertyValue::Vec4(v) | PropertyValue::ColorRgba(v) => {
-                    Some(format!("vec4({}, {}, {}, {})", v[0], v[1], v[2], v[3]))
-                }
-                _ => None,
-            };
-            if let Some(dv) = define_val {
-                opts.defines.insert(norm_name, dv);
+            if let Some(dv) = property_value_to_define(&val) {
+                opts.defines.insert(define_name, dv);
             }
         }
     }
@@ -1564,8 +2260,9 @@ pub(super) fn bake_shader_plus_gradient_json(
     );
     let color_space = parse_gradient_color_space(
         val.get("colorSpace")
+            .or_else(|| val.get("space"))
             .or_else(|| val.get("color_space"))
-            .or_else(|| shader_meta.and_then(|s| s.get("colorSpace"))),
+            .or_else(|| shader_meta.and_then(|s| s.get("colorSpace").or_else(|| s.get("space")))),
     );
     let spec = GradientSpec {
         stops,
@@ -1916,7 +2613,13 @@ pub(super) fn bake_shader_plus_curve_rgba16f(
             ]
         });
 
-    let channels_obj = obj.get("channels").unwrap_or(obj);
+    // Zoidium encodes `"channels": "rgba" | "single"` as a string metadata field alongside
+    // top-level `"common"/"red"/"green"/"blue"` arrays; only descend into `"channels"` when
+    // it is actually a nested JSON object.
+    let channels_obj = match obj.get("channels") {
+        Some(v) if v.is_object() => v,
+        _ => obj,
+    };
     let common_pts = parse_curve_points(
         channels_obj
             .get("common")

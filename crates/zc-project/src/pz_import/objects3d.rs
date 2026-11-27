@@ -10,7 +10,7 @@ use crate::model::{
     PropertyTrack, PropertyValue, Shape3DKind, Text3DAlign, Text3DData, TrackToConstraint,
 };
 
-use super::effects::parse_custom_properties;
+use super::effects::parse_custom_properties_from_maps;
 use super::materials::parse_material;
 use super::tracks::{
     infer_default_value, parse_gradient_stops, parse_particle_color_stops,
@@ -86,12 +86,19 @@ pub(crate) fn parse_object3d(
                             model_props.insert(k.clone(), parse_property_track(v, default_val));
                         }
                     }
+                    let asset_id = extract_model_asset_id(obj, props);
+                    let preset_type = match (explicit_object_type, asset_id.is_some()) {
+                        (Some(0), _) => None,
+                        (None, true) => None,
+                        (Some(ot), true) if !matches!(ot, 1 | 2) => None,
+                        _ => Some(sub_type),
+                    };
                     (
                         "Model",
                         [0.0, 0.0, 0.0],
                         Object3DKind::Model(Box::new(ModelData {
-                            preset_type: Some(sub_type),
-                            asset_id: None,
+                            preset_type,
+                            asset_id,
                             model_properties: model_props,
                         })),
                     )
@@ -134,10 +141,7 @@ pub(crate) fn parse_object3d(
                         .and_then(|p| p.get("reflectionVisibility"))
                         .and_then(value_as_u32)
                         .unwrap_or(0);
-                    let custom_properties = parse_custom_properties(
-                        obj.get("customProperties")
-                            .or_else(|| props.and_then(|p| p.get("customProperties"))),
-                    );
+                    let custom_properties = parse_custom_properties_from_maps(obj, props);
                     let mut children = Vec::new();
                     if let Some(arr) = obj
                         .get("objects")
@@ -200,14 +204,58 @@ pub(crate) fn parse_object3d(
                     plugins,
                     warnings,
                 ),
+                Some(10) => {
+                    plugins.insert("trapcode-suite".to_owned());
+                    let canonical = "zoidium:trapcode-suite/particular";
+                    plugin_object_type = Some(canonical.to_owned());
+                    extra_preserved.insert("type".to_owned(), Value::String(canonical.to_owned()));
+                    (
+                        "Particular",
+                        [0.0, 0.0, 0.0],
+                        Object3DKind::Dummy {
+                            original_type: Some(canonical.to_owned()),
+                            payload: val.clone(),
+                        },
+                    )
+                }
+                Some(11) => {
+                    plugins.insert("trapcode-suite".to_owned());
+                    let canonical = "zoidium:trapcode-suite/form";
+                    plugin_object_type = Some(canonical.to_owned());
+                    extra_preserved.insert("type".to_owned(), Value::String(canonical.to_owned()));
+                    (
+                        "Form",
+                        [0.0, 0.0, 0.0],
+                        Object3DKind::Dummy {
+                            original_type: Some(canonical.to_owned()),
+                            payload: val.clone(),
+                        },
+                    )
+                }
+                Some(12) => {
+                    plugins.insert("trapcode-suite".to_owned());
+                    let canonical = "zoidium:trapcode-suite/plexus";
+                    plugin_object_type = Some(canonical.to_owned());
+                    extra_preserved.insert("type".to_owned(), Value::String(canonical.to_owned()));
+                    (
+                        "Plexus",
+                        [0.0, 0.0, 0.0],
+                        Object3DKind::Dummy {
+                            original_type: Some(canonical.to_owned()),
+                            payload: val.clone(),
+                        },
+                    )
+                }
                 Some(13) => {
                     plugins.insert("optical-flares".to_owned());
-                    plugin_object_type = Some("zoidium:optical-flares/flare".to_owned());
+                    let canonical = "zoidium:optical-flares/flare";
+                    plugin_object_type = Some(canonical.to_owned());
+                    extra_preserved.insert("type".to_owned(), Value::String(canonical.to_owned()));
                     (
                         "Optical Flares",
                         [0.0, 0.0, 0.0],
                         Object3DKind::Dummy {
-                            original_type: Some("13".to_owned()),
+                            original_type: Some(canonical.to_owned()),
                             payload: val.clone(),
                         },
                     )
@@ -291,9 +339,104 @@ pub(crate) fn parse_object3d(
         out.constraints = parse_constraints(props, is_camera_or_light, plugins);
 
         for (k, v) in props {
-            if !is_known_object3d_prop(k) {
-                out.preserved.insert(format!("property.{k}"), v.clone());
+            if !is_known_object3d_prop_for_kind(k, &out.kind) {
+                out.preserved
+                    .insert(format!("property.{k}"), normalize_preserved_plugin_prop(v));
             }
+        }
+    }
+
+    // Unpack Zoidium plugin property containers (`characterProperties`, `repeaterProperties`,
+    // `effectorProperties`, `fieldProperties`) into `preserved["property.<k>"]` so both the
+    // renderer (`effectors.rs`) and `zc-session` (`sync_from_project.rs`) see them directly
+    // with keyframes & expressions intact.
+    for container_key in [
+        "characterProperties",
+        "repeaterProperties",
+        "effectorProperties",
+        "fieldProperties",
+    ] {
+        let container_map = obj
+            .get(container_key)
+            .and_then(Value::as_object)
+            .or_else(|| {
+                props
+                    .and_then(|p| p.get(container_key))
+                    .and_then(Value::as_object)
+            });
+        if let Some(cmap) = container_map {
+            for (k, v) in cmap {
+                if k == "name" {
+                    continue;
+                }
+                let prop_key = format!("property.{k}");
+                out.preserved
+                    .entry(prop_key)
+                    .or_insert_with(|| normalize_preserved_plugin_prop(v));
+            }
+        }
+    }
+
+    // Zoidium Effector/Repeater legacy migrations & unit tags:
+    // - Radial repeater `repeaterProperties` stores `startAngle`/`sweep` in radians.
+    // - Legacy `polygonCount` / `smoothness` / `curveQuality` map to `subdivision`.
+    // - Legacy `field` without `fieldFalloff` enables `legacyField`.
+    if let Some(pt) = out
+        .preserved
+        .get("zoidiumPluginObjectType")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    {
+        if pt == "zoidium:repeater/radial"
+            && let Some(rp) = obj.get("repeaterProperties").and_then(Value::as_object)
+            && (rp.contains_key("sweep")
+                || (rp.contains_key("startAngle") && !rp.contains_key("endAngle")))
+        {
+            out.preserved
+                .insert("zoidiumRadialRadians".to_owned(), Value::Bool(true));
+        }
+        if pt.starts_with("zoidium:repeater/") {
+            if !out.preserved.contains_key("property.subdivision") {
+                for legacy_key in [
+                    "property.polygonCount",
+                    "property.smoothness",
+                    "property.curveQuality",
+                ] {
+                    if let Some(v) = out.preserved.get(legacy_key).cloned() {
+                        out.preserved.insert("property.subdivision".to_owned(), v);
+                        break;
+                    }
+                }
+            }
+            let has_active_field = out.preserved.get("property.field").is_some_and(|v| {
+                value_as_u32(v).is_some_and(|n| n != 0)
+                    || v.as_str().is_some_and(|s| {
+                        !s.is_empty() && !s.eq_ignore_ascii_case("infinite") && s != "0"
+                    })
+            });
+            if has_active_field
+                && !out.preserved.contains_key("property.fieldFalloff")
+                && !out.preserved.contains_key("property.legacyField")
+            {
+                out.preserved
+                    .insert("property.legacyField".to_owned(), Value::Bool(true));
+            }
+        }
+    }
+
+    // Non-Group objects with legacy `customProperties` / `userProperties` / `extraProperties`:
+    // unpack each entry into `preserved["property.<name>"]` as a serialized `PropertyTrack`
+    // so keyframes & expressions survive into `SessionObject3D.properties`.
+    if !matches!(out.kind, Object3DKind::Group { .. }) {
+        for cp in parse_custom_properties_from_maps(obj, props) {
+            if cp.name.is_empty() {
+                continue;
+            }
+            let track_val = serde_json::to_value(&cp.track)
+                .unwrap_or_else(|_| property_value_to_plain_json(&cp.track.value));
+            out.preserved
+                .entry(format!("property.{}", cp.name))
+                .or_insert(track_val);
         }
     }
 
@@ -325,22 +468,29 @@ pub(crate) fn parse_object3d(
         }
     }
 
+    let is_group_kind = matches!(out.kind, Object3DKind::Group { .. });
     for (k, v) in obj {
-        if !matches!(
-            k.as_str(),
-            "type"
-                | "objectType"
-                | "properties"
-                | "material"
-                | "objects"
-                | "customProperties"
-                | "zoidiumTextScaleMode"
-                | "zoidiumUvMode"
-                | "zoidiumShadowMode"
-                | "frontMaterial"
-                | "sideMaterial"
-                | "_zoidiumParticlesPlusSprite"
-        ) {
+        let skip_custom_props = is_group_kind
+            && matches!(
+                k.as_str(),
+                "customProperties" | "userProperties" | "extraProperties"
+            );
+        if !skip_custom_props
+            && !matches!(
+                k.as_str(),
+                "type"
+                    | "objectType"
+                    | "properties"
+                    | "material"
+                    | "objects"
+                    | "zoidiumTextScaleMode"
+                    | "zoidiumUvMode"
+                    | "zoidiumShadowMode"
+                    | "frontMaterial"
+                    | "sideMaterial"
+                    | "_zoidiumParticlesPlusSprite"
+            )
+        {
             out.preserved.insert(k.clone(), v.clone());
         }
     }
@@ -360,6 +510,16 @@ pub(super) fn parse_string_typed_object3d(
     plugins: &mut BTreeSet<String>,
     warnings: &mut Vec<String>,
 ) -> (&'static str, [f64; 3], Object3DKind) {
+    let normalized_owned: String = if let Some(rest) = type_str.strip_prefix("zoidcraft:") {
+        format!("zoidium:{rest}")
+    } else if let Some(rest) = type_str.strip_prefix("zoidium:effector-plus/") {
+        format!("zoidium:repeater/{rest}")
+    } else if let Some(rest) = type_str.strip_prefix("effector-plus/") {
+        format!("zoidium:repeater/{rest}")
+    } else {
+        type_str.to_owned()
+    };
+    let type_str = normalized_owned.as_str();
     match type_str {
         "zoidium:camera-plus/camera" | "zoidium:camera-plus/camera_plus" => {
             plugins.insert("camera-plus".to_owned());
@@ -522,6 +682,39 @@ pub(super) fn parse_string_typed_object3d(
                     cap_segments,
                     radial_segments,
                     shading,
+                }),
+            )
+        }
+        "zoidium:geometry-plus/torus-knot" | "zoidium:geometry-plus/torus_knot" => {
+            plugins.insert("geometry-plus".to_owned());
+            *plugin_object_type = Some("zoidium:geometry-plus/torus-knot".to_owned());
+            preserve_animated_geometry_props(props, extra_preserved);
+            let radius = props
+                .and_then(|p| prop_track_f64(p, "radius"))
+                .unwrap_or(5.0);
+            let tube = props.and_then(|p| prop_track_f64(p, "tube")).unwrap_or(1.5);
+            let tubular_segments = props
+                .and_then(|p| prop_track_f64(p, "tubularSegments"))
+                .map_or(64, |v| v.round().max(3.0) as u32);
+            let radial_segments = props
+                .and_then(|p| prop_track_f64(p, "radialSegments"))
+                .map_or(12, |v| v.round().max(3.0) as u32);
+            let p_param = props
+                .and_then(|p| prop_track_f64(p, "p"))
+                .map_or(2, |v| v.round().max(1.0) as u32);
+            let q_param = props
+                .and_then(|p| prop_track_f64(p, "q"))
+                .map_or(3, |v| v.round().max(1.0) as u32);
+            (
+                "Torus Knot",
+                [0.0, 0.0, 0.0],
+                Object3DKind::Shape3D(Shape3DKind::TorusKnot {
+                    radius,
+                    tube,
+                    tubular_segments,
+                    radial_segments,
+                    p: p_param,
+                    q: q_param,
                 }),
             )
         }
@@ -741,9 +934,13 @@ pub(super) fn parse_string_typed_object3d(
         | "zoidium:expresstext-plus/voronoi" => {
             plugins.insert("expresstext-plus".to_owned());
             *plugin_object_type = Some(type_str.to_owned());
-            let custom_properties = parse_custom_properties(obj.get("customProperties"));
+            let custom_properties = parse_custom_properties_from_maps(obj, props);
             let mut children = Vec::new();
-            if let Some(arr) = obj.get("objects").and_then(Value::as_array) {
+            if let Some(arr) = obj
+                .get("objects")
+                .and_then(Value::as_array)
+                .or_else(|| obj.get("children").and_then(Value::as_array))
+            {
                 for child in arr {
                     children.push(parse_object3d(child, plugins, warnings));
                 }
@@ -804,9 +1001,13 @@ pub(super) fn parse_string_typed_object3d(
         | "zoidium:text-plus/character-material" => {
             plugins.insert("text-plus".to_owned());
             *plugin_object_type = Some(type_str.to_owned());
-            let custom_properties = parse_custom_properties(obj.get("customProperties"));
+            let custom_properties = parse_custom_properties_from_maps(obj, props);
             let mut children = Vec::new();
-            if let Some(arr) = obj.get("objects").and_then(Value::as_array) {
+            if let Some(arr) = obj
+                .get("objects")
+                .and_then(Value::as_array)
+                .or_else(|| obj.get("children").and_then(Value::as_array))
+            {
                 for child in arr {
                     children.push(parse_object3d(child, plugins, warnings));
                 }
@@ -819,8 +1020,18 @@ pub(super) fn parse_string_typed_object3d(
                 let (mat, _) = parse_material(sm, plugins);
                 material_slots.insert("side".to_owned(), mat);
             }
+            let label = match type_str {
+                "zoidium:text-plus/text-plus" => "Character Transform",
+                "zoidium:text-plus/gradient-transform" => "Gradient Transform",
+                "zoidium:text-plus/character-shake" => "Character Shake",
+                "zoidium:text-plus/selected-transform" => "Selected Character Transform",
+                "zoidium:text-plus/selected-shake" => "Selected Character Shake",
+                "zoidium:text-plus/random-scatter" => "Random Scatter",
+                "zoidium:text-plus/character-material" => "Character Material",
+                _ => "Text+",
+            };
             (
-                "Text+",
+                label,
                 [0.0, 0.0, 0.0],
                 Object3DKind::Group {
                     reflection_visibility: 0,
@@ -829,7 +1040,7 @@ pub(super) fn parse_string_typed_object3d(
                 },
             )
         }
-        // --- Repeater & Effector+ (11 parent group classes) ---
+        // --- Repeater & Effector+ (12 parent group classes) ---
         "zoidium:repeater/repeater"
         | "zoidium:repeater/linear-repeater"
         | "zoidium:repeater/random-repeater"
@@ -840,6 +1051,7 @@ pub(super) fn parse_string_typed_object3d(
         | "zoidium:repeater/grid-repeater"
         | "zoidium:repeater/twist"
         | "zoidium:repeater/warp"
+        | "zoidium:repeater/shear"
         | "zoidium:repeater/voronoi-fracture"
         | "zoidium:repeater/plain"
         | "zoidium:repeater/delay" => {
@@ -859,9 +1071,13 @@ pub(super) fn parse_string_typed_object3d(
                     Value::String("legacy".to_owned()),
                 );
             }
-            let custom_properties = parse_custom_properties(obj.get("customProperties"));
+            let custom_properties = parse_custom_properties_from_maps(obj, props);
             let mut children = Vec::new();
-            if let Some(arr) = obj.get("objects").and_then(Value::as_array) {
+            if let Some(arr) = obj
+                .get("objects")
+                .and_then(Value::as_array)
+                .or_else(|| obj.get("children").and_then(Value::as_array))
+            {
                 for child in arr {
                     children.push(parse_object3d(child, plugins, warnings));
                 }
@@ -871,6 +1087,7 @@ pub(super) fn parse_string_typed_object3d(
                 "zoidium:repeater/grid" => "Grid Repeater",
                 "zoidium:repeater/twist" => "Twist",
                 "zoidium:repeater/warp" => "Warp",
+                "zoidium:repeater/shear" => "Shear",
                 "zoidium:repeater/voronoi-fracture" => "Voronoi Fracture",
                 "zoidium:repeater/plain" => "Plain Effector",
                 "zoidium:repeater/delay" => "Delay Effector",
@@ -923,10 +1140,19 @@ pub(super) fn parse_string_typed_object3d(
                     }
                 }
                 (name, [0.0, 10.0, 0.0], Object3DKind::Light(Box::new(light)))
-            } else if obj.get("objects").and_then(Value::as_array).is_some() {
-                let custom_properties = parse_custom_properties(obj.get("customProperties"));
+            } else if obj
+                .get("objects")
+                .and_then(Value::as_array)
+                .or_else(|| obj.get("children").and_then(Value::as_array))
+                .is_some()
+            {
+                let custom_properties = parse_custom_properties_from_maps(obj, props);
                 let mut children = Vec::new();
-                if let Some(arr) = obj.get("objects").and_then(Value::as_array) {
+                if let Some(arr) = obj
+                    .get("objects")
+                    .and_then(Value::as_array)
+                    .or_else(|| obj.get("children").and_then(Value::as_array))
+                {
                     for child in arr {
                         children.push(parse_object3d(child, plugins, warnings));
                     }
@@ -963,6 +1189,50 @@ pub(super) fn parse_string_typed_object3d(
                 )
             }
         }
+        // --- Light+ & Portal Light (`zoidium:light-plus/*` or bare Portal Light alias) ---
+        s if s.starts_with("zoidium:light-plus/")
+            || s.eq_ignore_ascii_case("portal-light")
+            || s.eq_ignore_ascii_case("portal_light")
+            || s.eq_ignore_ascii_case("portal light") =>
+        {
+            plugins.insert("light-plus".to_owned());
+            let sub_raw = s
+                .strip_prefix("zoidium:light-plus/")
+                .unwrap_or("portal-light");
+            let sub = sub_raw.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+            let canonical = format!("zoidium:light-plus/{sub}");
+            *plugin_object_type = Some(canonical.clone());
+            extra_preserved.insert("type".to_owned(), Value::String(canonical));
+            let (lt, name) = match sub.as_str() {
+                "spot-light" | "spot" => (1u32, "Spot Light"),
+                "point-light" | "point" => (2, "Point Light"),
+                "infinite-light" | "directional-light" => (3, "Infinite Light"),
+                "hemisphere-light" => (4, "Hemisphere Light"),
+                "ambient-light" => (5, "Ambient Light"),
+                "sun-light" => (3, "Sun Light"),
+                "area-light" => (2, "Area Light"),
+                "ies-light" => (2, "IES Light"),
+                "portal-light" => (2, "Portal Light"),
+                _ => (2, "Light"),
+            };
+            let mut light = parse_light_data(props, lt);
+            if let Some(p) = props {
+                if let Some(sky) = p.get("skyColor") {
+                    light.color = parse_property_track(sky, PropertyValue::Color([1.0, 1.0, 1.0]));
+                }
+                if let Some(d) = prop_track_f64(p, "distance") {
+                    light.distance = d;
+                }
+                if let Some(d) = prop_track_f64(p, "decay") {
+                    light.decay = d;
+                }
+                if let Some(pen) = prop_track_f64(p, "penumbra") {
+                    light.penumbra = pen;
+                }
+            }
+            (name, [0.0, 10.0, 0.0], Object3DKind::Light(Box::new(light)))
+        }
+        // --- Particles / Particle+ ---
         s if s.starts_with("zoidium:particles-plus/") || s.eq_ignore_ascii_case("particles") => {
             if s.starts_with("zoidium:particles-plus/")
                 || props.is_some_and(|p| p.contains_key("turbulence") || p.contains_key("drag"))
@@ -995,9 +1265,13 @@ pub(super) fn parse_string_typed_object3d(
             {
                 plugins.insert(plugin_id.to_owned());
             }
-            if let Some(arr) = obj.get("objects").and_then(Value::as_array) {
+            if let Some(arr) = obj
+                .get("objects")
+                .and_then(Value::as_array)
+                .or_else(|| obj.get("children").and_then(Value::as_array))
+            {
                 *plugin_object_type = Some(other.to_owned());
-                let custom_properties = parse_custom_properties(obj.get("customProperties"));
+                let custom_properties = parse_custom_properties_from_maps(obj, props);
                 let mut children = Vec::new();
                 for child in arr {
                     children.push(parse_object3d(child, plugins, warnings));
@@ -1104,8 +1378,63 @@ pub(super) fn prop_track_u32_val(val: &Value) -> Option<u32> {
     track.value.as_option()
 }
 
-pub(super) fn is_known_object3d_prop(key: &str) -> bool {
-    matches!(
+fn property_value_to_plain_json(val: &PropertyValue) -> Value {
+    match val {
+        PropertyValue::Number(n) => serde_json::json!(*n),
+        PropertyValue::Option(o) => serde_json::json!(*o),
+        PropertyValue::Bool(b) => Value::Bool(*b),
+        PropertyValue::Vec2(v) => serde_json::json!(*v),
+        PropertyValue::Vec3(v) | PropertyValue::Color(v) => serde_json::json!(*v),
+        PropertyValue::Vec4(v) | PropertyValue::ColorRgba(v) => serde_json::json!(*v),
+        PropertyValue::Text(s) | PropertyValue::List(s) | PropertyValue::Shader(s) => {
+            Value::String(s.clone())
+        }
+        PropertyValue::Asset(Some(id)) => Value::String(id.clone()),
+        PropertyValue::Asset(None) => Value::Null,
+        PropertyValue::Gradient(stops) => serde_json::to_value(stops).unwrap_or(Value::Null),
+        PropertyValue::Curve(v) | PropertyValue::Json(v) => v.clone(),
+    }
+}
+
+fn track_is_dynamic(track: &PropertyTrack) -> bool {
+    if track.animated
+        || track.expression.is_some()
+        || track.keyframes.len() > 1
+        || track.keyframes.iter().any(|k| k.frame.abs() > 1e-6)
+    {
+        return true;
+    }
+    track.channels.iter().any(track_is_dynamic)
+}
+
+/// Normalizes a CM3/Zoidium dynamic property JSON object (using `keyframes` / `objects` /
+/// `expression` / `animated`) into either a plain static JSON value (when constant) or a
+/// serialized `PropertyTrack` (when animated or expression-driven).
+fn normalize_preserved_plugin_prop(val: &Value) -> Value {
+    let Some(map) = val.as_object() else {
+        return val.clone();
+    };
+    if map.contains_key("static_behavior") || map.contains_key("channels") {
+        return val.clone();
+    }
+    let looks_like_cm3_track = map.contains_key("keyframes")
+        || map.contains_key("objects")
+        || map.contains_key("expression")
+        || map.contains_key("animated");
+    if !looks_like_cm3_track {
+        return val.clone();
+    }
+    let default_val = infer_default_value(val);
+    let track = parse_property_track(val, default_val);
+    if track_is_dynamic(&track) {
+        serde_json::to_value(&track).unwrap_or_else(|_| val.clone())
+    } else {
+        property_value_to_plain_json(&track.value)
+    }
+}
+
+pub(super) fn is_known_object3d_prop_for_kind(key: &str, kind: &Object3DKind) -> bool {
+    let is_core = matches!(
         key,
         "name"
             | "enabled"
@@ -1113,49 +1442,8 @@ pub(super) fn is_known_object3d_prop(key: &str) -> bool {
             | "rotation"
             | "scale"
             | "eulerOrder"
-            | "geometryProperties"
-            | "modelProperties"
-            | "shake"
-            | "shakeAmplitude"
-            | "shakeSpeed"
-            | "active"
-            | "projection"
-            | "focalLength"
-            | "filmGate"
-            | "zoom"
-            | "filmOffsetX"
-            | "filmOffsetY"
-            | "fov"
-            | "near"
-            | "far"
-            | "depthOfField"
-            | "vibrate"
-            | "motionBlur"
-            | "dof"
-            | "dofFocusDistance"
-            | "dofAperture"
-            | "dofFocusAreaWidth"
-            | "dofNearBlurLevel"
-            | "dofFarBlurLevel"
-            | "reflectionVisibility"
-            | "text"
-            | "font"
-            | "size"
-            | "detail"
-            | "bevel"
-            | "bevelSize"
-            | "positionMode"
-            | "spacing"
-            | "characterIndexOffset"
-            | "characterCountOverride"
-            | "bevelSide"
-            | "bevelDetail"
-            | "bevelProfile"
-            | "bevelTension"
-            | "zoidiumTextScaleMode"
             | "zoidiumUvMode"
             | "zoidiumShadowMode"
-            | "zoidiumCastShadows"
             | "zoidiumId"
             | "zoidiumTrackTo"
             | "zoidiumTrackAxis"
@@ -1170,33 +1458,119 @@ pub(super) fn is_known_object3d_prop(key: &str) -> bool {
             | "zoidiumFollowRotationOffset"
             | "zoidiumFollowScaleOffset"
             | "zoidiumFollowFallback"
-            | "color"
-            | "groundColor"
-            | "target"
-            | "intensity"
-            | "angle"
-            | "time"
-            | "number"
-            | "rate"
-            | "lifetime"
-            | "pdist"
-            | "ipos"
-            | "pspread"
-            | "iradius"
-            | "rspread"
-            | "vdist"
-            | "ivel"
-            | "vspread"
-            | "irvel"
-            | "rvspread"
-            | "accel"
-            | "iang"
-            | "aspread"
-            | "angvel"
-            | "avspread"
-            | "blending"
-            | "texture"
-    )
+    );
+    if is_core {
+        return true;
+    }
+    match kind {
+        Object3DKind::Group { .. } => {
+            matches!(
+                key,
+                "reflectionVisibility" | "customProperties" | "userProperties" | "extraProperties"
+            )
+        }
+        Object3DKind::Shape3D(_) => {
+            matches!(key, "geometryProperties" | "zoidiumCastShadows")
+        }
+        Object3DKind::Model(_) => {
+            matches!(
+                key,
+                "modelProperties"
+                    | "zoidiumCastShadows"
+                    | "asset"
+                    | "assetId"
+                    | "model"
+                    | "customGeometry"
+                    | "file"
+                    | "src"
+            )
+        }
+        Object3DKind::Text3D(_) => matches!(
+            key,
+            "text"
+                | "font"
+                | "size"
+                | "detail"
+                | "bevel"
+                | "bevelSize"
+                | "positionMode"
+                | "spacing"
+                | "characterIndexOffset"
+                | "characterCountOverride"
+                | "bevelSide"
+                | "bevelDetail"
+                | "bevelProfile"
+                | "bevelTension"
+                | "zoidiumTextScaleMode"
+                | "zoidiumCastShadows"
+        ),
+        Object3DKind::Camera(_) => matches!(
+            key,
+            "shake"
+                | "shakeAmplitude"
+                | "shakeSpeed"
+                | "active"
+                | "projection"
+                | "focalLength"
+                | "filmGate"
+                | "zoom"
+                | "filmOffsetX"
+                | "filmOffsetY"
+                | "fov"
+                | "near"
+                | "far"
+                | "depthOfField"
+                | "vibrate"
+                | "motionBlur"
+                | "dof"
+                | "dofFocusDistance"
+                | "dofAperture"
+                | "dofFocusAreaWidth"
+                | "dofNearBlurLevel"
+                | "dofFarBlurLevel"
+        ),
+        Object3DKind::Light(_) => matches!(
+            key,
+            "color"
+                | "groundColor"
+                | "target"
+                | "intensity"
+                | "angle"
+                | "zoidiumCastShadows"
+                | "shadowMapSize"
+                | "zoidiumShadowMapSize"
+                | "shadow_map_size"
+                | "shadowBias"
+                | "zoidiumShadowBias"
+                | "shadow_bias"
+        ),
+        Object3DKind::Particles(_) => matches!(
+            key,
+            "time"
+                | "number"
+                | "rate"
+                | "lifetime"
+                | "pdist"
+                | "ipos"
+                | "pspread"
+                | "iradius"
+                | "rspread"
+                | "vdist"
+                | "ivel"
+                | "vspread"
+                | "irvel"
+                | "rvspread"
+                | "accel"
+                | "iang"
+                | "aspread"
+                | "angvel"
+                | "avspread"
+                | "blending"
+                | "texture"
+                | "zoidiumCastShadows"
+        ),
+        Object3DKind::Dummy { .. } => false,
+    }
 }
 
 pub(super) fn parse_shape3d_object(
@@ -1505,6 +1879,20 @@ pub(super) fn parse_light_data(props: Option<&Map<String, Value>>, sub_type: u32
     if let Some(v) = prop_track_f64(props, "distance") {
         light.distance = v;
     }
+    if let Some(v) = props
+        .get("shadowMapSize")
+        .or_else(|| props.get("zoidiumShadowMapSize"))
+        .or_else(|| props.get("shadow_map_size"))
+        .and_then(prop_track_u32_val)
+    {
+        light.shadow_map_size = v.clamp(64, 4096);
+    }
+    if let Some(v) = prop_track_f64(props, "shadowBias")
+        .or_else(|| prop_track_f64(props, "zoidiumShadowBias"))
+        .or_else(|| prop_track_f64(props, "shadow_bias"))
+    {
+        light.shadow_bias = v.clamp(-1.0, 1.0);
+    }
     light
 }
 
@@ -1654,11 +2042,11 @@ pub(super) fn parse_camera_data(
         if let Some(v) = vib_obj.get("rotationFrequency") {
             vib.rotation_frequency = parse_property_track(v, PropertyValue::Number(2.0));
         }
-        if let Some(v) = vib_obj.get("frequency")
-            && !vib_obj.contains_key("positionFrequency")
-        {
+        if let Some(v) = vib_obj.get("frequency") {
             vib.frequency = parse_property_track(v, PropertyValue::Number(2.0));
-            vib.position_frequency = vib.frequency.clone();
+            if !vib_obj.contains_key("positionFrequency") {
+                vib.position_frequency = vib.frequency.clone();
+            }
             if !vib_obj.contains_key("rotationFrequency") {
                 vib.rotation_frequency = vib.frequency.clone();
             }
@@ -2015,4 +2403,160 @@ pub(crate) fn remap_scene_constraint_targets(objects: &mut [Object3D]) {
         &name_to_uuid,
         &current_uuids,
     );
+}
+
+fn extract_asset_str(val: &Value) -> Option<String> {
+    if let Some(s) = val.as_str() {
+        let trimmed = s.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    }
+    let obj = val.as_object()?;
+    if let Some(v) = obj.get("value") {
+        return extract_asset_str(v);
+    }
+    if let Some(kfs) = obj.get("keyframes").and_then(Value::as_array) {
+        return kfs
+            .first()
+            .and_then(|kf| kf.get("value").or_else(|| kf.get("v")))
+            .and_then(extract_asset_str);
+    }
+    None
+}
+
+fn extract_model_asset_id(
+    obj: &Map<String, Value>,
+    props: Option<&Map<String, Value>>,
+) -> Option<String> {
+    let model_props = props
+        .and_then(|p| p.get("modelProperties"))
+        .and_then(Value::as_object);
+    for key in ["asset", "assetId", "model", "customGeometry", "file", "src"] {
+        if let Some(id) = props.and_then(|p| p.get(key)).and_then(extract_asset_str) {
+            return Some(id);
+        }
+        if let Some(id) = model_props
+            .and_then(|mp| mp.get(key))
+            .and_then(extract_asset_str)
+        {
+            return Some(id);
+        }
+        if let Some(id) = obj.get(key).and_then(extract_asset_str) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_object3d_resolves_model_asset_id_torus_knot_and_numeric_fx_types() {
+        let mut plugins = BTreeSet::new();
+        let mut warnings = Vec::new();
+
+        // 1. Model with asset_id across alias keys
+        for key in ["asset", "assetId", "model", "file", "src"] {
+            let val = json!({
+                "type": 2,
+                "objectType": 0,
+                "properties": {
+                    "name": "MeshModel",
+                    key: "mesh_sha256_abc"
+                }
+            });
+            let obj = parse_object3d(&val, &mut plugins, &mut warnings);
+            let Object3DKind::Model(m) = obj.kind else {
+                panic!("expected Model for key {key}");
+            };
+            assert_eq!(m.asset_id.as_deref(), Some("mesh_sha256_abc"));
+            assert_eq!(m.preset_type, None);
+        }
+
+        // 2. TorusKnot imports as Shape3DKind::TorusKnot (not Dummy)
+        let tk_val = json!({
+            "type": "zoidium:geometry-plus/torus-knot",
+            "properties": {
+                "name": "Knot",
+                "radius": 8.0,
+                "tube": 2.0,
+                "tubularSegments": 96,
+                "radialSegments": 16,
+                "p": 3,
+                "q": 5
+            }
+        });
+        let tk = parse_object3d(&tk_val, &mut plugins, &mut warnings);
+        assert!(matches!(
+            tk.kind,
+            Object3DKind::Shape3D(Shape3DKind::TorusKnot {
+                radius,
+                tube,
+                tubular_segments: 96,
+                radial_segments: 16,
+                p: 3,
+                q: 5,
+            }) if (radius - 8.0).abs() < 1e-9 && (tube - 2.0).abs() < 1e-9
+        ));
+
+        // 3. Numeric types 10, 11, 12, 13 + Portal Light import with zero warnings
+        for (num, expected_tag) in [
+            (10u32, "zoidium:trapcode-suite/particular"),
+            (11, "zoidium:trapcode-suite/form"),
+            (12, "zoidium:trapcode-suite/plexus"),
+            (13, "zoidium:optical-flares/flare"),
+        ] {
+            let val = json!({ "type": num, "properties": { "name": format!("FX {num}") } });
+            let parsed = parse_object3d(&val, &mut plugins, &mut warnings);
+            assert_eq!(
+                parsed.preserved.get("type").and_then(Value::as_str),
+                Some(expected_tag)
+            );
+            assert_eq!(
+                parsed
+                    .preserved
+                    .get("zoidiumPluginObjectType")
+                    .and_then(Value::as_str),
+                Some(expected_tag)
+            );
+            assert!(matches!(
+                parsed.kind,
+                Object3DKind::Dummy {
+                    original_type: Some(ref t),
+                    ..
+                } if t == expected_tag
+            ));
+        }
+
+        for portal_ty in ["zoidium:light-plus/portal-light", "Portal Light"] {
+            let val = json!({
+                "type": portal_ty,
+                "properties": {
+                    "name": "Portal",
+                    "shadowMapSize": 2048,
+                    "shadowBias": 0.004
+                }
+            });
+            let parsed = parse_object3d(&val, &mut plugins, &mut warnings);
+            let Object3DKind::Light(l) = parsed.kind else {
+                panic!("expected Light for {portal_ty}");
+            };
+            assert_eq!(l.shadow_map_size, 2048);
+            assert!((l.shadow_bias - 0.004).abs() < 1e-9);
+            assert_eq!(
+                parsed
+                    .preserved
+                    .get("zoidiumPluginObjectType")
+                    .and_then(Value::as_str),
+                Some("zoidium:light-plus/portal-light")
+            );
+        }
+
+        assert!(
+            warnings.is_empty(),
+            "expected zero warnings, got {warnings:?}"
+        );
+    }
 }

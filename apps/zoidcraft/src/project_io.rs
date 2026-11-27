@@ -20,6 +20,502 @@ pub(crate) const ZOIDCRAFT_ENABLED_PLUGINS_KEY: &str = "zoidcraftEnabledPlugins"
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) const AUTOSAVE_EXTERNALIZE_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
 
+/// `localStorage` metadata key for browser autosave snapshots.
+#[cfg(target_arch = "wasm32")]
+pub(crate) const WEB_AUTOSAVE_META_KEY: &str = "zoidcraft.autosave.v1.meta";
+
+/// `localStorage` chunk key prefix (`{WEB_AUTOSAVE_CHUNK_PREFIX}{index}`).
+#[cfg(target_arch = "wasm32")]
+pub(crate) const WEB_AUTOSAVE_CHUNK_PREFIX: &str = "zoidcraft.autosave.v1.chunk.";
+
+/// Maximum characters stored per `localStorage` chunk key (512 KiB).
+#[cfg(target_arch = "wasm32")]
+pub(crate) const WEB_AUTOSAVE_CHUNK_CHARS: usize = 512 * 1024;
+
+/// Maximum total base64-encoded bytes permitted for a browser autosave snapshot (~4 MiB,
+/// staying comfortably within standard 5 MiB `localStorage` quotas).
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const WEB_AUTOSAVE_MAX_ENCODED_BYTES: usize = 4 * 1024 * 1024;
+
+/// Threshold above which embedded assets are externalized in web autosave fallback snapshots.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const WEB_AUTOSAVE_EXTERNALIZE_THRESHOLD_BYTES: usize = 256 * 1024;
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) const WEB_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
+
+// ---------------------------------------------------------------------------
+// Base64 & Chunked Web Autosave Codec (Zero External Crates)
+// ---------------------------------------------------------------------------
+
+#[cfg(any(target_arch = "wasm32", test))]
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn encode_base64(input: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = if chunk.len() > 1 {
+            u32::from(chunk[1])
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            u32::from(chunk[2])
+        } else {
+            0
+        };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(BASE64_ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(BASE64_ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(BASE64_ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(BASE64_ALPHABET[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    let mut clean = Vec::with_capacity(input.len());
+    for b in input.bytes() {
+        if !b.is_ascii_whitespace() {
+            clean.push(b);
+        }
+    }
+    if !clean.len().is_multiple_of(4) {
+        return Err("invalid base64 length".to_owned());
+    }
+    let decode_val = |b: u8| -> Result<u32, String> {
+        match b {
+            b'A'..=b'Z' => Ok(u32::from(b - b'A')),
+            b'a'..=b'z' => Ok(u32::from(b - b'a') + 26),
+            b'0'..=b'9' => Ok(u32::from(b - b'0') + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(format!("invalid base64 byte: 0x{b:02x}")),
+        }
+    };
+    let mut out = Vec::with_capacity((clean.len() / 4) * 3);
+    for (idx, chunk) in clean.as_chunks::<4>().0.iter().enumerate() {
+        let is_last = (idx + 1) * 4 == clean.len();
+        let pad = if chunk[2] == b'=' && chunk[3] == b'=' {
+            if !is_last {
+                return Err("unexpected base64 padding before end".to_owned());
+            }
+            2
+        } else if chunk[3] == b'=' {
+            if !is_last {
+                return Err("unexpected base64 padding before end".to_owned());
+            }
+            1
+        } else {
+            0
+        };
+        let v0 = decode_val(chunk[0])?;
+        let v1 = decode_val(chunk[1])?;
+        let v2 = if pad == 2 { 0 } else { decode_val(chunk[2])? };
+        let v3 = if pad >= 1 { 0 } else { decode_val(chunk[3])? };
+        let triple = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+        out.push(((triple >> 16) & 0xFF) as u8);
+        if pad < 2 {
+            out.push(((triple >> 8) & 0xFF) as u8);
+        }
+        if pad == 0 {
+            out.push((triple & 0xFF) as u8);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn clone_project_with_asset_byte_cap(src: &Project, max_asset_bytes: usize) -> Project {
+    let mut assets = BTreeMap::new();
+    for (k, rec) in &src.assets {
+        let drop_bytes = rec
+            .bytes
+            .as_ref()
+            .is_some_and(|b| b.len() > max_asset_bytes);
+        let copy = if drop_bytes {
+            AssetRecord {
+                id: rec.id.clone(),
+                kind: rec.kind,
+                source: rec.source,
+                filename: rec.filename.clone(),
+                url: rec.url.clone(),
+                external: true,
+                bytes: None,
+                missing: true,
+                sha256: rec.sha256.clone(),
+                size: rec.size,
+                preserved: rec.preserved.clone(),
+            }
+        } else {
+            rec.clone()
+        };
+        assets.insert(k.clone(), copy);
+    }
+    Project {
+        version: src.version,
+        name: src.name.clone(),
+        assets,
+        media: src.media.clone(),
+        sequence: src.sequence.clone(),
+        compositions: src.compositions.clone(),
+        composition_ids: src.composition_ids.clone(),
+        plugin_requirements: src.plugin_requirements.clone(),
+        imported_from_pz_version: src.imported_from_pz_version,
+        preserved: src.preserved.clone(),
+    }
+}
+
+/// Encodes `project` into size-guarded, chunked base64 + JSON metadata suitable for browser
+/// `window.localStorage` persistence. Automatically externalizes large embedded assets if the
+/// full archive would exceed `max_encoded_bytes`.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn encode_web_autosave_chunks(
+    project: &Project,
+    timestamp_secs: u64,
+    max_encoded_bytes: usize,
+    chunk_chars: usize,
+) -> Result<(String, Vec<String>, u64), String> {
+    let step = chunk_chars.max(1024);
+    let mut assets_externalized = false;
+    let mut raw_bytes = zc_project::save_zcraft_to_bytes(project)
+        .map_err(|e| format!("failed to serialize web autosave snapshot: {e}"))?;
+    let mut encoded = encode_base64(&raw_bytes);
+
+    if encoded.len() > max_encoded_bytes {
+        let trimmed =
+            clone_project_with_asset_byte_cap(project, WEB_AUTOSAVE_EXTERNALIZE_THRESHOLD_BYTES);
+        raw_bytes = zc_project::save_zcraft_to_bytes(&trimmed)
+            .map_err(|e| format!("failed to serialize trimmed web autosave snapshot: {e}"))?;
+        encoded = encode_base64(&raw_bytes);
+        assets_externalized = true;
+    }
+
+    if encoded.len() > max_encoded_bytes {
+        let metadata_only = clone_project_with_asset_byte_cap(project, 0);
+        raw_bytes = zc_project::save_zcraft_to_bytes(&metadata_only)
+            .map_err(|e| format!("failed to serialize lightweight web autosave snapshot: {e}"))?;
+        encoded = encode_base64(&raw_bytes);
+        assets_externalized = true;
+    }
+
+    if encoded.len() > max_encoded_bytes {
+        return Err(format!(
+            "web autosave snapshot ({} bytes encoded) exceeds browser storage budget ({} bytes)",
+            encoded.len(),
+            max_encoded_bytes
+        ));
+    }
+
+    let chunks: Vec<String> = encoded
+        .as_bytes()
+        .chunks(step)
+        .map(|slice| std::str::from_utf8(slice).unwrap_or_default().to_owned())
+        .collect();
+    let digest = sha256_hex(&raw_bytes);
+    let raw_len = raw_bytes.len() as u64;
+    let meta = json!({
+        "version": 1_u32,
+        "project_name": project.name,
+        "timestamp_secs": timestamp_secs,
+        "raw_bytes": raw_len,
+        "chunks": chunks.len(),
+        "sha256": digest,
+        "assets_externalized": assets_externalized,
+    });
+    let meta_json =
+        serde_json::to_string(&meta).map_err(|e| format!("failed to encode autosave meta: {e}"))?;
+    Ok((meta_json, chunks, raw_len))
+}
+
+/// Validates and decodes chunked base64 + JSON metadata produced by [`encode_web_autosave_chunks`].
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn decode_web_autosave_chunks(
+    meta_json: &str,
+    chunks: &[String],
+) -> Result<(Project, u64, u64), String> {
+    let meta: Value = serde_json::from_str(meta_json)
+        .map_err(|e| format!("invalid web autosave metadata: {e}"))?;
+    let version = meta.get("version").and_then(Value::as_u64).unwrap_or(0);
+    if version != 1 {
+        return Err(format!("unsupported web autosave version: {version}"));
+    }
+    let expected_chunks = meta
+        .get("chunks")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "web autosave metadata missing chunk count".to_owned())?
+        as usize;
+    if expected_chunks == 0 || chunks.len() != expected_chunks {
+        return Err(format!(
+            "web autosave chunk count mismatch (expected {expected_chunks}, got {})",
+            chunks.len()
+        ));
+    }
+    let expected_sha = meta
+        .get("sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "web autosave metadata missing sha256".to_owned())?;
+    let timestamp_secs = meta
+        .get("timestamp_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let total_len: usize = chunks.iter().map(String::len).sum();
+    let mut joined = String::with_capacity(total_len);
+    for chunk in chunks {
+        joined.push_str(chunk);
+    }
+    let raw_bytes = decode_base64(&joined)?;
+    let actual_sha = sha256_hex(&raw_bytes);
+    if actual_sha != expected_sha {
+        return Err("web autosave snapshot failed SHA-256 integrity check".to_owned());
+    }
+    let project = zc_project::load_zcraft_from_bytes(&raw_bytes)
+        .map_err(|e| format!("failed to load web autosave project: {e}"))?;
+    Ok((project, timestamp_secs, raw_bytes.len() as u64))
+}
+
+#[cfg(target_arch = "wasm32")]
+static WEB_UNSAVED_DIRTY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_arch = "wasm32")]
+static WEB_BEFOREUNLOAD_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_arch = "wasm32")]
+struct WebAutosaveRuntime {
+    startup_checked: bool,
+    last_autosave_at: Instant,
+    last_autosave_revision: u64,
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static WEB_AUTOSAVE_RUNTIME: std::cell::RefCell<WebAutosaveRuntime> =
+        std::cell::RefCell::new(WebAutosaveRuntime {
+            startup_checked: false,
+            last_autosave_at: Instant::now(),
+            last_autosave_revision: 0,
+        });
+}
+
+/// Updates the global unsaved-changes flag read by the browser `beforeunload` listener.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn set_web_unsaved_dirty(dirty: bool) {
+    WEB_UNSAVED_DIRTY.store(dirty, Ordering::Relaxed);
+}
+
+/// Registers a single idempotent `window` `beforeunload` handler that prompts the user before
+/// leaving or closing the tab whenever [`set_web_unsaved_dirty`] is `true`.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn register_web_beforeunload_guard() -> bool {
+    use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+
+    if WEB_BEFOREUNLOAD_REGISTERED.swap(true, Ordering::SeqCst) {
+        return true;
+    }
+    let Some(window) = web_sys::window() else {
+        WEB_BEFOREUNLOAD_REGISTERED.store(false, Ordering::SeqCst);
+        return false;
+    };
+    let window_js: &JsValue = window.as_ref();
+    let Ok(add_listener_val) =
+        js_sys::Reflect::get(window_js, &JsValue::from_str("addEventListener"))
+    else {
+        WEB_BEFOREUNLOAD_REGISTERED.store(false, Ordering::SeqCst);
+        return false;
+    };
+    let Ok(add_listener) = add_listener_val.dyn_into::<js_sys::Function>() else {
+        WEB_BEFOREUNLOAD_REGISTERED.store(false, Ordering::SeqCst);
+        return false;
+    };
+
+    let handler = Closure::<dyn FnMut(JsValue)>::new(move |event: JsValue| {
+        if !WEB_UNSAVED_DIRTY.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(prevent) = js_sys::Reflect::get(&event, &JsValue::from_str("preventDefault"))
+            && let Ok(func) = prevent.dyn_into::<js_sys::Function>()
+        {
+            let _ = func.call0(&event);
+        }
+        let _ = js_sys::Reflect::set(
+            &event,
+            &JsValue::from_str("returnValue"),
+            &JsValue::from_str(""),
+        );
+    });
+
+    let attached = add_listener
+        .call2(
+            window_js,
+            &JsValue::from_str("beforeunload"),
+            handler.as_ref(),
+        )
+        .is_ok();
+    if attached {
+        handler.forget();
+        true
+    } else {
+        WEB_BEFOREUNLOAD_REGISTERED.store(false, Ordering::SeqCst);
+        false
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_local_storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.local_storage().ok().flatten())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_web_autosave_chunk_count(storage: &web_sys::Storage) -> usize {
+    storage
+        .get_item(WEB_AUTOSAVE_META_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|meta| meta.get("chunks").and_then(Value::as_u64))
+        .unwrap_or(0) as usize
+}
+
+/// Saves a chunked, quota-guarded recovery snapshot of `session` into browser `localStorage`.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn save_web_autosave_snapshot(
+    session: &Session,
+) -> Result<RecoverySnapshotInfo, String> {
+    let storage =
+        web_local_storage().ok_or_else(|| "Browser localStorage is unavailable".to_owned())?;
+    let project = prepare_project_for_zcraft_save(session);
+    let timestamp_secs = (js_sys::Date::now() / 1000.0).max(0.0) as u64;
+    let (meta_json, chunks, raw_len) = encode_web_autosave_chunks(
+        &project,
+        timestamp_secs,
+        WEB_AUTOSAVE_MAX_ENCODED_BYTES,
+        WEB_AUTOSAVE_CHUNK_CHARS,
+    )?;
+
+    let prev_chunks = read_web_autosave_chunk_count(&storage);
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let key = format!("{WEB_AUTOSAVE_CHUNK_PREFIX}{idx}");
+        if storage.set_item(&key, chunk).is_err() {
+            // Roll back partial chunks beyond previous snapshot if quota was hit mid-write.
+            for cleanup_idx in 0..=idx {
+                let cleanup_key = format!("{WEB_AUTOSAVE_CHUNK_PREFIX}{cleanup_idx}");
+                let _ = storage.remove_item(&cleanup_key);
+            }
+            let _ = storage.remove_item(WEB_AUTOSAVE_META_KEY);
+            return Err("Browser localStorage quota exceeded while saving autosave".to_owned());
+        }
+    }
+    if storage.set_item(WEB_AUTOSAVE_META_KEY, &meta_json).is_err() {
+        for idx in 0..chunks.len() {
+            let key = format!("{WEB_AUTOSAVE_CHUNK_PREFIX}{idx}");
+            let _ = storage.remove_item(&key);
+        }
+        return Err(
+            "Browser localStorage quota exceeded while writing autosave metadata".to_owned(),
+        );
+    }
+    for stale_idx in chunks.len()..prev_chunks {
+        let key = format!("{WEB_AUTOSAVE_CHUNK_PREFIX}{stale_idx}");
+        let _ = storage.remove_item(&key);
+    }
+
+    Ok(RecoverySnapshotInfo {
+        filename: format!("browser-autosave-{timestamp_secs}.zcraft"),
+        timestamp_secs,
+        size_bytes: raw_len,
+        path: PathBuf::from(WEB_AUTOSAVE_META_KEY),
+    })
+}
+
+/// Reads lightweight metadata for an existing browser `localStorage` recovery snapshot without
+/// decoding the full project archive.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn peek_web_autosave_info() -> Option<RecoverySnapshotInfo> {
+    let storage = web_local_storage()?;
+    let meta_json = storage.get_item(WEB_AUTOSAVE_META_KEY).ok()??;
+    let meta: Value = serde_json::from_str(&meta_json).ok()?;
+    if meta.get("version").and_then(Value::as_u64) != Some(1) {
+        return None;
+    }
+    let chunk_count = meta.get("chunks").and_then(Value::as_u64)? as usize;
+    if chunk_count == 0 {
+        return None;
+    }
+    // Quick check that the first chunk exists before advertising recovery.
+    storage
+        .get_item(&format!("{WEB_AUTOSAVE_CHUNK_PREFIX}0"))
+        .ok()??;
+    let timestamp_secs = meta
+        .get("timestamp_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let size_bytes = meta.get("raw_bytes").and_then(Value::as_u64).unwrap_or(0);
+    Some(RecoverySnapshotInfo {
+        filename: format!("browser-autosave-{timestamp_secs}.zcraft"),
+        timestamp_secs,
+        size_bytes,
+        path: PathBuf::from(WEB_AUTOSAVE_META_KEY),
+    })
+}
+
+/// Loads and verifies the saved browser `localStorage` autosave [`Project`] snapshot.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn load_web_autosave_snapshot() -> Result<Project, String> {
+    let storage =
+        web_local_storage().ok_or_else(|| "Browser localStorage is unavailable".to_owned())?;
+    let meta_json = storage
+        .get_item(WEB_AUTOSAVE_META_KEY)
+        .ok()
+        .flatten()
+        .ok_or_else(|| "No browser autosave snapshot found".to_owned())?;
+    let meta: Value = serde_json::from_str(&meta_json)
+        .map_err(|e| format!("invalid browser autosave metadata: {e}"))?;
+    let chunk_count = meta
+        .get("chunks")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "browser autosave metadata missing chunk count".to_owned())?
+        as usize;
+    let mut chunks = Vec::with_capacity(chunk_count);
+    for idx in 0..chunk_count {
+        let key = format!("{WEB_AUTOSAVE_CHUNK_PREFIX}{idx}");
+        let chunk = storage
+            .get_item(&key)
+            .ok()
+            .flatten()
+            .ok_or_else(|| format!("missing browser autosave chunk {idx}"))?;
+        chunks.push(chunk);
+    }
+    let (project, _, _) = decode_web_autosave_chunks(&meta_json, &chunks)?;
+    Ok(project)
+}
+
+/// Removes any stored browser `localStorage` autosave snapshot and all of its chunks.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn clear_web_autosave_snapshot() {
+    let Some(storage) = web_local_storage() else {
+        return;
+    };
+    let count = read_web_autosave_chunk_count(&storage).max(16);
+    for idx in 0..count {
+        let key = format!("{WEB_AUTOSAVE_CHUNK_PREFIX}{idx}");
+        let _ = storage.remove_item(&key);
+    }
+    let _ = storage.remove_item(WEB_AUTOSAVE_META_KEY);
+}
+
 // ---------------------------------------------------------------------------
 // Top-Level ZoidCraft Desktop Application
 // ---------------------------------------------------------------------------
@@ -552,6 +1048,91 @@ impl ZoidCraftApp {
             self.last_title = title.clone();
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.maybe_init_web_persistence();
+            set_web_unsaved_dirty(self.needs_confirmation_before_replace_or_close());
+            self.maybe_periodic_web_autosave(ctx);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn maybe_init_web_persistence(&mut self) {
+        let should_check = WEB_AUTOSAVE_RUNTIME.with(|rt| {
+            let mut rt = rt.borrow_mut();
+            if rt.startup_checked {
+                false
+            } else {
+                rt.startup_checked = true;
+                rt.last_autosave_at = Instant::now();
+                rt.last_autosave_revision = self.session.revision();
+                true
+            }
+        });
+        if should_check {
+            let _ = register_web_beforeunload_guard();
+            if self.startup_recovery_banner.is_none()
+                && !self.has_unsaved_changes()
+                && let Some(info) = peek_web_autosave_info()
+            {
+                self.startup_recovery_banner = Some(info);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn maybe_periodic_web_autosave(&mut self, ctx: &egui::Context) {
+        let rev = self.session.revision();
+        let needs_snapshot = self.session.is_dirty()
+            && WEB_AUTOSAVE_RUNTIME.with(|rt| rt.borrow().last_autosave_revision != rev);
+        if !needs_snapshot {
+            return;
+        }
+        let elapsed = WEB_AUTOSAVE_RUNTIME.with(|rt| rt.borrow().last_autosave_at.elapsed());
+        if elapsed >= WEB_AUTOSAVE_INTERVAL {
+            WEB_AUTOSAVE_RUNTIME.with(|rt| {
+                rt.borrow_mut().last_autosave_at = Instant::now();
+            });
+            if self.session.history.is_in_transaction() {
+                return;
+            }
+            match save_web_autosave_snapshot(&self.session) {
+                Ok(_) => {
+                    WEB_AUTOSAVE_RUNTIME.with(|rt| {
+                        rt.borrow_mut().last_autosave_revision = rev;
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!("web autosave snapshot failed: {err}");
+                }
+            }
+        } else {
+            ctx.request_repaint_after(Duration::from_secs(5));
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn handle_restore_web_autosave(&mut self) {
+        match load_web_autosave_snapshot() {
+            Ok(project) => {
+                let before_restore = self.session.snapshot();
+                self.load_project_into_session(project, None);
+                self.session
+                    .history
+                    .push("Restore Browser Autosave", before_restore);
+                self.startup_recovery_banner = None;
+                let rev = self.session.revision();
+                WEB_AUTOSAVE_RUNTIME.with(|rt| {
+                    let mut rt = rt.borrow_mut();
+                    rt.last_autosave_at = Instant::now();
+                    rt.last_autosave_revision = rev;
+                });
+                self.show_toast("Restored browser autosave snapshot");
+            }
+            Err(err) => {
+                self.show_toast(format!("Failed to restore browser autosave: {err}"));
+            }
+        }
     }
 
     pub(crate) fn reset_ephemeral_ui_state(&mut self) {
@@ -650,6 +1231,11 @@ impl ZoidCraftApp {
         self.session.playback.editing_camera = false;
         self.current_file = None;
         self.pending_unsaved_dialog = None;
+        #[cfg(target_arch = "wasm32")]
+        {
+            set_web_unsaved_dirty(false);
+            clear_web_autosave_snapshot();
+        }
         self.invalidate_project_hash_caches();
         self.cached_missing_plugins_revision = None;
         self.cached_missing_plugins.clear();
@@ -909,6 +1495,11 @@ impl ZoidCraftApp {
                 if include_assets {
                     self.current_file = Some(target_path.to_path_buf());
                     self.session.mark_saved();
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        set_web_unsaved_dirty(false);
+                        clear_web_autosave_snapshot();
+                    }
                 }
                 let name = target_path
                     .file_name()
@@ -1647,6 +2238,8 @@ impl ZoidCraftApp {
             if restore_clicked {
                 #[cfg(not(target_arch = "wasm32"))]
                 self.handle_restore_recovery_snapshot(&snap.path);
+                #[cfg(target_arch = "wasm32")]
+                self.handle_restore_web_autosave();
             } else if dismiss_clicked {
                 self.startup_recovery_banner = None;
             }
@@ -1721,5 +2314,102 @@ impl ZoidCraftApp {
                 self.status_toast = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod web_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn base64_roundtrip_handles_all_padding_lengths() {
+        for sample in [
+            b"".as_slice(),
+            b"a",
+            b"ab",
+            b"abc",
+            b"abcd",
+            b"ZoidCraft web persistence 0123456789+/=",
+            &[0x00, 0x01, 0x02, 0xfe, 0xff, 0x80, 0x7f],
+        ] {
+            let enc = encode_base64(sample);
+            let dec = decode_base64(&enc).expect("decode valid base64");
+            assert_eq!(dec, sample);
+        }
+        assert!(decode_base64("abc").is_err(), "bad length must fail");
+        assert!(decode_base64("!!!!").is_err(), "invalid char must fail");
+    }
+
+    #[test]
+    fn web_autosave_chunks_roundtrip_and_reject_corruption() {
+        let mut project = Project::new_cm3_default();
+        project.name = "WebRecoveryDemo".to_owned();
+        let aid = project.insert_binary_asset(
+            AssetKind::Image,
+            "badge.png",
+            vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4],
+        );
+
+        let (meta_json, mut chunks, raw_len) = encode_web_autosave_chunks(
+            &project,
+            1_730_000_000,
+            WEB_AUTOSAVE_MAX_ENCODED_BYTES,
+            1024,
+        )
+        .expect("encode web autosave chunks");
+        assert!(raw_len > 0);
+        assert!(!chunks.is_empty());
+
+        let (restored, ts, decoded_len) =
+            decode_web_autosave_chunks(&meta_json, &chunks).expect("decode web autosave chunks");
+        assert_eq!(ts, 1_730_000_000);
+        assert_eq!(decoded_len, raw_len);
+        assert_eq!(restored.name, "WebRecoveryDemo");
+        assert_eq!(
+            restored.assets.get(&aid).and_then(|a| a.bytes.as_deref()),
+            Some([0x89, b'P', b'N', b'G', 1, 2, 3, 4].as_slice())
+        );
+
+        // Corrupt a byte in the first chunk and ensure SHA-256 verification fails.
+        if let Some(first) = chunks.first_mut() {
+            let flipped = if first.starts_with('A') { 'B' } else { 'A' };
+            first.replace_range(0..1, &flipped.to_string());
+        }
+        assert!(
+            decode_web_autosave_chunks(&meta_json, &chunks).is_err(),
+            "corrupted chunk must fail integrity check"
+        );
+    }
+
+    #[test]
+    fn web_autosave_externalizes_oversized_assets_to_stay_within_quota() {
+        let mut project = Project::new_cm3_default();
+        project.name = "QuotaFallback".to_owned();
+        // Create pseudo-random incompressible payload that exceeds a tight 16 KiB test quota.
+        let mut big = Vec::with_capacity(24 * 1024);
+        let mut state: u32 = 0x1234_5678;
+        for _ in 0..(24 * 1024) {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            big.push((state >> 24) as u8);
+        }
+        let aid = project.insert_binary_asset(AssetKind::Av, "clip.mp4", big);
+
+        let (meta_json, chunks, _) =
+            encode_web_autosave_chunks(&project, 1_730_000_123, 16 * 1024, 2048)
+                .expect("fallback metadata-only snapshot must fit within quota");
+        let meta: Value = serde_json::from_str(&meta_json).expect("meta json");
+        assert_eq!(
+            meta.get("assets_externalized").and_then(Value::as_bool),
+            Some(true)
+        );
+        let (restored, _, _) =
+            decode_web_autosave_chunks(&meta_json, &chunks).expect("decode fallback snapshot");
+        assert_eq!(restored.name, "QuotaFallback");
+        let rec = restored
+            .assets
+            .get(&aid)
+            .expect("asset record preserved in fallback");
+        assert!(rec.external);
+        assert!(rec.bytes.is_none());
     }
 }

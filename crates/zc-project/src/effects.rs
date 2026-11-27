@@ -1585,6 +1585,21 @@ fn default_zoidium_params(id: &str) -> Option<BTreeMap<String, PropertyTrack>> {
             p.insert("labelFontSize".into(), PropertyTrack::number(20.0));
             p.insert("labelColor".into(), PropertyTrack::color([1.0, 1.0, 1.0]));
             p.insert("labelOpacity".into(), PropertyTrack::number(1.0));
+            for n in 1..=6 {
+                p.insert(
+                    format!("point{n}Enable"),
+                    PropertyTrack::option(if n == 1 { 1 } else { 0 }),
+                );
+                p.insert(format!("point{n}X"), PropertyTrack::number(50.0));
+                p.insert(format!("point{n}Y"), PropertyTrack::number(50.0));
+                p.insert(format!("point{n}Size"), PropertyTrack::number(120.0));
+                p.insert(
+                    format!("point{n}Label"),
+                    PropertyTrack::text(format!("P{n}")),
+                );
+                p.insert(format!("point{n}LabelDX"), PropertyTrack::number(140.0));
+                p.insert(format!("point{n}LabelDY"), PropertyTrack::number(-80.0));
+            }
         }
         "ascii" => {
             p.insert(
@@ -1598,6 +1613,22 @@ fn default_zoidium_params(id: &str) -> Option<BTreeMap<String, PropertyTrack>> {
             p.insert("charSize".into(), PropertyTrack::number(18.0));
             p.insert("charset".into(), PropertyTrack::option(0));
             p.insert("customChars".into(), PropertyTrack::text("@%#*+=-:. "));
+            p.insert("blackFill".into(), PropertyTrack::text("@"));
+            p.insert("blackStroke".into(), PropertyTrack::text(""));
+            p.insert("blackColor".into(), PropertyTrack::color([1.0, 0.16, 0.16]));
+            p.insert("blackOpacity".into(), PropertyTrack::number(1.0));
+            p.insert("whiteFill".into(), PropertyTrack::text("#"));
+            p.insert("whiteStroke".into(), PropertyTrack::text(""));
+            p.insert("whiteColor".into(), PropertyTrack::color([1.0, 0.35, 0.35]));
+            p.insert("whiteOpacity".into(), PropertyTrack::number(1.0));
+            p.insert("greyFill".into(), PropertyTrack::text("+"));
+            p.insert("greyStroke".into(), PropertyTrack::text(""));
+            p.insert("greyColor".into(), PropertyTrack::color([0.75, 0.2, 0.2]));
+            p.insert("greyOpacity".into(), PropertyTrack::number(1.0));
+            p.insert("alphaFill".into(), PropertyTrack::text(" "));
+            p.insert("alphaStroke".into(), PropertyTrack::text(""));
+            p.insert("alphaColor".into(), PropertyTrack::color([1.0, 1.0, 1.0]));
+            p.insert("alphaOpacity".into(), PropertyTrack::number(1.0));
             p.insert("colorMode".into(), PropertyTrack::option(0));
             p.insert(
                 "duotoneDark".into(),

@@ -581,7 +581,6 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
     );
     let env_u = atan2(refl_dir.z, refl_dir.x) * RECIPROCAL_PI2 + 0.5;
     let env_v = 1.0 - (asin(clamp(refl_dir.y, -1.0, 1.0)) * RECIPROCAL_PI + 0.5);
-    let env_sample = textureSample(env_tex, clamp_sampler, vec2<f32>(env_u, env_v));
 
     // Per-face material_slot filter and alpha test cutoff (strictly after all textureSample/derivative calls).
     if (slot_filter != 0xffffffffu && fin.material_slot != slot_filter) {
@@ -658,7 +657,7 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
     var indirect_diff_acc = vec3<f32>(0.0);
     var direct_spec_acc = vec3<f32>(0.0);
     var indirect_spec_acc = vec3<f32>(0.0);
-    var scene_ibl_energy = 0.0;
+    var direct_metal_irradiance_acc = vec3<f32>(0.0);
     let light_count = u32(clamp(u_scene.camera_pos_light_count.w, 0.0, 8.0));
 
     for (var i: u32 = 0u; i < light_count; i = i + 1u) {
@@ -672,7 +671,6 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
             indirect_diff_acc = indirect_diff_acc + diffuse_albedo * l_color;
             continue;
         }
-        scene_ibl_energy = scene_ibl_energy + max(light.color_intensity.w, 0.0);
         if (kind == 4u) {
             // Hemisphere: uses normalize(light.position) as sky direction per Three.js r91.
             let hemi_dir = safe_normalize(light.position_distance.xyz, vec3<f32>(0.0, 1.0, 0.0));
@@ -684,13 +682,168 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
         }
 
         var l_dir = vec3<f32>(0.0, 1.0, 0.0);
+        var spec_l_dir = vec3<f32>(0.0, 1.0, 0.0);
+        var area_alpha_boost = 0.0;
+        var area_spec_norm = 1.0;
         var atten = 1.0;
         var vis = 1.0;
         let shadow_slot = light.cos_inner_decay_penumbra.w;
 
-        if (kind == 3u) {
+        if (kind == 6u) {
+            // Rectangular Area Light (representative-point diffuse & Karis specular with solid-angle normalization).
+            let light_pos = light.position_distance.xyz;
+            let n_l = safe_normalize(light.direction_cos_outer.xyz, vec3<f32>(0.0, -1.0, 0.0));
+            let u_raw = light.ground_kind.xyz;
+            let u_ortho = u_raw - n_l * dot(u_raw, n_l);
+            let u_l = safe_normalize(u_ortho, vec3<f32>(1.0, 0.0, 0.0));
+            let v_l = safe_normalize(cross(n_l, u_l), vec3<f32>(0.0, 1.0, 0.0));
+            let hw = max(light.direction_cos_outer.w, 0.05);
+            let hh = max(light.cos_inner_decay_penumbra.x, 0.05);
+
+            let to_p = fin.world_pos - light_pos;
+            let cu = clamp(dot(to_p, u_l), -hw, hw);
+            let cv = clamp(dot(to_p, v_l), -hh, hh);
+            let closest_diff = light_pos + u_l * cu + v_l * cv;
+            let to_closest = closest_diff - fin.world_pos;
+            let dist_diff = max(length(to_closest), 0.05);
+            l_dir = to_closest / dist_diff;
+
+            let emit_cos = clamp(dot(-l_dir, n_l), 0.0, 1.0);
+            let area = 4.0 * hw * hh;
+            let solid_norm = area / (area + 0.25 * dist_diff * dist_diff);
+            atten = emit_cos * solid_norm;
+
+            let cutoff_dist = light.position_distance.w;
+            let decay = max(light.cos_inner_decay_penumbra.y, 0.0);
+            if (cutoff_dist > 0.0 && decay > 0.0) {
+                let ratio = clamp(1.0 - dist_diff / cutoff_dist, 0.0, 1.0);
+                atten = atten * select(pow(ratio, decay), 0.0, ratio <= 0.0);
+            }
+            if (atten <= 0.0) {
+                continue;
+            }
+
+            // Karis specular representative point: intersect reflection ray with area rectangle plane.
+            let r_ray = safe_normalize(reflect(-v_dir, n), n);
+            let r_dot_nl = dot(r_ray, n_l);
+            var spec_pt = closest_diff;
+            if (abs(r_dot_nl) > 1e-4) {
+                let t_hit = dot(light_pos - fin.world_pos, n_l) / r_dot_nl;
+                if (t_hit > 0.0) {
+                    let hit_p = fin.world_pos + r_ray * t_hit - light_pos;
+                    let su = clamp(dot(hit_p, u_l), -hw, hw);
+                    let sv = clamp(dot(hit_p, v_l), -hh, hh);
+                    spec_pt = light_pos + u_l * su + v_l * sv;
+                }
+            }
+            let to_spec = spec_pt - fin.world_pos;
+            let dist_spec = max(length(to_spec), 0.05);
+            spec_l_dir = to_spec / dist_spec;
+            let r_eff = sqrt(hw * hh);
+            area_alpha_boost = clamp(r_eff / (2.0 * dist_spec), 0.0, 0.75);
+            let base_alpha = roughness * roughness;
+            let eff_alpha = clamp(base_alpha + area_alpha_boost, 0.04, 1.0);
+            area_spec_norm = (base_alpha / eff_alpha) * (base_alpha / eff_alpha);
+
+            let n_dot_l_sh = max(dot(n, l_dir), 0.0);
+            if (n_dot_l_sh > 0.0 && shadow_slot >= 0.0 && shadow_slot < 4.0) {
+                vis = sample_shadow_2d_pcf(u32(shadow_slot + 0.5), fin.world_pos, n_dot_l_sh);
+            }
+        } else if (kind == 7u) {
+            // IES Photometric Light: 6-band vertical candela profile along actual light orientation.
+            let to_light = light.position_distance.xyz - fin.world_pos;
+            let dist = max(length(to_light), 1e-4);
+            l_dir = to_light / dist;
+            spec_l_dir = l_dir;
+
+            let cutoff_dist = light.position_distance.w;
+            let decay = max(light.cos_inner_decay_penumbra.y, 0.0);
+            if (cutoff_dist > 0.0 && decay > 0.0) {
+                let ratio = clamp(1.0 - dist / cutoff_dist, 0.0, 1.0);
+                atten = select(pow(ratio, decay), 0.0, ratio <= 0.0);
+            }
+
+            let ies_fwd = safe_normalize(light.direction_cos_outer.xyz, vec3<f32>(0.0, -1.0, 0.0));
+            let cos_theta = clamp(dot(-l_dir, ies_fwd), -1.0, 1.0);
+            let angle_rad = acos(cos_theta);
+            let norm_t = clamp(angle_rad / (PI * 0.5), 0.0, 1.0);
+            let seg_f = norm_t * 5.0;
+            let c0 = light.direction_cos_outer.w;
+            let c1 = light.ground_kind.x;
+            let c2 = light.ground_kind.y;
+            let c3 = light.ground_kind.z;
+            let c4 = light.cos_inner_decay_penumbra.x;
+            let c5 = light.cos_inner_decay_penumbra.z;
+            var candela = c5;
+            if (seg_f < 1.0) {
+                candela = mix(c0, c1, seg_f);
+            } else if (seg_f < 2.0) {
+                candela = mix(c1, c2, seg_f - 1.0);
+            } else if (seg_f < 3.0) {
+                candela = mix(c2, c3, seg_f - 2.0);
+            } else if (seg_f < 4.0) {
+                candela = mix(c3, c4, seg_f - 3.0);
+            } else {
+                candela = mix(c4, c5, seg_f - 4.0);
+            }
+            // Smoothly fade beyond 90 degrees horizon.
+            let back_fade = 1.0 - smoothstep(PI * 0.5, PI * 0.65, angle_rad);
+            atten = atten * max(candela, 0.0) * back_fade;
+            if (atten <= 0.0) {
+                continue;
+            }
+
+            let n_dot_l_sh = max(dot(n, l_dir), 0.0);
+            if (n_dot_l_sh > 0.0 && shadow_slot >= 0.0 && shadow_slot < 4.0) {
+                vis = sample_shadow_2d_pcf(u32(shadow_slot + 0.5), fin.world_pos, n_dot_l_sh);
+            }
+        } else if (kind == 8u) {
+            // Portal Light: oriented hemispherical sky/fill illumination along portal forward normal with rectangular falloff.
+            let light_pos = light.position_distance.xyz;
+            let n_p = safe_normalize(light.direction_cos_outer.xyz, vec3<f32>(0.0, 0.0, -1.0));
+            let u_raw = light.ground_kind.xyz;
+            let u_p = safe_normalize(u_raw - n_p * dot(u_raw, n_p), vec3<f32>(1.0, 0.0, 0.0));
+            let v_p = safe_normalize(cross(n_p, u_p), vec3<f32>(0.0, 1.0, 0.0));
+            let hw = max(light.direction_cos_outer.w, 0.05);
+            let hh = max(light.cos_inner_decay_penumbra.x, 0.05);
+
+            let to_p = fin.world_pos - light_pos;
+            let cu = clamp(dot(to_p, u_p), -hw, hw);
+            let cv = clamp(dot(to_p, v_p), -hh, hh);
+            let closest = light_pos + u_p * cu + v_p * cv;
+            let to_portal = closest - fin.world_pos;
+            let dist = max(length(to_portal), 0.1);
+            l_dir = to_portal / dist;
+
+            let front_dist = dot(to_p, n_p);
+            let span = max(hw, hh);
+            let forward_mask = smoothstep(-0.25 * span, 0.25 * span, front_dist);
+            let emit_cos = clamp(dot(-l_dir, n_p) * 0.75 + 0.25, 0.0, 1.0);
+            let area = 4.0 * hw * hh;
+            let rect_falloff = area / (area + 0.18 * dist * dist);
+            var portal_atten = forward_mask * emit_cos * rect_falloff;
+
+            let cutoff_dist = light.position_distance.w;
+            let decay = max(light.cos_inner_decay_penumbra.y, 0.0);
+            if (cutoff_dist > 0.0 && decay > 0.0) {
+                let ratio = clamp(1.0 - dist / cutoff_dist, 0.0, 1.0);
+                portal_atten = portal_atten * select(pow(ratio, decay), 0.0, ratio <= 0.0);
+            }
+            if (portal_atten <= 0.0) {
+                continue;
+            }
+            let wrap_ndl = clamp((dot(n, l_dir) + 0.35) / 1.35, 0.0, 1.0);
+            indirect_diff_acc = indirect_diff_acc + diffuse_albedo * l_color * (portal_atten * wrap_ndl);
+            if (shading_mode == 1u) {
+                let refl_align = clamp(dot(refl_raw, l_dir) * 0.5 + 0.5, 0.0, 1.0);
+                let env_brdf = brdf_specular_ggx_env(n_dot_v, f0, max(roughness, 0.25));
+                indirect_spec_acc = indirect_spec_acc + l_color * (portal_atten * refl_align * 0.35) * env_brdf;
+            }
+            continue;
+        } else if (kind == 3u) {
             // Directional: rays travel along direction_cos_outer.xyz
             l_dir = safe_normalize(-light.direction_cos_outer.xyz, vec3<f32>(0.0, 1.0, 0.0));
+            spec_l_dir = l_dir;
             let n_dot_l_sh = max(dot(n, l_dir), 0.0);
             if (n_dot_l_sh > 0.0 && shadow_slot >= 0.0 && shadow_slot < 4.0) {
                 vis = sample_shadow_2d_pcf(u32(shadow_slot + 0.5), fin.world_pos, n_dot_l_sh);
@@ -699,6 +852,7 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
             let to_light = light.position_distance.xyz - fin.world_pos;
             let dist = max(length(to_light), 1e-4);
             l_dir = to_light / dist;
+            spec_l_dir = l_dir;
 
             // Three.js r91 punctualLightIntensityToIrradianceFactor:
             // when cutoff_dist == 0.0, decay is forced to 0 -> atten = 1.0 (no distance falloff).
@@ -711,12 +865,24 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
 
             let n_dot_l_sh = max(dot(n, l_dir), 0.0);
             if (kind == 1u) {
-                // Spot cone with penumbra smoothstep falloff
-                let theta = dot(-l_dir, safe_normalize(light.direction_cos_outer.xyz, vec3<f32>(0.0, -1.0, 0.0)));
+                // Spot cone with strict outer cutoff and penumbra smoothstep falloff (Three.js r91).
+                let spot_dir = safe_normalize(light.direction_cos_outer.xyz, vec3<f32>(0.0, -1.0, 0.0));
+                let theta = dot(-l_dir, spot_dir);
                 let cos_outer = light.direction_cos_outer.w;
                 let cos_inner = light.cos_inner_decay_penumbra.x;
-                let cone = smoothstep(cos_outer, max(cos_inner, cos_outer + 1e-4), theta);
-                atten = atten * cone;
+                if (theta <= cos_outer) {
+                    atten = 0.0;
+                } else {
+                    let cone = select(
+                        1.0,
+                        smoothstep(cos_outer, cos_inner, theta),
+                        cos_inner > cos_outer + 1e-5,
+                    );
+                    atten = atten * cone;
+                }
+                if (atten <= 0.0) {
+                    continue;
+                }
                 if (n_dot_l_sh > 0.0 && shadow_slot >= 0.0 && shadow_slot < 4.0) {
                     vis = sample_shadow_2d_pcf(u32(shadow_slot + 0.5), fin.world_pos, n_dot_l_sh);
                 }
@@ -728,44 +894,53 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
         }
 
         let n_dot_l = max(dot(n, l_dir), 0.0);
-        if (n_dot_l <= 0.0) {
+        if (n_dot_l <= 0.0 || atten <= 0.0) {
             continue;
         }
-        let h_dir = safe_normalize(v_dir + l_dir, n);
+        let h_dir = safe_normalize(v_dir + spec_l_dir, n);
         let n_dot_h = max(dot(n, h_dir), 0.0);
-        let l_dot_h = max(dot(l_dir, h_dir), 0.0);
+        let l_dot_h = max(dot(spec_l_dir, h_dir), 0.0);
 
         // Three.js r91 legacy light mode (`#ifndef PHYSICALLY_CORRECT_LIGHTS`): irradiance = dotNL * lightColor * PI.
         let irradiance = l_color * atten * vis * n_dot_l * PI;
 
         if (shading_mode == 1u) {
             // Standard Metallic-Roughness PBR (Three.js r91 RE_Direct_Physical)
-            let alpha = roughness * roughness;
+            let alpha = clamp(roughness * roughness + area_alpha_boost, 0.04, 1.0);
             let f = fresnel_schlick_three(f0, l_dot_h);
             let g = g_ggx_smith_correlated(alpha, n_dot_l, n_dot_v);
             let d = d_ggx(alpha, n_dot_h);
-            direct_spec_acc = direct_spec_acc + irradiance * (f * g * d);
+            direct_spec_acc = direct_spec_acc + irradiance * (f * g * d * area_spec_norm);
             direct_diff_acc = direct_diff_acc + irradiance * (RECIPROCAL_PI * diffuse_albedo);
+            direct_metal_irradiance_acc = direct_metal_irradiance_acc + l_color * (atten * vis * n_dot_l);
         } else if (shading_mode == 2u) {
             // Blinn-Phong (Three.js r91 RE_Direct_BlinnPhong + BRDF_Specular_BlinnPhong)
             direct_diff_acc = direct_diff_acc + irradiance * (RECIPROCAL_PI * diffuse_albedo);
             let f = fresnel_schlick_three(specular_c, l_dot_h);
             let d_bp = RECIPROCAL_PI * (shininess * 0.5 + 1.0) * pow(n_dot_h, shininess);
-            direct_spec_acc = direct_spec_acc + irradiance * (f * 0.25 * d_bp);
+            direct_spec_acc = direct_spec_acc + irradiance * (f * 0.25 * d_bp * area_spec_norm);
         } else {
             // Lambert
             direct_diff_acc = direct_diff_acc + irradiance * (RECIPROCAL_PI * diffuse_albedo);
         }
     }
 
-    // Environment-map IBL reflection for StandardPbr: uses equirectangular env_tex when bound,
-    // procedural hemisphere sky/ground gradient when `reflection_enabled == true`, or an
-    // analytical studio hemisphere/horizon IBL fallback for metallic surfaces under scene lighting
-    // so high-metalness CustomPbr and NodeMaterial ("Brushed Metal") never render pitch black.
+    // Environment-map IBL reflection for StandardPbr: uses equirectangular env_tex when bound
+    // (explicit env map or dynamically captured reflection-only / both scene cubemap),
+    // procedural hemisphere sky/ground gradient when `reflection_enabled == true` with no env_tex,
+    // or strictly direct-irradiance-weighted metallic multi-scatter so areas outside spot cones,
+    // in shadow, or facing away from lights stay completely dark (no fake omnidirectional skybox).
     if (shading_mode == 1u && (has_env_map || reflection_enabled)) {
         var env_rgb = vec3<f32>(0.0);
         if (has_env_map) {
-            env_rgb = select(env_sample.rgb, srgb_to_linear(env_sample.rgb), use_linear);
+            let blur_r = roughness * roughness * 0.045;
+            let e0 = textureSampleLevel(env_tex, clamp_sampler, vec2<f32>(fract(env_u), clamp(env_v, 0.002, 0.998)), 0.0).rgb;
+            let e1 = textureSampleLevel(env_tex, clamp_sampler, vec2<f32>(fract(env_u + blur_r), clamp(env_v, 0.002, 0.998)), 0.0).rgb;
+            let e2 = textureSampleLevel(env_tex, clamp_sampler, vec2<f32>(fract(env_u - blur_r), clamp(env_v, 0.002, 0.998)), 0.0).rgb;
+            let e3 = textureSampleLevel(env_tex, clamp_sampler, vec2<f32>(fract(env_u), clamp(env_v + blur_r, 0.002, 0.998)), 0.0).rgb;
+            let e4 = textureSampleLevel(env_tex, clamp_sampler, vec2<f32>(fract(env_u), clamp(env_v - blur_r, 0.002, 0.998)), 0.0).rgb;
+            let env_raw = select(e0, (e0 * 2.0 + e1 + e2 + e3 + e4) * (1.0 / 6.0), blur_r > 0.002);
+            env_rgb = select(env_raw, srgb_to_linear(env_raw), use_linear);
         } else {
             let h_t = smoothstep(0.0, 1.0, clamp(refl_dir.y * 0.5 + 0.5, 0.0, 1.0));
             let top_c = select(u_obj.env_color_top.rgb, srgb_to_linear(u_obj.env_color_top.rgb), use_linear);
@@ -775,18 +950,9 @@ fn fs_main(fin: VertexOut, @builtin(front_facing) is_front: bool) -> @location(0
         }
         let env_brdf = brdf_specular_ggx_env(n_dot_v, f0, roughness);
         indirect_spec_acc = indirect_spec_acc + env_rgb * u_obj.specular_refl.w * env_brdf;
-    } else if (shading_mode == 1u && metalness > 0.01 && scene_ibl_energy > 0.0) {
-        let h_t = smoothstep(0.0, 1.0, clamp(refl_dir.y * 0.5 + 0.5, 0.0, 1.0));
-        let sky_raw = vec3<f32>(0.80, 0.86, 0.94);
-        let gnd_raw = vec3<f32>(0.22, 0.20, 0.18);
-        let top_c = select(sky_raw, srgb_to_linear(sky_raw), use_linear);
-        let bot_c = select(gnd_raw, srgb_to_linear(gnd_raw), use_linear);
-        let horizon_band = exp(-abs(refl_dir.y) * mix(5.5, 1.5, roughness)) * 0.35;
-        let zenith_softbox = smoothstep(0.35, 0.95, refl_dir.y) * mix(0.28, 0.08, roughness);
-        let studio_env = mix(bot_c, top_c, h_t) + top_c * (horizon_band + zenith_softbox);
-        let studio_scale = clamp(scene_ibl_energy * 0.65, 0.45, 1.15) * metalness;
+    } else if (shading_mode == 1u && metalness > 0.01) {
         let env_brdf = brdf_specular_ggx_env(n_dot_v, f0, roughness);
-        indirect_spec_acc = indirect_spec_acc + studio_env * studio_scale * env_brdf;
+        direct_spec_acc = direct_spec_acc + direct_metal_irradiance_acc * (0.30 * metalness) * env_brdf;
     }
 
     // Material+ Ambient Occlusion modulation matching Zoidium `surface-shader.js:203-222`.
@@ -982,7 +1148,7 @@ fn scene_depth_at(px: vec2<i32>) -> f32 {
     let uv = (vec2<f32>(px) + vec2<f32>(0.5)) / res;
     let depth = textureSampleLevel(t_depth, s_depth, uv, 0.0).x;
     let far = u_dof.camera_depth_params.z;
-    return select(linearize_depth(depth), far, depth >= 1.0);
+    return select(linearize_depth(depth), far, depth >= 0.999999);
 }
 
 fn max_blur_radius() -> f32 {
@@ -1023,7 +1189,7 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
             largest = max(largest, blur_radius(scene_depth_at(p)));
         }
     }
-    return vec4<f32>(largest / max_blur_radius(), 0.0, 0.0, 1.0);
+    return vec4<f32>(clamp(largest / max_blur_radius(), 0.0, 1.0), 0.0, 0.0, 1.0);
 }
 "#;
 
@@ -1074,7 +1240,7 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
         }
     }
-    return vec4<f32>(largest / scale, 0.0, 0.0, 1.0);
+    return vec4<f32>(clamp(largest / scale, 0.0, 1.0), 0.0, 0.0, 1.0);
 }
 "#;
 
@@ -1115,7 +1281,7 @@ fn scene_depth_at(px: vec2<i32>) -> f32 {
     let uv = (vec2<f32>(px) + vec2<f32>(0.5)) / res;
     let depth = textureSampleLevel(t_depth, s_depth, uv, 0.0).x;
     let far = u_dof.camera_depth_params.z;
-    return select(linearize_depth(depth), far, depth >= 1.0);
+    return select(linearize_depth(depth), far, depth >= 0.999999);
 }
 
 fn max_blur_radius() -> f32 {
@@ -1209,7 +1375,7 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
     front = front / max(front.a, 1.0);
     back = back / max(back.a, 1.0);
     back = back + (fill / max(fill_count, 0.0001)) * (1.0 - back.a);
-    return front + back * (1.0 - front.a);
+    return clamp(front + back * (1.0 - front.a), vec4<f32>(0.0), vec4<f32>(1.0));
 }
 "#;
 
@@ -1238,6 +1404,17 @@ fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32
     return vec4<f32>(pos[vid], 0.0, 1.0);
 }
 
+fn sq(x: f32) -> f32 {
+    return x * x;
+}
+
+fn hash11(p_in: f32) -> f32 {
+    var p = fract(p_in * 0.1031);
+    p = p * (p + 33.33);
+    p = p * (p + p);
+    return fract(p);
+}
+
 fn poly_dist(p: vec2<f32>, sides: f32) -> f32 {
     let l = length(p);
     if (l < 1e-5) {
@@ -1248,35 +1425,43 @@ fn poly_dist(p: vec2<f32>, sides: f32) -> f32 {
     return cos(floor(0.5 + ang / seg) * seg - ang) * l;
 }
 
+fn depth_vis_tap(uv: vec2<f32>, src_depth: f32) -> f32 {
+    let d = textureSampleLevel(t_depth, s_depth, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).x;
+    return smoothstep(-0.0002, 0.0008, d - src_depth);
+}
+
 @fragment
 fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let res = max(u_flare.resolution_inv.xy, vec2<f32>(1.0));
     let inv_res = u_flare.resolution_inv.zw;
     let src_ndc = u_flare.pos_depth_aspect.xy;
     let src_depth = u_flare.pos_depth_aspect.z;
     let aspect = max(u_flare.pos_depth_aspect.w, 1e-4);
 
-    // 5-tap depth occlusion test around flare source UV (unconditional for uniform control flow;
-    // uses textureSampleLevel on non-filtering float depth binding for 100% Linux OpenGL/GLES safety).
+    // 9-tap soft weighted depth occlusion disk around the flare center (unconditional
+    // for uniform control flow; uses textureSampleLevel on non-filtering float depth
+    // binding for 100% WebGL2 / Linux Mesa OpenGL/GLES safety).
     let src_uv = vec2<f32>(src_ndc.x * 0.5 + 0.5, 0.5 - src_ndc.y * 0.5);
-    let tap_r = inv_res * 2.0;
-    let d0 = textureSampleLevel(t_depth, s_depth, clamp(src_uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).x;
-    let d1 = textureSampleLevel(t_depth, s_depth, clamp(src_uv + vec2<f32>( tap_r.x,  tap_r.y), vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).x;
-    let d2 = textureSampleLevel(t_depth, s_depth, clamp(src_uv + vec2<f32>(-tap_r.x,  tap_r.y), vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).x;
-    let d3 = textureSampleLevel(t_depth, s_depth, clamp(src_uv + vec2<f32>( tap_r.x, -tap_r.y), vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).x;
-    let d4 = textureSampleLevel(t_depth, s_depth, clamp(src_uv + vec2<f32>(-tap_r.x, -tap_r.y), vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).x;
+    let r_in = inv_res * 1.5;
+    let r_out = inv_res * 2.5;
+    let v_center = depth_vis_tap(src_uv, src_depth);
+    let v_in =
+        depth_vis_tap(src_uv + vec2<f32>( r_in.x,  0.0), src_depth) +
+        depth_vis_tap(src_uv + vec2<f32>(-r_in.x,  0.0), src_depth) +
+        depth_vis_tap(src_uv + vec2<f32>( 0.0,  r_in.y), src_depth) +
+        depth_vis_tap(src_uv + vec2<f32>( 0.0, -r_in.y), src_depth);
+    let v_out =
+        depth_vis_tap(src_uv + vec2<f32>( r_out.x,  r_out.y), src_depth) +
+        depth_vis_tap(src_uv + vec2<f32>(-r_out.x,  r_out.y), src_depth) +
+        depth_vis_tap(src_uv + vec2<f32>( r_out.x, -r_out.y), src_depth) +
+        depth_vis_tap(src_uv + vec2<f32>(-r_out.x, -r_out.y), src_depth);
+    let vis_weighted = v_center * 0.20 + v_in * 0.12 + v_out * 0.08;
 
-    let eps = 0.0005;
-    let vis_sum =
-        select(0.0, 1.0, d0 + eps >= src_depth) +
-        select(0.0, 1.0, d1 + eps >= src_depth) +
-        select(0.0, 1.0, d2 + eps >= src_depth) +
-        select(0.0, 1.0, d3 + eps >= src_depth) +
-        select(0.0, 1.0, d4 + eps >= src_depth);
-    let in_frustum = src_depth >= 0.0 && src_depth <= 1.0;
+    let edge = max(abs(src_ndc.x), abs(src_ndc.y));
+    let edge_fade = 1.0 - smoothstep(1.0, 1.35, edge);
+    let in_frustum = src_depth >= 0.0 && src_depth <= 1.0 && edge_fade > 0.001;
     let occ_enabled = u_flare.counts_occlusion.z > 0.5;
-    let raw_vis = select(1.0, vis_sum * 0.2, occ_enabled);
-    let occlusion_vis = select(0.0, raw_vis, in_frustum);
+    let raw_vis = select(1.0, vis_weighted, occ_enabled);
+    let occlusion_vis = select(0.0, raw_vis * edge_fade, in_frustum);
     if (occlusion_vis <= 0.001) {
         return vec4<f32>(0.0);
     }
@@ -1293,6 +1478,7 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
     let rot_rad = u_flare.shape_params.w;
     let ghost_count = u32(clamp(u_flare.counts_occlusion.x + 0.5, 0.0, 8.0));
     let ray_count = u_flare.counts_occlusion.y;
+    let dispersion = clamp(u_flare.counts_occlusion.w, 0.0, 2.0);
     let base_col = u_flare.color_brightness.rgb;
     let brightness = u_flare.color_brightness.w;
 
@@ -1304,57 +1490,125 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
     let q = d_rot / base_size;
     let r = length(q);
 
-    // 1. Bright core glow (Zoidium `optflares-shaders.js` etype 0).
-    let core = exp(-r * r * 90.0) * 1.5 + exp(-r * r * 14.0) * 0.7 + exp(-r * r * 3.0) * 0.45;
-    var col = base_col * core;
+    // 1. Bright core glow with hot center bloom (Zoidium `optflares-shaders.js` etype 0).
+    let core_hot = exp(-r * r * 90.0) * 1.55;
+    let core_mid = exp(-r * r * 14.0) * 0.72;
+    let core_halo = exp(-r * r * 3.0) * 0.52;
+    let hot_tint = mix(base_col, vec3<f32>(1.0, 0.99, 0.97), clamp(exp(-r * r * 45.0) * 0.55, 0.0, 0.55));
+    var col = hot_tint * core_hot + base_col * (core_mid + core_halo);
 
-    // 2. Directional starburst rays.
+    // 2. Multi-harmonic shimmer, glint cross, spike ball & sparkle burst (Zoidium etypes 4, 5, 6, 7).
     if (ray_count >= 1.0 && r > 1e-5) {
         let ang = atan2(q.y, q.x);
-        let r1 = pow(abs(cos(ang * ray_count * 0.5)), 24.0);
-        let r2 = pow(abs(cos(ang * ray_count + 0.35)), 48.0) * 0.45;
-        let rays = (r1 + r2) * exp(-r * 1.5);
-        col = col + base_col * rays * 1.1;
+        let half_rays = max(ray_count * 0.5, 1.0);
+        let r1 = pow(abs(cos(ang * half_rays)), 24.0);
+        let r2 = pow(abs(cos(ang * ray_count + 0.35)), 48.0) * 0.52;
+        let r3 = pow(abs(cos(ang * (ray_count * 1.5 + 3.0) + 1.1)), 64.0) * 0.32;
+        let ray_sum = r1 + r2 + r3;
+        let ray_env = exp(-r * (1.35 + 0.22 * abs(sin(ang * 3.0 + rot_rad))));
+        let glint_w = select(0.0, 1.0, ray_count >= 4.0);
+        let glint = (pow(abs(cos(2.0 * ang)), 84.0) + pow(abs(cos(4.0 * ang + 0.6)), 140.0) * 0.45) * exp(-r * 1.1) * 0.65 * glint_w;
+        let disp_shift = 0.08 * dispersion;
+        let rays_rgb = vec3<f32>(
+            ray_sum * exp(-r * max(1.35 - disp_shift, 0.5)),
+            ray_sum * ray_env,
+            ray_sum * exp(-r * (1.35 + disp_shift)),
+        );
+        col = col + base_col * (rays_rgb * 1.05 + vec3<f32>(glint));
+
+        if (ray_count >= 14.0 && r < 2.2) {
+            var sp = vec3<f32>(0.0);
+            for (var s_idx: i32 = 0; s_idx < 14; s_idx = s_idx + 1) {
+                let fs = f32(s_idx);
+                let h1 = hash11(5.7 + fs * 1.37);
+                let h2 = hash11(11.3 + fs * 2.71);
+                let h3 = hash11(19.1 + fs * 3.93);
+                let rad_s = sqrt(h1) * 1.55;
+                let pa = h2 * 6.2831853 + rot_rad * 0.5;
+                let p2 = vec2<f32>(cos(pa), sin(pa)) * rad_s;
+                let d2 = (q - p2) / (0.03 + 0.08 * h3);
+                let dd = dot(d2, d2);
+                let c1 = exp(-abs(d2.x) * 2.6) * exp(-abs(d2.y) * 0.55);
+                let c2 = exp(-abs(d2.y) * 2.6) * exp(-abs(d2.x) * 0.55);
+                let tw = 0.55 + 0.45 * sin(rot_rad * 4.0 + h2 * 18.0);
+                sp = sp + base_col * (exp(-dd * 1.4) * (0.35 + 0.45 * tw) + (c1 + c2) * 0.16 * tw);
+            }
+            col = col + sp * 0.65;
+        }
     }
 
-    // 3. Anamorphic horizontal streak.
+    // 3. Anamorphic streak with hot spot and chromatic dispersion (Zoidium etype 3).
     if (anamorphic > 0.001) {
-        let qs = vec2<f32>(d_rot.x / (base_size * 3.2), d_rot.y / (base_size * 0.35));
-        let streak_core = exp(-qs.y * qs.y * 45.0) * exp(-qs.x * qs.x * 1.1);
-        let streak_halo = exp(-qs.y * qs.y * 8.0) * exp(-qs.x * qs.x * 0.38);
-        let streak_tint = mix(base_col, vec3<f32>(0.55, 0.78, 1.0), 0.35);
-        col = col + streak_tint * (streak_core * 1.3 + streak_halo * 0.4) * anamorphic;
+        let stretch = mix(3.2, 4.4, clamp((anamorphic - 0.5) * 0.8, 0.0, 1.0));
+        let qs = vec2<f32>(d_rot.x / (base_size * stretch), d_rot.y / (base_size * 0.34));
+        let qs_r = vec2<f32>(qs.x * 0.96, qs.y);
+        let qs_b = vec2<f32>(qs.x * 1.04, qs.y);
+        let core_r = exp(-sq(qs_r.y) * 52.0) * exp(-sq(qs_r.x) * 1.05);
+        let core_g = exp(-sq(qs.y) * 56.0) * exp(-sq(qs.x) * 1.05);
+        let core_b = exp(-sq(qs_b.y) * 52.0) * exp(-sq(qs_b.x) * 1.05);
+        let streak_halo = exp(-sq(qs.y) * 9.0) * exp(-sq(qs.x) * 0.40);
+        let streak_hot = exp(-(sq(qs.x) + sq(qs.y)) * 45.0) * 0.75;
+        let warmth = clamp(base_col.r - base_col.b, 0.0, 1.0);
+        let blue_coat = mix(0.35, 0.08, warmth);
+        let streak_tint = mix(base_col, vec3<f32>(0.45, 0.74, 1.0), blue_coat);
+        col = col + streak_tint * (vec3<f32>(core_r, core_g, core_b) * 1.35 + vec3<f32>(streak_halo * 0.44 + streak_hot)) * anamorphic;
     }
 
-    // 4. Chromatic halo ring.
+    // 4. Chromatic halo ring + secondary iridescent hoop (Zoidium etypes 8 & 9).
     if (ring_intensity > 0.001) {
-        let rr = exp(-pow((r - 0.786) * 24.0, 2.0));
-        let gg = exp(-pow((r - 0.800) * 26.0, 2.0));
-        let bb = exp(-pow((r - 0.814) * 24.0, 2.0));
-        let ring_glow = exp(-pow((r - 0.800) * 6.0, 2.0)) * 0.2;
-        col = col + (base_col * (gg * 1.1 + ring_glow) + vec3<f32>(rr, gg, bb) * 0.28) * ring_intensity;
+        let rr = exp(-sq((r - 0.784) * 24.0));
+        let gg = exp(-sq((r - 0.800) * 26.0));
+        let bb = exp(-sq((r - 0.816) * 24.0));
+        let ring_glow = exp(-sq((r - 0.800) * 6.0)) * 0.22;
+        col = col + (base_col * (gg * 1.15 + ring_glow) + vec3<f32>(rr, gg, bb) * 0.34) * ring_intensity;
+
+        if (ring_intensity > 0.45 && r > 1e-5) {
+            let ang_h = atan2(q.y, q.x);
+            let rainbow = vec3<f32>(0.55) + vec3<f32>(0.45) * cos(vec3<f32>(ang_h, ang_h + 2.094, ang_h + 4.188) + vec3<f32>(rot_rad));
+            let band_outer = exp(-sq((r - 0.58) * 11.0));
+            let band_inner = exp(-sq((r - 0.50) * 14.0)) * 0.5;
+            let hoop_w = smoothstep(0.45, 0.95, ring_intensity) * 0.55;
+            let hoop_tint = mix(base_col, rainbow, 0.65);
+            col = col + hoop_tint * (band_outer + band_inner) * hoop_w;
+        }
     }
 
-    // 5. Chromatic iris ghosts mirrored across screen center (0, 0).
+    // 5. Chromatic iris polygon ghosts & multi-iris bokeh orbs along the screen-center axis (Zoidium etypes 1, 2, 11).
     let axis = -src;
     let axis_len = length(axis);
-    let axis_fade = smoothstep(0.0, 0.03, axis_len);
+    let axis_fade = smoothstep(0.0, 0.025, axis_len);
     if (ghost_count > 0u && axis_fade > 0.001) {
+        let axis_dir = axis / max(axis_len, 1e-5);
         for (var i: u32 = 0u; i < ghost_count; i = i + 1u) {
             let fi = f32(i);
             let frac = (fi + 0.5) / f32(ghost_count);
-            let t = 0.45 + frac * 1.95;
-            let anchor = src + axis * t;
-            let g_size = base_size * (0.28 + 0.42 * fract(sin(fi * 12.9898 + 1.23) * 43758.5453));
+            let t = 0.38 + frac * 2.05;
+            let anchor = src + axis_dir * (axis_len * t);
+            let h_sz = hash11(51.0 + fi * 3.7);
+            let h_hue = hash11(73.0 + fi * 5.1);
+            let g_size = base_size * (0.24 + 0.46 * h_sz);
             let gd = (p - anchor) / max(g_size, 1e-4);
-            let pd_r = poly_dist(gd * 0.96, 6.0);
-            let pd_g = poly_dist(gd, 6.0);
-            let pd_b = poly_dist(gd * 1.04, 6.0);
-            let g_r = smoothstep(1.05, 0.45, pd_r) * 0.22 + exp(-pow((pd_r - 0.95) * 6.0, 2.0)) * 0.14;
-            let g_g = smoothstep(1.05, 0.45, pd_g) * 0.22 + exp(-pow((pd_g - 0.95) * 6.0, 2.0)) * 0.14;
-            let g_b = smoothstep(1.05, 0.45, pd_b) * 0.22 + exp(-pow((pd_b - 0.95) * 6.0, 2.0)) * 0.14;
-            let g_col = vec3<f32>(g_r, g_g, g_b) * mix(vec3<f32>(1.0), base_col, 0.6);
-            col = col + g_col * axis_fade;
+            let gr = length(gd);
+            let chroma_shift = mix(vec3<f32>(0.78, 0.90, 1.12), vec3<f32>(1.12, 0.92, 0.78), h_hue);
+            let ghost_tint = mix(vec3<f32>(1.0), base_col, 0.62) * chroma_shift;
+
+            if ((i & 1u) == 0u) {
+                let pd_r = poly_dist(gd * 0.955, 6.0);
+                let pd_g = poly_dist(gd, 6.0);
+                let pd_b = poly_dist(gd * 1.045, 6.0);
+                let g_r = smoothstep(1.06, 0.42, pd_r) * 0.24 + exp(-sq((pd_r - 0.94) * 6.5)) * 0.17;
+                let g_g = smoothstep(1.06, 0.42, pd_g) * 0.24 + exp(-sq((pd_g - 0.94) * 6.5)) * 0.17;
+                let g_b = smoothstep(1.06, 0.42, pd_b) * 0.24 + exp(-sq((pd_b - 0.94) * 6.5)) * 0.17;
+                col = col + vec3<f32>(g_r, g_g, g_b) * ghost_tint * axis_fade;
+            } else {
+                let core2 = exp(-gr * gr * 14.0) * 0.34;
+                let disc2 = smoothstep(1.02, 0.76, gr) * 0.20;
+                let rim_r = exp(-sq((gr * 0.96 - 0.90) * 9.0)) * 0.18;
+                let rim_g = exp(-sq((gr - 0.90) * 9.0)) * 0.18;
+                let rim_b = exp(-sq((gr * 1.04 - 0.90) * 9.0)) * 0.18;
+                let orb = vec3<f32>(core2 + disc2 + rim_r, core2 + disc2 + rim_g, core2 + disc2 + rim_b);
+                col = col + orb * ghost_tint * axis_fade;
+            }
         }
     }
 
@@ -1522,5 +1776,77 @@ fn fs_main(fin: VertexOut) -> @location(0) vec4<f32> {
     );
     let a = clamp(c.a, 0.0, 1.0);
     return vec4<f32>(clamp(c.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * a, a);
+}
+"#;
+
+pub(crate) const CUBE_TO_EQUIRECT_WGSL: &str = r#"
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@group(0) @binding(0) var face_px: texture_2d<f32>;
+@group(0) @binding(1) var face_nx: texture_2d<f32>;
+@group(0) @binding(2) var face_py: texture_2d<f32>;
+@group(0) @binding(3) var face_ny: texture_2d<f32>;
+@group(0) @binding(4) var face_pz: texture_2d<f32>;
+@group(0) @binding(5) var face_nz: texture_2d<f32>;
+@group(0) @binding(6) var env_sampler: sampler;
+
+@vertex
+fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> VsOut {
+    var p = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0),
+    );
+    var out: VsOut;
+    let clip = p[vid];
+    out.pos = vec4<f32>(clip, 0.0, 1.0);
+    out.uv = vec2<f32>(clip.x * 0.5 + 0.5, 0.5 - clip.y * 0.5);
+    return out;
+}
+
+@fragment
+fn fs_main(fin: VsOut) -> @location(0) vec4<f32> {
+    let phi = (fin.uv.x - 0.5) * 6.28318530718;
+    let theta = (0.5 - fin.uv.y) * 3.14159265359;
+    let cos_t = cos(theta);
+    let d = vec3<f32>(cos_t * cos(phi), sin(theta), cos_t * sin(phi));
+    let ad = abs(d);
+
+    var col = vec3<f32>(0.0);
+    if (ad.x >= ad.y && ad.x >= ad.z) {
+        if (d.x >= 0.0) {
+            let z_fwd = max(d.x, 1e-5);
+            let uv = vec2<f32>((d.z / z_fwd) * 0.5 + 0.5, 0.5 - (d.y / z_fwd) * 0.5);
+            col = textureSampleLevel(face_px, env_sampler, uv, 0.0).rgb;
+        } else {
+            let z_fwd = max(-d.x, 1e-5);
+            let uv = vec2<f32>((-d.z / z_fwd) * 0.5 + 0.5, 0.5 - (d.y / z_fwd) * 0.5);
+            col = textureSampleLevel(face_nx, env_sampler, uv, 0.0).rgb;
+        }
+    } else if (ad.y >= ad.x && ad.y >= ad.z) {
+        if (d.y >= 0.0) {
+            let z_fwd = max(d.y, 1e-5);
+            let uv = vec2<f32>((d.x / z_fwd) * 0.5 + 0.5, 0.5 - (d.z / z_fwd) * 0.5);
+            col = textureSampleLevel(face_py, env_sampler, uv, 0.0).rgb;
+        } else {
+            let z_fwd = max(-d.y, 1e-5);
+            let uv = vec2<f32>((d.x / z_fwd) * 0.5 + 0.5, 0.5 - (-d.z / z_fwd) * 0.5);
+            col = textureSampleLevel(face_ny, env_sampler, uv, 0.0).rgb;
+        }
+    } else {
+        if (d.z >= 0.0) {
+            let z_fwd = max(d.z, 1e-5);
+            let uv = vec2<f32>((-d.x / z_fwd) * 0.5 + 0.5, 0.5 - (d.y / z_fwd) * 0.5);
+            col = textureSampleLevel(face_pz, env_sampler, uv, 0.0).rgb;
+        } else {
+            let z_fwd = max(-d.z, 1e-5);
+            let uv = vec2<f32>((d.x / z_fwd) * 0.5 + 0.5, 0.5 - (d.y / z_fwd) * 0.5);
+            col = textureSampleLevel(face_nz, env_sampler, uv, 0.0).rgb;
+        }
+    }
+    return vec4<f32>(col, 1.0);
 }
 "#;

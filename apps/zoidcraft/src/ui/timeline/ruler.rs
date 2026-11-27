@@ -42,7 +42,38 @@ pub(crate) fn marker_color_at(
     (raw, color)
 }
 
-/// Hit-tests timeline markers along `ruler_rect`, returning the closest marker index within 9 px.
+/// Top Y boundary of the lower marker interaction band inside `ruler_rect`.
+///
+/// Guarantees at least the top 50% of the ruler height (and 20 px on the standard 35 px ruler)
+/// is exclusively reserved for playhead scrubbing so dragging above markers never accidentally
+/// grabs or moves a marker.
+#[must_use]
+pub(crate) fn marker_scrub_band_bottom(ruler_rect: Rect) -> f32 {
+    (ruler_rect.bottom() - 15.0).max(ruler_rect.top() + ruler_rect.height() * 0.5)
+}
+
+#[inline]
+pub(crate) fn marker_pin_center_y(ruler_rect: Rect) -> f32 {
+    ruler_rect.bottom() - 9.0
+}
+
+#[inline]
+pub(crate) fn marker_label_rect(mx: f32, cy: f32, label: &str) -> Option<Rect> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let char_count = label.chars().take(16).count();
+    let lbl_w = (char_count as f32 * 5.8 + 6.0).min(100.0);
+    Some(Rect::from_min_size(
+        pos2(mx + 6.5, cy - 6.0),
+        vec2(lbl_w, 12.0),
+    ))
+}
+
+/// Hit-tests timeline markers along `ruler_rect`, confined strictly to the lower marker band
+/// (visible diamond pin & optional label badge) so the upper scrubbing band always scrubs the
+/// playhead.
 #[must_use]
 pub fn hit_test_marker(
     markers: &[zc_project::Marker],
@@ -52,23 +83,49 @@ pub fn hit_test_marker(
     zoom: f64,
     pointer: Pos2,
 ) -> Option<usize> {
-    if !ruler_rect.contains(pointer) {
+    let band_top = marker_scrub_band_bottom(ruler_rect);
+    if !ruler_rect.contains(pointer) || pointer.y < band_top {
         return None;
     }
-    let mut best_dist = 9.0_f32;
+
+    let cy = marker_pin_center_y(ruler_rect);
+    let pin_top = (cy - 6.0).max(band_top);
+
+    // Pass 1: direct hit on the visible diamond pin head / stem (prioritized over overlapping tags).
+    let mut best_dist = 6.5_f32;
     let mut hit = None;
     for (idx, m) in markers.iter().enumerate() {
-        let mx = ruler_rect.left() + (frame_to_px(m.frame, fps, zoom) - scroll_x) as f32;
-        if mx < ruler_rect.left() - 10.0 || mx > ruler_rect.right() + 10.0 {
+        let mx = (ruler_rect.left() + (frame_to_px(m.frame, fps, zoom) - scroll_x) as f32).round();
+        if mx < ruler_rect.left() - 12.0 || mx > ruler_rect.right() + 12.0 {
             continue;
         }
-        let dx = (pointer.x - mx).abs();
-        if dx < best_dist && pointer.y >= ruler_rect.top() + 8.0 {
+        let dx = (pointer.x - (mx + 0.5)).abs();
+        if dx < best_dist && pointer.y >= pin_top && pointer.y <= ruler_rect.bottom() {
             best_dist = dx;
             hit = Some(idx);
         }
     }
-    hit
+    if hit.is_some() {
+        return hit;
+    }
+
+    // Pass 2: hit on a visible marker label tag in reverse paint order (topmost drawn wins).
+    for (idx, m) in markers.iter().enumerate().rev() {
+        let mx = (ruler_rect.left() + (frame_to_px(m.frame, fps, zoom) - scroll_x) as f32).round();
+        if mx < ruler_rect.left() - 12.0 || mx > ruler_rect.right() + 12.0 {
+            continue;
+        }
+        if let Some(lbl_rect) = marker_label_rect(mx, cy, &m.label) {
+            let clipped = lbl_rect.intersect(Rect::from_min_max(
+                pos2(ruler_rect.left(), band_top),
+                ruler_rect.max,
+            ));
+            if clipped.is_positive() && clipped.contains(pointer) {
+                return Some(idx);
+            }
+        }
+    }
+    None
 }
 
 pub(crate) fn paint_and_interact_breadcrumb_bar(
@@ -704,18 +761,15 @@ pub(crate) fn paint_and_interact_ruler(
             *m_color
         };
 
-        // Vertical pin stem to ruler bottom.
+        // Vertical pin stem & diamond flag pin head confined to the lower marker band
+        // (leaving the upper ~57% of the ruler unobstructed for playhead scrubbing).
+        let cy = marker_pin_center_y(rect);
+        let r = 5.0;
         painter.rect_filled(
-            Rect::from_min_max(
-                pos2(mx, rect.bottom() - 15.0),
-                pos2(mx + 1.0, rect.bottom()),
-            ),
+            Rect::from_min_max(pos2(mx, cy - r), pos2(mx + 1.0, rect.bottom())),
             CornerRadius::ZERO,
             pin_col,
         );
-        // Diamond flag pin head.
-        let cy = rect.bottom() - 10.0;
-        let r = 5.0;
         let pts = vec![
             pos2(mx + 0.5, cy - r),
             pos2(mx + 0.5 + r, cy),
@@ -729,10 +783,10 @@ pub(crate) fn paint_and_interact_ruler(
         ));
 
         // Optional short label badge right of pin (hidden while inline-renaming this marker).
-        if !m_label.trim().is_empty() && renaming_marker_idx != Some(idx) {
+        if renaming_marker_idx != Some(idx)
+            && let Some(lbl_rect) = marker_label_rect(mx, cy, m_label)
+        {
             let short_label: String = m_label.chars().take(16).collect();
-            let lbl_w = (short_label.len() as f32 * 5.8 + 6.0).min(100.0);
-            let lbl_rect = Rect::from_min_size(pos2(mx + 6.5, cy - 6.5), vec2(lbl_w, 13.0));
             painter.rect_filled(
                 lbl_rect,
                 CornerRadius::same(1),

@@ -412,8 +412,13 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                 self.alloc_builtin_fn(format!("Math.{prop}"))
             }
             RuntimeValue::Namespace(NamespaceKind::Methods) => {
-                if is_methods_member(prop, self.config.mode) {
-                    if let Some(s) = static_global_builtin_name(prop) {
+                if is_methods_member(prop, self.config.mode)
+                    || (self.config.mode == ExprMode::ExpressionsPlus
+                        && Self::extended_builtin_static_name(prop).is_some())
+                {
+                    if let Some(s) = static_global_builtin_name(prop)
+                        .or_else(|| Self::extended_builtin_static_name(prop))
+                    {
                         Ok(RuntimeValue::BuiltinFn(BuiltinRef::Static(s)))
                     } else {
                         self.alloc_builtin_fn(prop.to_string())
@@ -583,6 +588,11 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
     }
 
     fn property_derivative_time(&self, id: &HandleId) -> f64 {
+        if self.ctx.this_property_id().as_ref() == Some(id)
+            && let Some(pt) = self.posterized_time()
+        {
+            return pt;
+        }
         let fps = self.ctx.fps();
         if fps > 0.0 {
             let local_frame = self
@@ -603,7 +613,13 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         match handle {
             HandleRef::Property(id) => match prop {
                 "value" => {
-                    let v = self.read_property_value(id)?;
+                    let v = if self.ctx.this_property_id().as_ref() == Some(id)
+                        && let Some(pt) = self.posterized_time()
+                    {
+                        self.read_property_value_at_time(id, pt)?
+                    } else {
+                        self.read_property_value(id)?
+                    };
                     self.intern_value(v)
                 }
                 "velocity" => {
@@ -683,7 +699,15 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
         ops: &'ast [ChainOp],
         env: usize,
     ) -> Result<RuntimeValue, ExprError> {
-        let mut current = self.eval_expr(base, env)?;
+        let mut current = if let Expr::Ident(name) = base
+            && self.config.mode == ExprMode::ExpressionsPlus
+            && self.lookup_local(env, name).is_none()
+            && let Some(static_name) = Self::extended_builtin_static_name(name)
+        {
+            RuntimeValue::BuiltinFn(BuiltinRef::Static(static_name))
+        } else {
+            self.eval_expr(base, env)?
+        };
         let mut idx = 0;
         while idx < ops.len() {
             match &ops[idx] {
@@ -771,13 +795,16 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                     }
                     Ok(static_math_builtin_name(prop).is_none() && math_constant(prop).is_none())
                 }
-                NamespaceKind::Methods => Ok(!is_methods_member(prop, self.config.mode)),
-                NamespaceKind::Array => Ok(!matches!(prop, "isArray" | "from")),
+                NamespaceKind::Methods => Ok(!is_methods_member(prop, self.config.mode)
+                    && !(self.config.mode == ExprMode::ExpressionsPlus
+                        && Self::extended_builtin_static_name(prop).is_some())),
+                NamespaceKind::Array => Ok(!matches!(prop, "isArray" | "from" | "of")),
                 NamespaceKind::Number => Ok(!matches!(
                     prop,
                     "isFinite"
                         | "isNaN"
                         | "isInteger"
+                        | "isSafeInteger"
                         | "parseFloat"
                         | "parseInt"
                         | "MAX_SAFE_INTEGER"
@@ -787,10 +814,19 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                         | "NEGATIVE_INFINITY"
                         | "NaN"
                 )),
-                NamespaceKind::String => Ok(prop != "fromCharCode"),
-                NamespaceKind::Object => {
-                    Ok(!matches!(prop, "keys" | "values" | "entries" | "assign"))
-                }
+                NamespaceKind::String => Ok(!matches!(prop, "fromCharCode" | "fromCodePoint")),
+                NamespaceKind::Object => Ok(!matches!(
+                    prop,
+                    "keys"
+                        | "values"
+                        | "entries"
+                        | "assign"
+                        | "fromEntries"
+                        | "hasOwn"
+                        | "is"
+                        | "freeze"
+                        | "create"
+                )),
                 NamespaceKind::Json => Ok(!matches!(prop, "stringify" | "parse")),
                 NamespaceKind::Boolean => Ok(true),
             },
@@ -801,6 +837,9 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
                         | "pop"
                         | "shift"
                         | "unshift"
+                        | "splice"
+                        | "sort"
+                        | "copyWithin"
                         | "reverse"
                         | "slice"
                         | "concat"
@@ -863,7 +902,8 @@ impl<'a, 'ast> Evaluator<'a, 'ast> {
             RuntimeValue::Handle(handle) => match handle {
                 HandleRef::Property(id) => match prop {
                     "valueAtTime" | "velocityAtTime" | "speedAtTime" | "key" | "nearestKey"
-                    | "parent" | "value" | "velocity" | "speed" | "numKeys" | "length" => Ok(false),
+                    | "loopIn" | "loopOut" | "smooth" | "wiggle" | "parent" | "value"
+                    | "velocity" | "speed" | "numKeys" | "length" => Ok(false),
                     "name" => Ok(self.ctx.handle_name(id).is_none()),
                     _ => {
                         let val = self.read_property_value(id)?;

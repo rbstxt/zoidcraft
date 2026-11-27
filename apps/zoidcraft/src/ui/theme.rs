@@ -285,6 +285,8 @@ pub struct Cm3Theme {
     pub custom_sat_percent: f32,
     /// User main focus color for `CustomMainColor` (Spec 01 §2.6 A).
     pub custom_main_rgb: Rgb,
+    /// Optional per-slot color overrides `[focus, link, clip, clip_selected, clip_selection]`.
+    pub slot_overrides: [Option<Rgb>; 5],
     /// Derived 5-color accent palette.
     pub palette: ThemePalette,
     /// Global UI font scale multiplier (`1.0` = exact CM3 px sizes).
@@ -300,6 +302,7 @@ impl Default for Cm3Theme {
             custom_hue_deg: 0.0,
             custom_sat_percent: 100.0,
             custom_main_rgb: ThemePalette::CLASSIC.focus,
+            slot_overrides: [None; 5],
             palette: ThemePalette::CLASSIC,
             font_scale: 1.0,
             editor_font: EditorFontChoice::SourceCodePro,
@@ -340,9 +343,9 @@ impl Cm3Theme {
         self.recompute_palette();
     }
 
-    /// Recomputes `self.palette` from the active profile & custom parameters.
+    /// Recomputes `self.palette` from the active profile, custom parameters, and per-slot overrides.
     pub fn recompute_palette(&mut self) {
-        self.palette = match self.profile {
+        let mut pal = match self.profile {
             // Exact canonical Zoidium / CM3 Classic colors (#384668 accent, #526183 clip).
             ThemeProfileChoice::Panzoid => ThemePalette::CLASSIC,
             ThemeProfileChoice::Signal => ThemeProfile::Signal.palette(),
@@ -358,6 +361,78 @@ impl Cm3Theme {
                 ThemePalette::derive_from_rgb(self.custom_main_rgb)
             }
         };
+        if let Some(c) = self.slot_overrides[0] {
+            pal.focus = c;
+        }
+        if let Some(c) = self.slot_overrides[1] {
+            pal.link = c;
+        }
+        if let Some(c) = self.slot_overrides[2] {
+            pal.clip = c;
+        }
+        if let Some(c) = self.slot_overrides[3] {
+            pal.clip_selected = c;
+        }
+        if let Some(c) = self.slot_overrides[4] {
+            pal.clip_selection = c;
+        }
+        self.palette = pal;
+    }
+
+    /// Sets an individual palette slot override (`0=focus, 1=link, 2=clip, 3=clipSelected, 4=clipSelection`).
+    pub fn set_slot_override(&mut self, slot: usize, rgb: Rgb) {
+        if slot < 5 {
+            self.slot_overrides[slot] = Some(rgb);
+            self.recompute_palette();
+        }
+    }
+
+    /// Clears all per-slot color overrides and restores derived profile colors.
+    pub fn clear_slot_overrides(&mut self) {
+        self.slot_overrides = [None; 5];
+        self.recompute_palette();
+    }
+
+    /// Exports the active theme palette as a Zoidium-compatible JSON object string.
+    #[must_use]
+    pub fn export_theme_json(&self) -> String {
+        let hex = |rgb: Rgb| {
+            let [r, g, b] = rgb.to_u8();
+            format!("#{r:02x}{g:02x}{b:02x}")
+        };
+        serde_json::json!({
+            "profile": self.profile.label(),
+            "focus": hex(self.palette.focus),
+            "link": hex(self.palette.link),
+            "clip": hex(self.palette.clip),
+            "clipSelected": hex(self.palette.clip_selected),
+            "clipSelection": hex(self.palette.clip_selection),
+        })
+        .to_string()
+    }
+
+    /// Imports a Zoidium-compatible theme JSON object (`focus`, `link`, `clip`, `clipSelected`, `clipSelection`).
+    pub fn import_theme_json(&mut self, text: &str) -> bool {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+            return false;
+        };
+        let Some(obj) = val.as_object() else {
+            return false;
+        };
+        let keys = ["focus", "link", "clip", "clipSelected", "clipSelection"];
+        let mut any = false;
+        for (slot, k) in keys.iter().enumerate() {
+            if let Some(s) = obj.get(*k).and_then(serde_json::Value::as_str)
+                && let Ok(rgba) = Rgba::from_hex(s.trim())
+            {
+                self.slot_overrides[slot] = Some(Rgb::new(rgba.0[0], rgba.0[1], rgba.0[2]));
+                any = true;
+            }
+        }
+        if any {
+            self.recompute_palette();
+        }
+        any
     }
 
     /// Primary focus & accent (`--zui-accent`, `#384668` in Classic).
@@ -506,6 +581,12 @@ fn load_system_cjk_fallback_font() -> Option<std::sync::Arc<egui::FontData>> {
 
 #[cfg(target_arch = "wasm32")]
 fn load_system_cjk_fallback_font() -> Option<std::sync::Arc<egui::FontData>> {
+    static LOGGED_ONCE: std::sync::Once = std::sync::Once::new();
+    LOGGED_ONCE.call_once(|| {
+        tracing::debug!(
+            "OS CJK system font probing is unavailable on wasm32; using bundled monospace/proportional and egui fallback fonts"
+        );
+    });
     None
 }
 
@@ -536,12 +617,12 @@ pub fn apply_editor_font(ctx: &egui::Context, font: EditorFontChoice) {
         EditorFontChoice::GeistMono => ("geist_mono", "source_code_pro"),
     };
     for family in [FontFamily::Monospace, FontFamily::Proportional] {
-        if let Some(list) = fonts.families.get_mut(&family) {
-            list.insert(0, secondary.to_owned());
-            list.insert(0, primary.to_owned());
-            if has_cjk_fallback {
-                list.push("system_cjk_fallback".to_owned());
-            }
+        let list = fonts.families.entry(family).or_default();
+        list.retain(|name| name != primary && name != secondary && name != "system_cjk_fallback");
+        list.insert(0, secondary.to_owned());
+        list.insert(0, primary.to_owned());
+        if has_cjk_fallback {
+            list.push("system_cjk_fallback".to_owned());
         }
     }
     ctx.set_fonts(fonts);

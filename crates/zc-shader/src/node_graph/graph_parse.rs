@@ -92,7 +92,15 @@ pub(super) fn parse_raw_graph(
             .to_string();
 
         let mut params = BTreeMap::new();
-        // Merge lower-precedence `values` / `inputs` maps first, then `params` on top.
+        // Pull top-level image/asset reference keys first (lowest precedence).
+        for asset_key in [
+            "assetId", "asset_id", "asset", "image", "texture", "src", "media", "file", "url",
+        ] {
+            if let Some(v) = nobj.get(asset_key) {
+                params.insert(asset_key.to_string(), v.clone());
+            }
+        }
+        // Merge lower-precedence `values` / `inputs` maps next, then `params` on top.
         for key in ["values", "inputs", "params"] {
             if let Some(Value::Object(map)) = nobj.get(key) {
                 for (k, v) in map {
@@ -400,10 +408,11 @@ pub(super) fn resolve_blend_mode(params: &BTreeMap<String, Value>, keys: &[&str]
             "saturation" => 16,
             "color" => 17,
             "value" | "luminosity" => 18,
+            "hard light" | "hardlight" | "hard_light" => 19,
             _ => 0,
         };
     }
-    (param_f64(params, keys, 0.0).round() as i32).clamp(0, 18)
+    (param_f64(params, keys, 0.0).round() as i32).clamp(0, 19)
 }
 
 pub(super) fn resolve_math_op(
@@ -434,8 +443,8 @@ pub(super) fn resolve_math_op(
             "ceiling" | "ceil" => 18,
             "fraction" | "fract" => 19,
             "sign" => 20,
-            "smooth minimum" | "smoothmin" | "smin" => 21,
-            "smooth maximum" | "smoothmax" | "smax" => 22,
+            "smooth min" | "smooth minimum" | "smoothmin" | "smin" => 21,
+            "smooth max" | "smooth maximum" | "smoothmax" | "smax" => 22,
             "snap" => 23,
             "wrap" => 24,
             "ping-pong" | "pingpong" => 25,
@@ -444,10 +453,12 @@ pub(super) fn resolve_math_op(
             "arctan2" | "atan2" => 28,
             "greater than" | "gt" | ">" => 29,
             "less than" | "lt" | "<" => 30,
+            "step" => 31,
+            "negate" | "neg" => 32,
             _ => default,
         };
     }
-    (param_f64(params, keys, f64::from(default)).round() as i32).clamp(0, 30)
+    (param_f64(params, keys, f64::from(default)).round() as i32).clamp(0, 32)
 }
 
 pub(super) fn resolve_vector_math_op(params: &BTreeMap<String, Value>) -> i32 {
@@ -462,10 +473,238 @@ pub(super) fn resolve_vector_math_op(params: &BTreeMap<String, Value>) -> i32 {
             "length" | "len" => 6,
             "distance" | "dist" => 7,
             "cross product" | "cross" => 8,
+            "scale" => 9,
             _ => 0,
         };
     }
-    (param_f64(params, &["mode", "op", "operation"], 0.0).round() as i32).clamp(0, 8)
+    (param_f64(params, &["mode", "op", "operation"], 0.0).round() as i32).clamp(0, 9)
+}
+
+pub(super) fn resolve_voronoi_mode(params: &BTreeMap<String, Value>) -> i32 {
+    if let Some(name) = param_str(params, &["mode", "feature"]) {
+        return match name.trim().to_ascii_lowercase().as_str() {
+            "f1" | "f1 distance" => 0,
+            "f2" | "f2 distance" => 1,
+            "edge" | "distance to edge" | "f2 - f1 edge" => 2,
+            "cell id" | "cellid" | "cell_id" | "cell" => 3,
+            _ => 0,
+        };
+    }
+    (param_f64(params, &["mode", "feature"], 0.0).round() as i32).clamp(0, 3)
+}
+
+pub(super) fn resolve_ramp_interp(params: &BTreeMap<String, Value>) -> i32 {
+    if let Some(name) = param_str(params, &["interpolation", "interp", "mode"]) {
+        return match name.trim().to_ascii_lowercase().as_str() {
+            "constant" | "step" | "none" => 0,
+            "linear" => 1,
+            "smooth" | "ease" | "smoothstep" => 2,
+            "cubic" | "b-spline" | "bspline" | "catmull-rom" | "cardinal" => 3,
+            _ => 1,
+        };
+    }
+    (param_f64(params, &["interpolation", "interp", "mode"], 1.0).round() as i32).clamp(0, 3)
+}
+
+pub(super) fn resolve_normal_mode(params: &BTreeMap<String, Value>) -> i32 {
+    if let Some(name) = param_str(params, &["normalMode", "mode"]) {
+        return match name.trim().to_ascii_lowercase().as_str() {
+            "tangent" | "tangent normal" | "normal" => 0,
+            "bump" | "bump height" | "height" => 1,
+            _ => 0,
+        };
+    }
+    (param_f64(params, &["normalMode", "mode"], 0.0).round() as i32).clamp(0, 1)
+}
+
+pub(super) fn resolve_trig_op(params: &BTreeMap<String, Value>) -> i32 {
+    if let Some(name) = param_str(params, &["op", "mode", "function"]) {
+        return match name.trim().to_ascii_lowercase().as_str() {
+            "sin" | "sine" | "0" => 0,
+            "cos" | "cosine" | "1" => 1,
+            "tan" | "tangent" | "2" => 2,
+            "asin" | "arcsin" | "3" => 3,
+            "acos" | "arccos" | "4" => 4,
+            "atan" | "arctan" | "5" => 5,
+            _ => 0,
+        };
+    }
+    (param_f64(params, &["op", "mode", "function"], 0.0).round() as i32).clamp(0, 5)
+}
+
+pub(super) fn resolve_blur_mode(params: &BTreeMap<String, Value>) -> i32 {
+    if let Some(name) = param_str(params, &["mode", "type"]) {
+        return match name.trim().to_ascii_lowercase().as_str() {
+            "box" => 0,
+            "gaussian" | "gauss" => 1,
+            "directional" | "motion" => 2,
+            "radial" | "zoom" => 3,
+            _ => 0,
+        };
+    }
+    (param_f64(params, &["mode", "type"], 0.0).round() as i32).clamp(0, 3)
+}
+
+#[cfg(test)]
+mod graph_parse_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn map1(k: &str, v: Value) -> BTreeMap<String, Value> {
+        let mut m = BTreeMap::new();
+        m.insert(k.to_string(), v);
+        m
+    }
+
+    #[test]
+    fn blend_mode_indices_and_names_match_1_to_1() {
+        let names = [
+            "Mix",
+            "Add",
+            "Subtract",
+            "Multiply",
+            "Screen",
+            "Overlay",
+            "Darken",
+            "Lighten",
+            "Difference",
+            "Soft Light",
+            "Color Dodge",
+            "Color Burn",
+            "Linear Light",
+            "Divide",
+            "Exclusion",
+            "Hue",
+            "Saturation",
+            "Color",
+            "Luminosity",
+            "Hard Light",
+        ];
+        for (idx, name) in names.iter().enumerate() {
+            assert_eq!(
+                resolve_blend_mode(&map1("mode", json!(name)), &["mode"]),
+                idx as i32,
+                "blend name {name}"
+            );
+            assert_eq!(
+                resolve_blend_mode(&map1("mode", json!(idx)), &["mode"]),
+                idx as i32,
+                "blend index {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn math_op_indices_and_names_match_1_to_1() {
+        let names = [
+            "Add",
+            "Subtract",
+            "Multiply",
+            "Divide",
+            "Min",
+            "Max",
+            "Power",
+            "Modulo",
+            "Abs",
+            "Invert",
+            "Clamp",
+            "Compare",
+            "Sin",
+            "Round",
+            "Sqrt",
+            "Log",
+            "Exp",
+            "Floor",
+            "Ceil",
+            "Fract",
+            "Sign",
+            "Smooth Min",
+            "Smooth Max",
+            "Snap",
+            "Wrap",
+            "Ping-Pong",
+            "Cos",
+            "Tan",
+            "Atan2",
+            "Greater Than",
+            "Less Than",
+            "Step",
+            "Negate",
+        ];
+        for (idx, name) in names.iter().enumerate() {
+            assert_eq!(
+                resolve_math_op(&map1("mode", json!(name)), &["mode"], 0),
+                idx as i32,
+                "math name {name}"
+            );
+            assert_eq!(
+                resolve_math_op(&map1("mode", json!(idx)), &["mode"], 0),
+                idx as i32,
+                "math index {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_math_voronoi_ramp_normal_and_trig_resolvers_match_indices() {
+        let vec_names = [
+            "Add",
+            "Subtract",
+            "Multiply",
+            "Divide",
+            "Normalize",
+            "Dot",
+            "Length",
+            "Distance",
+            "Cross",
+            "Scale",
+        ];
+        for (idx, name) in vec_names.iter().enumerate() {
+            assert_eq!(
+                resolve_vector_math_op(&map1("mode", json!(name))),
+                idx as i32
+            );
+            assert_eq!(
+                resolve_vector_math_op(&map1("mode", json!(idx))),
+                idx as i32
+            );
+        }
+
+        let vor_names = ["F1 Distance", "F2 Distance", "Edge", "Cell ID"];
+        for (idx, name) in vor_names.iter().enumerate() {
+            assert_eq!(resolve_voronoi_mode(&map1("mode", json!(name))), idx as i32);
+            assert_eq!(resolve_voronoi_mode(&map1("mode", json!(idx))), idx as i32);
+        }
+
+        let ramp_names = ["Constant", "Linear", "Smooth", "Cubic"];
+        for (idx, name) in ramp_names.iter().enumerate() {
+            assert_eq!(
+                resolve_ramp_interp(&map1("interpolation", json!(name))),
+                idx as i32
+            );
+            assert_eq!(
+                resolve_ramp_interp(&map1("interpolation", json!(idx))),
+                idx as i32
+            );
+        }
+
+        assert_eq!(
+            resolve_normal_mode(&map1("normalMode", json!("Tangent Normal"))),
+            0
+        );
+        assert_eq!(resolve_normal_mode(&map1("normalMode", json!(0))), 0);
+        assert_eq!(
+            resolve_normal_mode(&map1("normalMode", json!("Bump Height"))),
+            1
+        );
+        assert_eq!(resolve_normal_mode(&map1("normalMode", json!(1))), 1);
+
+        let trig_names = ["Sin", "Cos", "Tan", "Asin", "Acos", "Atan"];
+        for (idx, name) in trig_names.iter().enumerate() {
+            assert_eq!(resolve_trig_op(&map1("op", json!(name))), idx as i32);
+            assert_eq!(resolve_trig_op(&map1("op", json!(idx))), idx as i32);
+        }
+    }
 }
 
 // ===========================================================================

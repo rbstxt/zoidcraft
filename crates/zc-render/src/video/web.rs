@@ -14,6 +14,7 @@ use crate::effects::fnv1a_hash64;
 
 thread_local! {
     static VIDEO_METADATA: RefCell<HashMap<u64, VideoMetadata>> = RefCell::default();
+    static VIDEO_PATH_ALIASES: RefCell<HashMap<String, u64>> = RefCell::default();
 }
 
 /// Registers metadata on the browser thread that runs the renderer. Use
@@ -24,6 +25,92 @@ pub fn register_web_video_metadata(asset_hash: u64, meta: VideoMetadata) {
 
 fn registered_metadata(asset_hash: u64) -> Option<VideoMetadata> {
     VIDEO_METADATA.with_borrow(|metadata| metadata.get(&asset_hash).cloned())
+}
+
+fn strip_file_url_prefix(url: &str) -> &str {
+    url.strip_prefix("file://").unwrap_or(url)
+}
+
+fn record_path_alias(raw: &str, asset_hash: u64) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let stripped = strip_file_url_prefix(trimmed);
+    VIDEO_PATH_ALIASES.with_borrow_mut(|aliases| {
+        aliases.insert(trimmed.to_owned(), asset_hash);
+        if stripped != trimmed && !stripped.is_empty() {
+            aliases.insert(stripped.to_owned(), asset_hash);
+        }
+        if let Some(name) = Path::new(stripped).file_name().and_then(|s| s.to_str())
+            && !name.is_empty()
+        {
+            aliases.insert(name.to_owned(), asset_hash);
+        }
+    });
+}
+
+fn parse_hex_u64_key(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        if !hex.is_empty() && hex.len() <= 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return u64::from_str_radix(hex, 16).ok();
+        }
+        return None;
+    }
+    if trimmed.len() == 16 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return u64::from_str_radix(trimmed, 16).ok();
+    }
+    None
+}
+
+fn fnv1a_with_zero_size(raw: &str) -> u64 {
+    // Matches `hash_asset_record` when `bytes` is `None`, `sha256` is empty, and `size == 0`.
+    fnv1a_hash64(raw.as_bytes()).wrapping_mul(0x0100_0000_01b3)
+}
+
+fn lookup_registered_hash_for_str(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let stripped = strip_file_url_prefix(trimmed);
+    let file_name = Path::new(stripped).file_name().and_then(|s| s.to_str());
+    let file_stem = Path::new(stripped).file_stem().and_then(|s| s.to_str());
+
+    if let Some(aliased) = VIDEO_PATH_ALIASES.with_borrow(|aliases| {
+        aliases
+            .get(trimmed)
+            .or_else(|| aliases.get(stripped))
+            .or_else(|| file_name.and_then(|n| aliases.get(n)))
+            .copied()
+    }) && registered_metadata(aliased).is_some()
+    {
+        return Some(aliased);
+    }
+
+    for candidate in [Some(trimmed), Some(stripped), file_name, file_stem]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(parsed) = parse_hex_u64_key(candidate)
+            && registered_metadata(parsed).is_some()
+        {
+            return Some(parsed);
+        }
+        let direct_hash = fnv1a_hash64(candidate.as_bytes());
+        if registered_metadata(direct_hash).is_some() {
+            return Some(direct_hash);
+        }
+        let zero_size_hash = fnv1a_with_zero_size(candidate);
+        if registered_metadata(zero_size_hash).is_some() {
+            return Some(zero_size_hash);
+        }
+    }
+    None
 }
 
 /// Reads a cached straight-alpha RGBA8 frame from `globalThis.__zcWebCodecs`.
@@ -91,11 +178,13 @@ fn decode_frame_bytes(
     (rgba.length() == expected_len).then(|| rgba.to_vec())
 }
 
-/// Looks up registered metadata for standalone media identified by the FNV-1a
-/// 64-bit hash of the path's UTF-8 bytes.
+/// Looks up registered metadata for media identified by hex asset hash, registered
+/// path/filename alias, or FNV-1a 64-bit hash of the path's UTF-8 bytes.
 #[must_use]
 pub fn probe_video_metadata(path: &Path) -> Option<VideoMetadata> {
-    registered_metadata(fnv1a_hash64(path.to_str()?.as_bytes()))
+    let raw = path.to_str()?;
+    let hash = lookup_registered_hash_for_str(raw)?;
+    registered_metadata(hash)
 }
 
 /// Returns the default FFmpeg command name. Browser builds cannot execute it.
@@ -123,12 +212,17 @@ pub struct VideoStreamSession {
 }
 
 impl VideoStreamSession {
-    /// Uses the FNV-1a 64-bit hash of the path's UTF-8 bytes as the asset key.
+    /// Resolves the asset key from a registered path/hex hash, falling back to the
+    /// FNV-1a 64-bit hash of the path's UTF-8 bytes.
     #[must_use]
     pub fn new(input_path: PathBuf, meta: VideoMetadata, dec_w: u32, dec_h: u32) -> Self {
+        let raw = input_path.to_string_lossy();
+        let asset_hash = lookup_registered_hash_for_str(&raw)
+            .or_else(|| parse_hex_u64_key(&raw))
+            .unwrap_or_else(|| fnv1a_hash64(raw.as_bytes()));
         Self {
             key: VideoStreamKey {
-                asset_hash: fnv1a_hash64(input_path.to_string_lossy().as_bytes()),
+                asset_hash,
                 dec_w: dec_w.max(2),
                 dec_h: dec_h.max(2),
             },
@@ -170,11 +264,30 @@ impl VideoDecoderPool {
     pub fn probe_asset(
         &mut self,
         asset_hash: u64,
-        _url: Option<&str>,
-        _filename: &str,
+        url: Option<&str>,
+        filename: &str,
         _bytes: Option<&[u8]>,
     ) -> Option<VideoMetadata> {
-        registered_metadata(asset_hash)
+        if let Some(meta) = registered_metadata(asset_hash) {
+            if let Some(u) = url {
+                record_path_alias(u, asset_hash);
+            }
+            if !filename.is_empty() {
+                record_path_alias(filename, asset_hash);
+            }
+            return Some(meta);
+        }
+        if let Some(u) = url
+            && let Some(resolved) = lookup_registered_hash_for_str(u)
+        {
+            return registered_metadata(resolved);
+        }
+        if !filename.is_empty()
+            && let Some(resolved) = lookup_registered_hash_for_str(filename)
+        {
+            return registered_metadata(resolved);
+        }
+        None
     }
 
     /// Reads a cached straight-alpha RGBA8 frame at the requested decode resolution.
@@ -214,15 +327,16 @@ impl VideoDecoderPool {
     pub fn decode_frame_from_path(
         &mut self,
         asset_hash: u64,
-        _path: &Path,
+        path: &Path,
         time_secs: f64,
         target_hint: Option<(u32, u32)>,
         max_gpu_dim: u32,
     ) -> Option<DecodedVideoImage> {
+        let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         self.decode_frame(
             asset_hash,
-            None,
-            "",
+            path.to_str(),
+            filename,
             None,
             time_secs,
             target_hint,

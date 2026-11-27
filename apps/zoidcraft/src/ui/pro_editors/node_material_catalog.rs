@@ -217,6 +217,18 @@ pub const MATERIAL_NODE_CATALOG: &[NodeTypeSpec] = &[
         ],
         params: &[
             NodeParamSpec {
+                key: "feature",
+                label: "Feature",
+                kind: NodeParamKind::Choice(&[
+                    "F1 Distance",
+                    "F2 Distance",
+                    "Smooth F1",
+                    "Edge",
+                    "Cell ID",
+                ]),
+                default_f64: 0.0,
+            },
+            NodeParamSpec {
                 key: "scale",
                 label: "Scale",
                 kind: NodeParamKind::Float {
@@ -227,8 +239,8 @@ pub const MATERIAL_NODE_CATALOG: &[NodeTypeSpec] = &[
                 default_f64: 6.0,
             },
             NodeParamSpec {
-                key: "jitter",
-                label: "Jitter",
+                key: "randomness",
+                label: "Randomness",
                 kind: NodeParamKind::Float {
                     min: 0.0,
                     max: 1.0,
@@ -365,12 +377,12 @@ pub const MATERIAL_NODE_CATALOG: &[NodeTypeSpec] = &[
         }],
         outputs: &[
             PortSpec {
-                id: "color",
+                id: "out",
                 label: "Color",
                 data_type: PortDataType::Color,
             },
             PortSpec {
-                id: "out",
+                id: "mortar",
                 label: "Mortar",
                 data_type: PortDataType::Float,
             },
@@ -387,14 +399,14 @@ pub const MATERIAL_NODE_CATALOG: &[NodeTypeSpec] = &[
                 default_f64: 4.0,
             },
             NodeParamSpec {
-                key: "mortarSize",
+                key: "mortar",
                 label: "Mortar",
                 kind: NodeParamKind::Float {
                     min: 0.005,
                     max: 0.2,
                     step: 0.005,
                 },
-                default_f64: 0.03,
+                default_f64: 0.04,
             },
         ],
     },
@@ -424,14 +436,14 @@ pub const MATERIAL_NODE_CATALOG: &[NodeTypeSpec] = &[
                 default_f64: 4.0,
             },
             NodeParamSpec {
-                key: "turbulence",
+                key: "veins",
                 label: "Veins",
                 kind: NodeParamKind::Float {
                     min: 0.0,
                     max: 12.0,
                     step: 0.2,
                 },
-                default_f64: 5.0,
+                default_f64: 3.0,
             },
         ],
     },
@@ -521,12 +533,12 @@ pub const MATERIAL_NODE_CATALOG: &[NodeTypeSpec] = &[
         title: "Blackbody",
         category: "Procedural",
         inputs: &[PortSpec {
-            id: "temperature",
+            id: "t",
             label: "Kelvin",
             data_type: PortDataType::Float,
         }],
         outputs: &[PortSpec {
-            id: "color",
+            id: "out",
             label: "Color",
             data_type: PortDataType::Color,
         }],
@@ -540,6 +552,191 @@ pub const MATERIAL_NODE_CATALOG: &[NodeTypeSpec] = &[
             },
             default_f64: 5500.0,
         }],
+    },
+    NodeTypeSpec {
+        kind: "sineWave",
+        title: "Sine Wave",
+        category: "Procedural",
+        inputs: &[PortSpec {
+            id: "uv",
+            label: "UV",
+            data_type: PortDataType::Uv,
+        }],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Value",
+            data_type: PortDataType::Float,
+        }],
+        params: &[
+            NodeParamSpec {
+                key: "scale",
+                label: "Scale",
+                kind: NodeParamKind::Float {
+                    min: 0.5,
+                    max: 64.0,
+                    step: 0.2,
+                },
+                default_f64: 6.0,
+            },
+            NodeParamSpec {
+                key: "phase",
+                label: "Phase",
+                kind: NodeParamKind::Float {
+                    min: -10.0,
+                    max: 10.0,
+                    step: 0.05,
+                },
+                default_f64: 0.0,
+            },
+            NodeParamSpec {
+                key: "axis",
+                label: "Axis",
+                kind: NodeParamKind::Choice(&["U", "V"]),
+                default_f64: 0.0,
+            },
+        ],
+    },
+    NodeTypeSpec {
+        kind: "dirt",
+        title: "Dirt / AO Noise",
+        category: "Procedural",
+        inputs: &[PortSpec {
+            id: "uv",
+            label: "UV",
+            data_type: PortDataType::Uv,
+        }],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Factor",
+            data_type: PortDataType::Float,
+        }],
+        params: &[
+            NodeParamSpec {
+                key: "scale",
+                label: "Scale",
+                kind: NodeParamKind::Float {
+                    min: 0.5,
+                    max: 64.0,
+                    step: 0.2,
+                },
+                default_f64: 4.0,
+            },
+            NodeParamSpec {
+                key: "radius",
+                label: "Radius",
+                kind: NodeParamKind::Float {
+                    min: 0.1,
+                    max: 5.0,
+                    step: 0.05,
+                },
+                default_f64: 1.4,
+            },
+        ],
+    },
+    NodeTypeSpec {
+        kind: "magic",
+        title: "Magic Pattern",
+        category: "Procedural",
+        inputs: &[PortSpec {
+            id: "uv",
+            label: "UV",
+            data_type: PortDataType::Uv,
+        }],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Color",
+            data_type: PortDataType::Color,
+        }],
+        params: &[
+            NodeParamSpec {
+                key: "scale",
+                label: "Scale",
+                kind: NodeParamKind::Float {
+                    min: 0.5,
+                    max: 32.0,
+                    step: 0.2,
+                },
+                default_f64: 5.0,
+            },
+            NodeParamSpec {
+                key: "depth",
+                label: "Depth",
+                kind: NodeParamKind::Int { min: 0, max: 10 },
+                default_f64: 2.0,
+            },
+            NodeParamSpec {
+                key: "distortion",
+                label: "Distortion",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 5.0,
+                    step: 0.1,
+                },
+                default_f64: 1.0,
+            },
+        ],
+    },
+    NodeTypeSpec {
+        kind: "rgbSpectrum",
+        title: "RGB Spectrum",
+        category: "Procedural",
+        inputs: &[PortSpec {
+            id: "t",
+            label: "Shift",
+            data_type: PortDataType::Float,
+        }],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Color",
+            data_type: PortDataType::Color,
+        }],
+        params: &[NodeParamSpec {
+            key: "wavelength",
+            label: "Wavelength (nm)",
+            kind: NodeParamKind::Float {
+                min: 380.0,
+                max: 780.0,
+                step: 5.0,
+            },
+            default_f64: 550.0,
+        }],
+    },
+    NodeTypeSpec {
+        kind: "gaussianSpectrum",
+        title: "Gaussian Spectrum",
+        category: "Procedural",
+        inputs: &[PortSpec {
+            id: "t",
+            label: "Shift",
+            data_type: PortDataType::Float,
+        }],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Color",
+            data_type: PortDataType::Color,
+        }],
+        params: &[
+            NodeParamSpec {
+                key: "center",
+                label: "Center (nm)",
+                kind: NodeParamKind::Float {
+                    min: 380.0,
+                    max: 780.0,
+                    step: 5.0,
+                },
+                default_f64: 550.0,
+            },
+            NodeParamSpec {
+                key: "width",
+                label: "Width",
+                kind: NodeParamKind::Float {
+                    min: 5.0,
+                    max: 250.0,
+                    step: 5.0,
+                },
+                default_f64: 60.0,
+            },
+        ],
     },
     // --- Color & Math ---
     NodeTypeSpec {
@@ -561,13 +758,482 @@ pub const MATERIAL_NODE_CATALOG: &[NodeTypeSpec] = &[
                 key: "interpolation",
                 label: "Interp",
                 kind: NodeParamKind::Choice(RAMP_INTERP),
-                default_f64: 0.0,
+                default_f64: 1.0,
             },
             NodeParamSpec {
                 key: "stops",
                 label: "Stops",
                 kind: NodeParamKind::ColorRamp,
                 default_f64: 0.0,
+            },
+        ],
+    },
+    NodeTypeSpec {
+        kind: "colorizer",
+        title: "5-Stop Colorizer",
+        category: "Color & Math",
+        inputs: &[PortSpec {
+            id: "a",
+            label: "Factor",
+            data_type: PortDataType::Float,
+        }],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Color",
+            data_type: PortDataType::Color,
+        }],
+        params: &[
+            NodeParamSpec {
+                key: "color1",
+                label: "Stop 1",
+                kind: NodeParamKind::ColorRgb,
+                default_f64: 0.0,
+            },
+            NodeParamSpec {
+                key: "color2",
+                label: "Stop 2",
+                kind: NodeParamKind::ColorRgb,
+                default_f64: 0.25,
+            },
+            NodeParamSpec {
+                key: "color3",
+                label: "Stop 3",
+                kind: NodeParamKind::ColorRgb,
+                default_f64: 0.7,
+            },
+            NodeParamSpec {
+                key: "color4",
+                label: "Stop 4",
+                kind: NodeParamKind::ColorRgb,
+                default_f64: 1.0,
+            },
+            NodeParamSpec {
+                key: "color5",
+                label: "Stop 5",
+                kind: NodeParamKind::ColorRgb,
+                default_f64: 1.0,
+            },
+        ],
+    },
+    NodeTypeSpec {
+        kind: "rgbCurves",
+        title: "RGB Curves",
+        category: "Color & Math",
+        inputs: &[PortSpec {
+            id: "color",
+            label: "Color",
+            data_type: PortDataType::Color,
+        }],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Color",
+            data_type: PortDataType::Color,
+        }],
+        params: &[
+            NodeParamSpec {
+                key: "factor",
+                label: "Factor",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.02,
+                },
+                default_f64: 1.0,
+            },
+            NodeParamSpec {
+                key: "curves",
+                label: "Curves",
+                kind: NodeParamKind::RgbCurves,
+                default_f64: 0.0,
+            },
+        ],
+    },
+    NodeTypeSpec {
+        kind: "separateRGB",
+        title: "Separate RGB",
+        category: "Color & Math",
+        inputs: &[PortSpec {
+            id: "color",
+            label: "Color",
+            data_type: PortDataType::Color,
+        }],
+        outputs: &[
+            PortSpec {
+                id: "r",
+                label: "R",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "g",
+                label: "G",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "b",
+                label: "B",
+                data_type: PortDataType::Float,
+            },
+        ],
+        params: &[],
+    },
+    NodeTypeSpec {
+        kind: "combineRGB",
+        title: "Combine RGB",
+        category: "Color & Math",
+        inputs: &[
+            PortSpec {
+                id: "r",
+                label: "R",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "g",
+                label: "G",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "b",
+                label: "B",
+                data_type: PortDataType::Float,
+            },
+        ],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Color",
+            data_type: PortDataType::Color,
+        }],
+        params: &[
+            NodeParamSpec {
+                key: "r",
+                label: "R",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.01,
+                },
+                default_f64: 0.0,
+            },
+            NodeParamSpec {
+                key: "g",
+                label: "G",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.01,
+                },
+                default_f64: 0.0,
+            },
+            NodeParamSpec {
+                key: "b",
+                label: "B",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.01,
+                },
+                default_f64: 0.0,
+            },
+        ],
+    },
+    NodeTypeSpec {
+        kind: "separateHSV",
+        title: "Separate HSV",
+        category: "Color & Math",
+        inputs: &[PortSpec {
+            id: "color",
+            label: "Color",
+            data_type: PortDataType::Color,
+        }],
+        outputs: &[
+            PortSpec {
+                id: "h",
+                label: "H",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "s",
+                label: "S",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "v",
+                label: "V",
+                data_type: PortDataType::Float,
+            },
+        ],
+        params: &[],
+    },
+    NodeTypeSpec {
+        kind: "combineHSV",
+        title: "Combine HSV",
+        category: "Color & Math",
+        inputs: &[
+            PortSpec {
+                id: "h",
+                label: "H",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "s",
+                label: "S",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "v",
+                label: "V",
+                data_type: PortDataType::Float,
+            },
+        ],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Color",
+            data_type: PortDataType::Color,
+        }],
+        params: &[
+            NodeParamSpec {
+                key: "h",
+                label: "H",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.01,
+                },
+                default_f64: 0.0,
+            },
+            NodeParamSpec {
+                key: "s",
+                label: "S",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.01,
+                },
+                default_f64: 1.0,
+            },
+            NodeParamSpec {
+                key: "v",
+                label: "V",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.01,
+                },
+                default_f64: 1.0,
+            },
+        ],
+    },
+    NodeTypeSpec {
+        kind: "cosineMix",
+        title: "Cosine Mix",
+        category: "Color & Math",
+        inputs: &[
+            PortSpec {
+                id: "a",
+                label: "Color A",
+                data_type: PortDataType::Color,
+            },
+            PortSpec {
+                id: "b",
+                label: "Color B",
+                data_type: PortDataType::Color,
+            },
+        ],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Color",
+            data_type: PortDataType::Color,
+        }],
+        params: &[NodeParamSpec {
+            key: "mix",
+            label: "Mix",
+            kind: NodeParamKind::Float {
+                min: 0.0,
+                max: 1.0,
+                step: 0.01,
+            },
+            default_f64: 0.5,
+        }],
+    },
+    NodeTypeSpec {
+        kind: "clampTexture",
+        title: "Clamp",
+        category: "Color & Math",
+        inputs: &[PortSpec {
+            id: "a",
+            label: "Color",
+            data_type: PortDataType::Color,
+        }],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Result",
+            data_type: PortDataType::Color,
+        }],
+        params: &[
+            NodeParamSpec {
+                key: "min",
+                label: "Min",
+                kind: NodeParamKind::Float {
+                    min: -10.0,
+                    max: 10.0,
+                    step: 0.02,
+                },
+                default_f64: 0.0,
+            },
+            NodeParamSpec {
+                key: "max",
+                label: "Max",
+                kind: NodeParamKind::Float {
+                    min: -10.0,
+                    max: 10.0,
+                    step: 0.02,
+                },
+                default_f64: 1.0,
+            },
+        ],
+    },
+    NodeTypeSpec {
+        kind: "multiply",
+        title: "Multiply",
+        category: "Color & Math",
+        inputs: &[
+            PortSpec {
+                id: "a",
+                label: "A",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "b",
+                label: "B",
+                data_type: PortDataType::Float,
+            },
+        ],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Result",
+            data_type: PortDataType::Float,
+        }],
+        params: &[NodeParamSpec {
+            key: "value",
+            label: "B",
+            kind: NodeParamKind::Float {
+                min: -100.0,
+                max: 100.0,
+                step: 0.05,
+            },
+            default_f64: 1.0,
+        }],
+    },
+    NodeTypeSpec {
+        kind: "add",
+        title: "Add",
+        category: "Color & Math",
+        inputs: &[
+            PortSpec {
+                id: "a",
+                label: "A",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "b",
+                label: "B",
+                data_type: PortDataType::Float,
+            },
+        ],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Result",
+            data_type: PortDataType::Float,
+        }],
+        params: &[NodeParamSpec {
+            key: "value",
+            label: "B",
+            kind: NodeParamKind::Float {
+                min: -100.0,
+                max: 100.0,
+                step: 0.05,
+            },
+            default_f64: 0.0,
+        }],
+    },
+    NodeTypeSpec {
+        kind: "subtract",
+        title: "Subtract",
+        category: "Color & Math",
+        inputs: &[
+            PortSpec {
+                id: "a",
+                label: "A",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "b",
+                label: "B",
+                data_type: PortDataType::Float,
+            },
+        ],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Result",
+            data_type: PortDataType::Float,
+        }],
+        params: &[NodeParamSpec {
+            key: "value",
+            label: "B",
+            kind: NodeParamKind::Float {
+                min: -100.0,
+                max: 100.0,
+                step: 0.05,
+            },
+            default_f64: 0.0,
+        }],
+    },
+    NodeTypeSpec {
+        kind: "compare",
+        title: "Compare",
+        category: "Color & Math",
+        inputs: &[
+            PortSpec {
+                id: "a",
+                label: "A",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "b",
+                label: "B",
+                data_type: PortDataType::Float,
+            },
+        ],
+        outputs: &[PortSpec {
+            id: "out",
+            label: "Mask",
+            data_type: PortDataType::Float,
+        }],
+        params: &[
+            NodeParamSpec {
+                key: "op",
+                label: "Op",
+                kind: NodeParamKind::Choice(&["Greater", "Less", "Equal"]),
+                default_f64: 0.0,
+            },
+            NodeParamSpec {
+                key: "value",
+                label: "Threshold",
+                kind: NodeParamKind::Float {
+                    min: -10.0,
+                    max: 10.0,
+                    step: 0.02,
+                },
+                default_f64: 0.5,
+            },
+            NodeParamSpec {
+                key: "epsilon",
+                label: "Epsilon",
+                kind: NodeParamKind::Float {
+                    min: 0.0001,
+                    max: 1.0,
+                    step: 0.005,
+                },
+                default_f64: 0.01,
             },
         ],
     },
@@ -647,11 +1313,11 @@ pub const MATERIAL_NODE_CATALOG: &[NodeTypeSpec] = &[
                 key: "brightness",
                 label: "Brightness",
                 kind: NodeParamKind::Float {
-                    min: -1.0,
-                    max: 1.0,
+                    min: 0.0,
+                    max: 2.0,
                     step: 0.01,
                 },
-                default_f64: 0.0,
+                default_f64: 1.0,
             },
             NodeParamSpec {
                 key: "contrast",
@@ -847,22 +1513,64 @@ pub const MATERIAL_NODE_CATALOG: &[NodeTypeSpec] = &[
         kind: "fresnel",
         title: "Fresnel",
         category: "Surface",
-        inputs: &[],
+        inputs: &[PortSpec {
+            id: "normal",
+            label: "Normal",
+            data_type: PortDataType::Vec3,
+        }],
         outputs: &[PortSpec {
             id: "out",
             label: "Factor",
             data_type: PortDataType::Float,
         }],
-        params: &[NodeParamSpec {
-            key: "ior",
-            label: "IOR",
-            kind: NodeParamKind::Float {
-                min: 1.0,
-                max: 4.0,
-                step: 0.05,
+        params: &[
+            NodeParamSpec {
+                key: "ior",
+                label: "IOR",
+                kind: NodeParamKind::Float {
+                    min: 1.0,
+                    max: 4.0,
+                    step: 0.05,
+                },
+                default_f64: 1.45,
             },
-            default_f64: 1.45,
-        }],
+            NodeParamSpec {
+                key: "power",
+                label: "Power",
+                kind: NodeParamKind::Float {
+                    min: 0.1,
+                    max: 16.0,
+                    step: 0.1,
+                },
+                default_f64: 3.0,
+            },
+            NodeParamSpec {
+                key: "viewAngle",
+                label: "View Angle (°)",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 89.0,
+                    step: 1.0,
+                },
+                default_f64: 0.0,
+            },
+            NodeParamSpec {
+                key: "mix",
+                label: "Strength",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.02,
+                },
+                default_f64: 1.0,
+            },
+            NodeParamSpec {
+                key: "color",
+                label: "Color",
+                kind: NodeParamKind::ColorRgb,
+                default_f64: 1.0,
+            },
+        ],
     },
     // --- Output ---
     NodeTypeSpec {
@@ -878,6 +1586,11 @@ pub const MATERIAL_NODE_CATALOG: &[NodeTypeSpec] = &[
             PortSpec {
                 id: "emissive",
                 label: "Emissive",
+                data_type: PortDataType::Color,
+            },
+            PortSpec {
+                id: "luminance",
+                label: "Luminance",
                 data_type: PortDataType::Color,
             },
             PortSpec {
@@ -904,6 +1617,11 @@ pub const MATERIAL_NODE_CATALOG: &[NodeTypeSpec] = &[
                 id: "opacity",
                 label: "Opacity",
                 data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "fresnel",
+                label: "Fresnel",
+                data_type: PortDataType::Color,
             },
         ],
         outputs: &[],

@@ -115,6 +115,9 @@ pub enum GraphDragState {
         key_value: f64,
         grab_start_pos: Pos2,
         orig_tangent: [f64; 2],
+        /// Snapshot of `(key_id, orig_matching_tangent, prev_frame, next_frame)` for any other
+        /// selected keys so multi-key handle edits apply the same relative delta without drift.
+        orig_other_tangents: Vec<(GraphKeyId, [f64; 2], f64, f64)>,
         changed: bool,
     },
     DraggingSpeedHandle {
@@ -164,6 +167,98 @@ pub struct ExprCurveCacheKey {
     pub speed_mode: bool,
 }
 
+/// Per-curve min/max range used when `GraphEditorState::normalize_curves` (`Norm`) is active.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CurveNormRange {
+    pub min_v: f64,
+    pub max_v: f64,
+}
+
+impl CurveNormRange {
+    #[must_use]
+    pub fn from_track(track: &CurveTrack) -> Self {
+        let mut min_v = f64::INFINITY;
+        let mut max_v = f64::NEG_INFINITY;
+        for kf in &track.keyframes {
+            if kf.value.is_finite() {
+                min_v = min_v.min(kf.value);
+                max_v = max_v.max(kf.value);
+            }
+        }
+        if !min_v.is_finite() || !max_v.is_finite() {
+            return Self {
+                min_v: 0.0,
+                max_v: 1.0,
+            };
+        }
+        Self { min_v, max_v }
+    }
+
+    #[must_use]
+    pub fn from_samples(samples: &[(f64, f64)]) -> Self {
+        let mut min_v = f64::INFINITY;
+        let mut max_v = f64::NEG_INFINITY;
+        for &(_, v) in samples {
+            if v.is_finite() {
+                min_v = min_v.min(v);
+                max_v = max_v.max(v);
+            }
+        }
+        if !min_v.is_finite() || !max_v.is_finite() {
+            return Self {
+                min_v: 0.0,
+                max_v: 1.0,
+            };
+        }
+        Self { min_v, max_v }
+    }
+
+    #[must_use]
+    pub fn span(&self) -> f64 {
+        (self.max_v - self.min_v).abs()
+    }
+
+    /// Maps a raw curve value into `[0.0, 1.0]` (constant curves map around `0.5`).
+    #[must_use]
+    pub fn normalize(&self, raw_v: f64) -> f64 {
+        let span = self.span();
+        if span <= 1e-9 {
+            0.5 + (raw_v - self.min_v)
+        } else {
+            (raw_v - self.min_v) / span
+        }
+    }
+
+    /// Inverse of `normalize`: maps a normalized display value back to raw curve units.
+    #[must_use]
+    pub fn denormalize(&self, norm_v: f64) -> f64 {
+        let span = self.span();
+        if span <= 1e-9 {
+            self.min_v + (norm_v - 0.5)
+        } else {
+            self.min_v + norm_v * span
+        }
+    }
+
+    /// Scales a raw value delta into normalized display units.
+    #[must_use]
+    pub fn normalize_delta(&self, raw_dv: f64) -> f64 {
+        let span = self.span();
+        if span <= 1e-9 { raw_dv } else { raw_dv / span }
+    }
+
+    /// Inverse of `normalize_delta`: scales a normalized display delta back into raw curve units.
+    #[must_use]
+    pub fn denormalize_delta(&self, norm_dv: f64) -> f64 {
+        let span = self.span();
+        if span <= 1e-9 {
+            norm_dv
+        } else {
+            norm_dv * span
+        }
+    }
+}
+
 /// Persistent state for the dual-mode Graph Editor widget.
 #[derive(Debug, Clone)]
 pub struct GraphEditorState {
@@ -184,6 +279,14 @@ pub struct GraphEditorState {
     pub focused_property: Option<(String, String)>,
     pub selected_keys: Vec<GraphKeyId>,
     pub handles: BTreeMap<GraphKeyId, BezierHandlePair>,
+    /// Per-channel Bezier handle overrides for vector properties (e.g. `position.X` vs `.Y`/`.Z`),
+    /// preventing edits on one axis from clobbering sibling channels in the graph editor.
+    pub channel_handle_overrides: BTreeMap<GraphKeyId, BezierHandlePair>,
+    /// Last `(control_points, continuous)` persisted to `SessionKeyframe` per
+    /// `(target_id, property, frame_bits)` so external edits (undo/redo/paste) cleanly invalidate
+    /// stale per-channel overrides.
+    #[allow(clippy::type_complexity)]
+    pub last_persisted_cp: BTreeMap<(String, String, u64), ([[f64; 2]; 2], bool)>,
     pub easing_plus_curve: [f64; 4],
     pub overshoot_top: bool,
     pub overshoot_bottom: bool,
@@ -230,6 +333,8 @@ impl GraphEditorState {
             focused_property: None,
             selected_keys: Vec::new(),
             handles: BTreeMap::new(),
+            channel_handle_overrides: BTreeMap::new(),
+            last_persisted_cp: BTreeMap::new(),
             easing_plus_curve: [0.333, 0.333, 0.667, 0.667],
             overshoot_top: false,
             overshoot_bottom: false,
@@ -361,10 +466,11 @@ impl GraphEditorState {
             }
             for kf in &track.keyframes {
                 let abs_f = track.frame_offset + kf.local_frame;
+                let disp_v = self.display_value_for_track(track, kf.value);
                 min_f = min_f.min(abs_f);
                 max_f = max_f.max(abs_f);
-                min_v = min_v.min(kf.value);
-                max_v = max_v.max(kf.value);
+                min_v = min_v.min(disp_v);
+                max_v = max_v.max(disp_v);
             }
         }
 
@@ -392,10 +498,11 @@ impl GraphEditorState {
                 && self.is_track_visible(&track.track_key)
             {
                 let abs_f = track.frame_offset + kf.local_frame;
+                let disp_v = self.display_value_for_track(track, kf.value);
                 min_f = min_f.min(abs_f);
                 max_f = max_f.max(abs_f);
-                min_v = min_v.min(kf.value);
-                max_v = max_v.max(kf.value);
+                min_v = min_v.min(disp_v);
+                max_v = max_v.max(disp_v);
             }
         }
 
@@ -418,6 +525,45 @@ impl GraphEditorState {
             return solo == track_key;
         }
         !self.hidden_tracks.contains(track_key)
+    }
+
+    /// Maps a raw keyframe/curve value into display Y space (`[0.0, 1.0]` when `Norm` is active in
+    /// Value mode, or raw value otherwise).
+    #[must_use]
+    pub fn display_value_for_track(&self, track: &CurveTrack, raw_value: f64) -> f64 {
+        if self.normalize_curves && self.plot_mode == GraphPlotMode::Value {
+            CurveNormRange::from_track(track).normalize(raw_value)
+        } else {
+            raw_value
+        }
+    }
+
+    /// Scales a raw value delta (such as a Bezier tangent `dy`) into display Y delta space.
+    #[must_use]
+    pub fn display_delta_for_track(&self, track: &CurveTrack, raw_delta: f64) -> f64 {
+        if self.normalize_curves && self.plot_mode == GraphPlotMode::Value {
+            CurveNormRange::from_track(track).normalize_delta(raw_delta)
+        } else {
+            raw_delta
+        }
+    }
+
+    /// Inverse of `display_delta_for_track`: maps a vertical drag delta in display Y space back
+    /// into raw property units for `track`.
+    #[must_use]
+    pub fn raw_delta_from_display(&self, track: &CurveTrack, display_delta: f64) -> f64 {
+        if self.normalize_curves && self.plot_mode == GraphPlotMode::Value {
+            CurveNormRange::from_track(track).denormalize_delta(display_delta)
+        } else {
+            display_delta
+        }
+    }
+
+    /// Maps a raw curve value on `track` directly to canvas screen Y (honoring `normalize_curves`).
+    #[must_use]
+    pub fn track_value_to_screen_y(&self, track: &CurveTrack, raw_value: f64, rect: Rect) -> f32 {
+        let disp = self.display_value_for_track(track, raw_value);
+        self.value_to_screen_y(disp, rect)
     }
 
     /// Maps an absolute frame to canvas screen X.

@@ -392,11 +392,36 @@ fn rewrite_slice(
                 continue;
             }
             Token::Ident(name) if name == "gl_PointCoord" && !prev_is_dot => {
-                out.push(Token::Ident("vec2".to_string()));
-                out.push(Token::Punct("(".to_string()));
-                out.push(Token::Number("0.5".to_string()));
-                out.push(Token::Punct(")".to_string()));
-                budget.charge(3)?;
+                // WebGPU / WGSL fragment shaders have no built-in `gl_PointCoord` (point sprites
+                // are rendered as screen-aligned quads). When `vUv` is not shadowed, derive the
+                // top-left `[0, 1]^2` point coordinate from the quad's `vUv` varying (`y` flipped
+                // to match OpenGL ES / WebGL top-left `gl_PointCoord` orientation); otherwise fall
+                // back to the sprite center `vec2(0.5)`.
+                if !is_shadowed("vUv", scopes)
+                    && !ctx.uniforms.contains_key("vUv")
+                    && !ctx.struct_uniforms.contains_key("vUv")
+                    && !ctx.samplers.contains("vUv")
+                {
+                    out.push(Token::Ident("vec2".to_string()));
+                    out.push(Token::Punct("(".to_string()));
+                    out.push(Token::Ident("vUv".to_string()));
+                    out.push(Token::Punct(".".to_string()));
+                    out.push(Token::Ident("x".to_string()));
+                    out.push(Token::Punct(",".to_string()));
+                    out.push(Token::Number("1.0".to_string()));
+                    out.push(Token::Punct("-".to_string()));
+                    out.push(Token::Ident("vUv".to_string()));
+                    out.push(Token::Punct(".".to_string()));
+                    out.push(Token::Ident("y".to_string()));
+                    out.push(Token::Punct(")".to_string()));
+                    budget.charge(11)?;
+                } else {
+                    out.push(Token::Ident("vec2".to_string()));
+                    out.push(Token::Punct("(".to_string()));
+                    out.push(Token::Number("0.5".to_string()));
+                    out.push(Token::Punct(")".to_string()));
+                    budget.charge(3)?;
+                }
                 i += 1;
                 continue;
             }
@@ -1035,4 +1060,41 @@ fn rewrite_preprocessor_line(
     )?;
     let rendered = render_tokens(&rewritten).trim().to_string();
     Ok(format!("#define {macro_name}{header_suffix} {rendered}"))
+}
+
+#[cfg(test)]
+mod rewrite_tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_gl_point_coord_from_uv_when_unshadowed_and_falls_back_when_shadowed() {
+        let src = r#"
+            precision highp float;
+            varying vec2 vUv;
+            void main() {
+                vec2 pc = gl_PointCoord;
+                gl_FragColor = vec4(pc, 0.0, 1.0);
+            }
+        "#;
+        let compiled = translate_glsl_es100(src).expect("gl_PointCoord shader must compile");
+        assert!(!compiled.glsl450_source.contains("gl_PointCoord"));
+        assert!(
+            compiled.glsl450_source.contains("vec2(vUv.x, 1.0 - vUv.y)"),
+            "expected top-left UV derivation in:\n{}",
+            compiled.glsl450_source
+        );
+
+        let shadowed = r#"
+            precision highp float;
+            void main() {
+                float vUv = 0.25;
+                vec2 pc = gl_PointCoord;
+                gl_FragColor = vec4(pc, vUv, 1.0);
+            }
+        "#;
+        let compiled_shadowed =
+            translate_glsl_es100(shadowed).expect("shadowed vUv gl_PointCoord must compile");
+        assert!(!compiled_shadowed.glsl450_source.contains("gl_PointCoord"));
+        assert!(compiled_shadowed.glsl450_source.contains("vec2(0.5)"));
+    }
 }

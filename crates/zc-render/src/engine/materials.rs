@@ -23,10 +23,11 @@ impl ProjectRenderEngine {
                 ..Default::default()
             },
             MaterialSpec::Texture(m) => {
-                let albedo = m
+                let (albedo, albedo_premultiplied) = m
                     .texture
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
+                    .and_then(|id| self.resolve_material_texture(id, "effects-masks", env))
+                    .map_or((None, false), |(t, pm)| (Some(t), pm));
                 EvaluatedMaterial {
                     params: MaterialParams {
                         shading: ShadingModel::Basic,
@@ -38,7 +39,7 @@ impl ProjectRenderEngine {
                         uv_center: eval_vec2(&m.center, env),
                         uv_rotation: eval_f32(&m.rotation, env),
                         wrap: TextureWrap::from_cm3(m.wrap),
-                        albedo_premultiplied: false,
+                        albedo_premultiplied,
                         ..Default::default()
                     },
                     albedo,
@@ -81,10 +82,11 @@ impl ProjectRenderEngine {
             }
             MaterialSpec::CustomPbr(m) => {
                 let opacity = eval_f32(&m.opacity, env).clamp(0.0, 1.0);
-                let albedo = m
+                let (albedo, albedo_premultiplied) = m
                     .texture
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
+                    .and_then(|id| self.resolve_material_texture(id, "effects-masks", env))
+                    .map_or((None, false), |(t, pm)| (Some(t), pm));
                 let normal = m
                     .normal_map
                     .as_deref()
@@ -106,7 +108,7 @@ impl ProjectRenderEngine {
                         uv_rotation: eval_f32(&m.rotation, env),
                         wrap: TextureWrap::from_cm3(m.wrap),
                         reflection_enabled: m.reflection,
-                        albedo_premultiplied: false,
+                        albedo_premultiplied,
                         ..Default::default()
                     },
                     albedo,
@@ -128,10 +130,25 @@ impl ProjectRenderEngine {
                 let emissive_intensity = eval_f32(&m.emissive_intensity, env).max(0.0);
                 let alpha_test = (m.alpha_test as f32).clamp(0.0, 1.0);
 
-                let albedo = m
-                    .base_color_map
-                    .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
+                let layer_stage = m
+                    .preserved
+                    .get("stage")
+                    .or_else(|| m.preserved.get("layerStage"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("effects-masks");
+                let albedo_ref = m.base_color_map.as_deref().or_else(|| {
+                    m.preserved
+                        .get("layerSource")
+                        .or_else(|| m.preserved.get("layerInput"))
+                        .or_else(|| m.preserved.get("sourceLayer"))
+                        .and_then(|v| {
+                            v.as_str()
+                                .or_else(|| v.get("value").and_then(serde_json::Value::as_str))
+                        })
+                });
+                let (albedo, albedo_premultiplied) = albedo_ref
+                    .and_then(|id| self.resolve_material_texture(id, layer_stage, env))
+                    .map_or((None, false), |(t, pm)| (Some(t), pm));
                 let normal = m
                     .normal_map
                     .as_deref()
@@ -139,7 +156,8 @@ impl ProjectRenderEngine {
                 let emissive_map = m
                     .emissive_map
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
+                    .and_then(|id| self.resolve_material_texture(id, layer_stage, env))
+                    .map(|(t, _)| t);
                 let roughness_map = m
                     .roughness_map
                     .as_deref()
@@ -189,7 +207,7 @@ impl ProjectRenderEngine {
                     alpha_test,
                     reflection_intensity,
                     reflection_enabled: m.reflection,
-                    albedo_premultiplied: false,
+                    albedo_premultiplied,
                     ..Default::default()
                 };
                 apply_pbr_plus_surface_props(&mut params, &m.preserved, ao_map.is_some(), env);
@@ -210,6 +228,7 @@ impl ProjectRenderEngine {
                     custom_params_a: [0.0; 4],
                     custom_params_b: [0.0; 4],
                     custom_glsl_uniforms: BTreeMap::new(),
+                    custom_glsl_textures: BTreeMap::new(),
                 }
             }
             MaterialSpec::Matcap(m) => {
@@ -240,10 +259,11 @@ impl ProjectRenderEngine {
             }
             MaterialSpec::ImagePlus(m) => {
                 let opacity = eval_f32(&m.opacity, env).clamp(0.0, 1.0);
-                let albedo = m
+                let (albedo, albedo_premultiplied) = m
                     .texture
                     .as_deref()
-                    .and_then(|id| self.ensure_image_asset_texture(env.project, id, false));
+                    .and_then(|id| self.resolve_material_texture(id, "effects-masks", env))
+                    .map_or((None, false), |(t, pm)| (Some(t), pm));
                 EvaluatedMaterial {
                     params: MaterialParams {
                         shading: ShadingModel::Basic,
@@ -256,7 +276,7 @@ impl ProjectRenderEngine {
                         uv_center: eval_vec2(&m.center, env),
                         uv_rotation: eval_f32(&m.rotation, env),
                         wrap: TextureWrap::from_cm3(m.wrap),
-                        albedo_premultiplied: false,
+                        albedo_premultiplied,
                         ..Default::default()
                     },
                     albedo,
@@ -266,8 +286,8 @@ impl ProjectRenderEngine {
             MaterialSpec::NodeMaterial {
                 resolution, graph, ..
             } => {
-                let bake_res = (*resolution).clamp(32, 1024);
-                let mut h = fnv1a_hash64(b"node_material_v3");
+                let bake_res = (*resolution).clamp(32, 2048);
+                let mut h = fnv1a_hash64(b"node_material_v4");
                 h = hash_u64(h, u64::from(bake_res));
                 h = hash_json_value(h, graph);
                 h = hash_node_material_referenced_assets(h, graph, env.project);
@@ -278,7 +298,7 @@ impl ProjectRenderEngine {
                 }
 
                 let unwrapped = unwrap_node_material_graph(graph);
-                let (sanitized_graph, direct_asset_slots) =
+                let (sanitized_graph, direct_asset_slots, decoded_images) =
                     prepare_node_material_graph_with_assets(&unwrapped, env.project);
 
                 let resolve_direct_tex =
@@ -287,7 +307,11 @@ impl ProjectRenderEngine {
                         engine.ensure_image_asset_texture(env.project, asset_id, false)
                     };
 
-                let eval = match bake_node_material_maps(&sanitized_graph, bake_res) {
+                let eval = match zc_shader::node_graph::bake_node_material_with_images(
+                    &sanitized_graph,
+                    bake_res,
+                    &decoded_images,
+                ) {
                     Ok(baked) => {
                         let upload_baked = |engine: &mut Self,
                                             chan: &str,
@@ -381,6 +405,7 @@ impl ProjectRenderEngine {
                             custom_params_a: [0.0; 4],
                             custom_params_b: [0.0; 4],
                             custom_glsl_uniforms: BTreeMap::new(),
+                            custom_glsl_textures: BTreeMap::new(),
                         }
                     }
                     Err(err) => {
@@ -418,12 +443,21 @@ impl ProjectRenderEngine {
                 let mut params_a = [1.0_f32, 1.0, 1.0, 1.0];
                 let mut params_b = [0.0_f32; 4];
                 let mut glsl_uniforms: BTreeMap<String, UniformValue> = BTreeMap::new();
+                let mut glsl_textures: BTreeMap<String, Arc<RenderTarget>> = BTreeMap::new();
                 let mut slot = 0usize;
                 for cp in custom_properties {
                     let val = eval_property_track(&cp.track, env);
-                    let (vals, uval): (Vec<f32>, Option<UniformValue>) = match val {
+                    let fixed = fix_property_name(&cp.name);
+                    let stage = extract_material_layer_stage(&cp.metadata, Some(&val));
+                    let mut insert_tex = |tex: Arc<RenderTarget>| {
+                        glsl_textures.insert(cp.name.clone(), Arc::clone(&tex));
+                        if fixed != cp.name {
+                            glsl_textures.insert(fixed.clone(), tex);
+                        }
+                    };
+                    let (vals, uval): (Vec<f32>, Option<UniformValue>) = match &val {
                         PropertyValue::Number(v) => {
-                            (vec![v as f32], Some(UniformValue::Float(v as f32)))
+                            (vec![*v as f32], Some(UniformValue::Float(*v as f32)))
                         }
                         PropertyValue::Vec2(v) => (
                             vec![v[0] as f32, v[1] as f32],
@@ -442,17 +476,59 @@ impl ProjectRenderEngine {
                                 v[3] as f32,
                             ])),
                         ),
-                        PropertyValue::Bool(b) => {
-                            (vec![if b { 1.0 } else { 0.0 }], Some(UniformValue::Bool(b)))
-                        }
+                        PropertyValue::Bool(b) => (
+                            vec![if *b { 1.0 } else { 0.0 }],
+                            Some(UniformValue::Bool(*b)),
+                        ),
                         PropertyValue::Option(o) => {
-                            (vec![o as f32], Some(UniformValue::Int(o as i32)))
+                            (vec![*o as f32], Some(UniformValue::Int(*o as i32)))
+                        }
+                        PropertyValue::Asset(Some(asset_id)) => {
+                            if let Some((tex, _)) =
+                                self.resolve_material_texture(asset_id, stage, env)
+                            {
+                                insert_tex(tex);
+                            }
+                            (Vec::new(), None)
+                        }
+                        PropertyValue::Text(s) | PropertyValue::List(s) => {
+                            let trimmed = s.trim();
+                            if !trimmed.is_empty()
+                                && (is_material_layer_ref_prefix(trimmed)
+                                    || is_material_layer_prop_name(&cp.name, &cp.metadata)
+                                    || env.project.assets.contains_key(trimmed))
+                                && let Some((tex, _)) =
+                                    self.resolve_material_texture(trimmed, stage, env)
+                            {
+                                insert_tex(tex);
+                            }
+                            (Vec::new(), None)
+                        }
+                        PropertyValue::Json(v) => {
+                            if let Some(layer_ref) = extract_layer_ref_from_json(v)
+                                && let Some((tex, _)) =
+                                    self.resolve_material_texture(layer_ref, stage, env)
+                            {
+                                insert_tex(tex);
+                            }
+                            (Vec::new(), None)
+                        }
+                        PropertyValue::Gradient(stops) => {
+                            let (raw, _cyclic, _reps) = bake_project_gradient_spec_rgba8(stops, cp);
+                            if let Ok(tex) = self.ctx.create_rgba8_texture(
+                                "zc-custom-3d-grad-lut",
+                                zc_shader::GRADIENT_LUT_WIDTH as u32,
+                                1,
+                                &raw,
+                            ) {
+                                insert_tex(Arc::new(tex));
+                            }
+                            (Vec::new(), None)
                         }
                         _ => (Vec::new(), None),
                     };
                     if let Some(uv) = uval {
                         glsl_uniforms.insert(cp.name.clone(), uv.clone());
-                        let fixed = fix_property_name(&cp.name);
                         if fixed != cp.name {
                             glsl_uniforms.insert(fixed, uv);
                         }
@@ -494,6 +570,7 @@ impl ProjectRenderEngine {
                         custom_params_a: params_a,
                         custom_params_b: params_b,
                         custom_glsl_uniforms: BTreeMap::new(),
+                        custom_glsl_textures: BTreeMap::new(),
                         ..Default::default()
                     }
                 } else {
@@ -535,13 +612,372 @@ impl ProjectRenderEngine {
                         custom_params_a: params_a,
                         custom_params_b: params_b,
                         custom_glsl_uniforms: glsl_uniforms,
+                        custom_glsl_textures: glsl_textures,
                         ..Default::default()
                     }
                 }
             }
-            MaterialSpec::Unknown { .. } => EvaluatedMaterial::default(),
+            MaterialSpec::Unknown {
+                material_type,
+                payload,
+            } => self.evaluate_layer_source_material(material_type, payload, env),
         }
     }
+
+    /// Resolves a timeline track/layer reference (`track:id:...`, `track:[...]`, `layer:...`,
+    /// or track/layer name/UUID) into a rendered 2D texture for 3D materials and custom shaders.
+    pub(super) fn resolve_layer_source_texture(
+        &mut self,
+        track_ref: &str,
+        stage: &str,
+        env: &EvalEnv<'_>,
+    ) -> Option<Arc<RenderTarget>> {
+        let trimmed = track_ref.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let (base_w, base_h) = self.current_render_dims.unwrap_or((
+            env.sequence_resolution[0].max(1),
+            env.sequence_resolution[1].max(1),
+        ));
+        let max_dim = 1024u32;
+        let (w, h) = if base_w > max_dim || base_h > max_dim {
+            let scale = (max_dim as f64) / f64::from(base_w.max(base_h));
+            (
+                ((f64::from(base_w) * scale).round() as u32).max(1),
+                ((f64::from(base_h) * scale).round() as u32).max(1),
+            )
+        } else {
+            (base_w.max(1), base_h.max(1))
+        };
+        let mut visited_comps = vec![env.sequence.id];
+        let mut visited_tracks = Vec::with_capacity(4);
+        // Guard against self-capture recursion by marking the track owning the active 3D scene.
+        if env.active_clip_id.is_some() || env.active_layer_id.is_some() {
+            for track in &env.sequence.video_tracks {
+                let owns_active = track.clips.iter().any(|c| {
+                    env.active_clip_id == Some(c.id) || env.active_layer_id == Some(c.layer.id)
+                });
+                if owns_active {
+                    visited_tracks.push(track.id);
+                    break;
+                }
+            }
+        }
+        match self.render_track_source(
+            trimmed,
+            stage,
+            env,
+            w,
+            h,
+            &mut visited_comps,
+            &mut visited_tracks,
+            1,
+        ) {
+            Ok(Some(rt)) => Some(Arc::new(rt)),
+            Ok(None) => None,
+            Err(err) => {
+                warn!(track_ref = trimmed, error = %err, "failed to render Layer Source Material texture");
+                None
+            }
+        }
+    }
+
+    /// Resolves a texture reference to either a project image asset `(tex, false)` or a live
+    /// timeline layer/track capture `(tex, true)` (premultiplied alpha).
+    pub(super) fn resolve_material_texture(
+        &mut self,
+        ref_str: &str,
+        stage: &str,
+        env: &EvalEnv<'_>,
+    ) -> Option<(Arc<RenderTarget>, bool)> {
+        let trimmed = ref_str.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if is_material_layer_ref_prefix(trimmed) {
+            return self
+                .resolve_layer_source_texture(trimmed, stage, env)
+                .map(|t| (t, true));
+        }
+        if let Some(tex) = self.ensure_image_asset_texture(env.project, trimmed, false) {
+            return Some((tex, false));
+        }
+        self.resolve_layer_source_texture(trimmed, stage, env)
+            .map(|t| (t, true))
+    }
+
+    /// Evaluates a `Layer Source Material` (`layer-input` / `layer-source` 3D material stored in
+    /// `MaterialSpec::Unknown`), rendering the referenced timeline track/layer and binding it
+    /// as the 3D mesh's albedo (and optional emissive) texture.
+    fn evaluate_layer_source_material(
+        &mut self,
+        material_type: &str,
+        payload: &serde_json::Value,
+        env: &EvalEnv<'_>,
+    ) -> EvaluatedMaterial {
+        let low_type = material_type.trim().to_ascii_lowercase().replace('_', "-");
+        let props = payload
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .or_else(|| payload.as_object());
+
+        let layer_ref_owned = props
+            .and_then(|p| {
+                for k in [
+                    "layerSource",
+                    "layerInput",
+                    "sourceLayer",
+                    "inputLayer",
+                    "source",
+                    "layer",
+                    "track",
+                    "texture",
+                ] {
+                    if let Some(v) = p.get(k)
+                        && let Some(r) = extract_layer_ref_from_json(v)
+                    {
+                        return Some(r.to_owned());
+                    }
+                }
+                None
+            })
+            .or_else(|| extract_layer_ref_from_json(payload).map(str::to_owned));
+
+        let is_layer_mat_type = low_type.contains("layer-input")
+            || low_type.contains("layerinput")
+            || low_type.contains("layer-source")
+            || low_type.contains("layersource");
+        if !is_layer_mat_type
+            && !layer_ref_owned
+                .as_deref()
+                .is_some_and(is_material_layer_ref_prefix)
+        {
+            return EvaluatedMaterial::default();
+        }
+
+        let stage = props
+            .and_then(|p| {
+                p.get("stage")
+                    .or_else(|| p.get("layerStage"))
+                    .and_then(|v| {
+                        v.as_str()
+                            .or_else(|| v.get("value").and_then(serde_json::Value::as_str))
+                    })
+            })
+            .unwrap_or("effects-masks");
+
+        let (tex_opt, is_premul) = layer_ref_owned
+            .as_deref()
+            .and_then(|r| self.resolve_material_texture(r, stage, env))
+            .map_or((None, true), |(t, pm)| (Some(t), pm));
+
+        let eval_f32_key = |keys: &[&str], default: f32| -> f32 {
+            if let Some(p) = props {
+                for &k in keys {
+                    if let Some(v) = p.get(k) {
+                        let tr =
+                            json_to_property_track(v, PropertyValue::Number(f64::from(default)));
+                        return eval_f32(&tr, env);
+                    }
+                }
+            }
+            default
+        };
+        let eval_vec2_key = |keys: &[&str], default: [f32; 2]| -> [f32; 2] {
+            if let Some(p) = props {
+                for &k in keys {
+                    if let Some(v) = p.get(k) {
+                        let tr = json_to_property_track(
+                            v,
+                            PropertyValue::Vec2([f64::from(default[0]), f64::from(default[1])]),
+                        );
+                        return eval_vec2(&tr, env);
+                    }
+                }
+            }
+            default
+        };
+        let eval_rgb_key = |keys: &[&str], default: [f32; 3]| -> [f32; 3] {
+            if let Some(p) = props {
+                for &k in keys {
+                    if let Some(v) = p.get(k) {
+                        if let Some(rgba) = parse_json_rgba(v) {
+                            return [rgba[0], rgba[1], rgba[2]];
+                        }
+                        let tr = json_to_property_track(
+                            v,
+                            PropertyValue::Color([
+                                f64::from(default[0]),
+                                f64::from(default[1]),
+                                f64::from(default[2]),
+                            ]),
+                        );
+                        return eval_color_rgb(&tr, env, default);
+                    }
+                }
+            }
+            default
+        };
+        let eval_u32_key = |keys: &[&str], default: u32| -> u32 {
+            if let Some(p) = props {
+                for &k in keys {
+                    if let Some(v) = p.get(k) {
+                        if let Some(u) = v.as_u64() {
+                            return u as u32;
+                        }
+                        if let Some(f) = v.as_f64() {
+                            return f.round().max(0.0) as u32;
+                        }
+                        if let Some(inner) = v.get("value") {
+                            if let Some(u) = inner.as_u64() {
+                                return u as u32;
+                            }
+                            if let Some(f) = inner.as_f64() {
+                                return f.round().max(0.0) as u32;
+                            }
+                        }
+                    }
+                }
+            }
+            default
+        };
+
+        let opacity = eval_f32_key(&["opacity"], 1.0).clamp(0.0, 1.0);
+        let transparent = props
+            .and_then(|p| p.get("transparent"))
+            .is_none_or(|v| parse_preserved_bool_flag(Some(v), true));
+        let blending = eval_u32_key(&["blending"], 0);
+        let side = eval_u32_key(&["side"], 2);
+        let wrap = eval_u32_key(&["wrap"], 0);
+        let lit = props.is_some_and(|p| {
+            p.get("lit")
+                .is_some_and(|v| parse_preserved_bool_flag(Some(v), false))
+                || p.contains_key("roughness")
+                || p.contains_key("metalness")
+        });
+        let use_emissive = props.is_some_and(|p| {
+            p.get("emissive").is_some()
+                || p.get("emissiveIntensity").is_some()
+                || p.get("asEmissive")
+                    .is_some_and(|v| parse_preserved_bool_flag(Some(v), false))
+        });
+        let emissive_intensity =
+            eval_f32_key(&["emissiveIntensity", "emissive_intensity"], 1.0).max(0.0);
+
+        EvaluatedMaterial {
+            params: MaterialParams {
+                shading: if lit {
+                    ShadingModel::StandardPbr
+                } else {
+                    ShadingModel::Basic
+                },
+                base_color: eval_rgb_key(&["color", "baseColor"], [1.0, 1.0, 1.0]),
+                emissive: if use_emissive {
+                    eval_rgb_key(&["emissive"], [1.0, 1.0, 1.0])
+                } else {
+                    [0.0, 0.0, 0.0]
+                },
+                emissive_intensity,
+                opacity,
+                roughness: eval_f32_key(&["roughness"], 0.5).clamp(0.04, 1.0),
+                metalness: eval_f32_key(&["metalness"], 0.0).clamp(0.0, 1.0),
+                side: map_cull_side(side),
+                blend: map_material_blend(blending, transparent, opacity),
+                uv_repeat: eval_vec2_key(&["repeat"], [1.0, 1.0]),
+                uv_offset: eval_vec2_key(&["offset"], [0.0, 0.0]),
+                uv_center: eval_vec2_key(&["center"], [0.0, 0.0]),
+                uv_rotation: eval_f32_key(&["rotation"], 0.0),
+                wrap: TextureWrap::from_cm3(wrap),
+                albedo_premultiplied: is_premul,
+                ..Default::default()
+            },
+            albedo: tex_opt.clone(),
+            emissive_map: if use_emissive { tex_opt } else { None },
+            ..Default::default()
+        }
+    }
+}
+
+fn is_material_layer_ref_prefix(s: &str) -> bool {
+    let low = s.trim().to_ascii_lowercase();
+    low.starts_with("track:")
+        || low.starts_with("layer:")
+        || low.starts_with("clip:")
+        || low.starts_with("layer-input:")
+}
+
+fn is_material_layer_prop_name(name: &str, meta: &BTreeMap<String, serde_json::Value>) -> bool {
+    let low = name.trim().to_ascii_lowercase();
+    if matches!(
+        low.as_str(),
+        "layersource"
+            | "layer_source"
+            | "layerinput"
+            | "layer_input"
+            | "sourcelayer"
+            | "inputlayer"
+    ) {
+        return true;
+    }
+    meta.get("type")
+        .and_then(|t| t.get("zoidiumShader"))
+        .and_then(|s| s.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|k| {
+            let kl = k.to_ascii_lowercase();
+            kl.contains("layer") || kl.contains("track")
+        })
+        || meta.contains_key("layerSource")
+        || meta.contains_key("layerInput")
+        || meta.contains_key("_zoidiumShaderLayerSource")
+}
+
+fn extract_layer_ref_from_json(val: &serde_json::Value) -> Option<&str> {
+    if let Some(s) = val.as_str() {
+        let t = s.trim();
+        return (!t.is_empty()).then_some(t);
+    }
+    if let Some(obj) = val.as_object() {
+        for k in [
+            "layerSource",
+            "layerInput",
+            "sourceLayer",
+            "inputLayer",
+            "source",
+            "track",
+            "layer",
+            "value",
+        ] {
+            if let Some(inner) = obj.get(k)
+                && let Some(r) = extract_layer_ref_from_json(inner)
+            {
+                return Some(r);
+            }
+        }
+    }
+    None
+}
+
+fn extract_material_layer_stage<'a>(
+    meta: &'a BTreeMap<String, serde_json::Value>,
+    val: Option<&'a PropertyValue>,
+) -> &'a str {
+    if let Some(PropertyValue::Json(v)) = val
+        && let Some(s) = v
+            .get("stage")
+            .or_else(|| v.get("layerStage"))
+            .and_then(serde_json::Value::as_str)
+        && !s.is_empty()
+    {
+        return s;
+    }
+    meta.get("stage")
+        .or_else(|| meta.get("layerStage"))
+        .or_else(|| meta.get("type").and_then(|t| t.get("stage")))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("effects-masks")
 }
 
 /// Unwraps `.pz`-imported `NodeMaterial` JSON wrappers (`{ properties: { graph: "<json>" } }`,
@@ -583,19 +1019,26 @@ pub(super) fn unwrap_node_material_graph(raw: &serde_json::Value) -> serde_json:
 /// - Direct links from an image/texture node into the `output` node's PBR ports are returned
 ///   in `direct_slots` (`"color"`, `"emissive"`, `"roughness"`, `"metalness"`, `"normal"`, `"opacity"`)
 ///   so the GPU binds the full-resolution texture asset directly.
-/// - Any image/texture nodes in the returned sanitized graph are replaced with `"color"` nodes
-///   carrying the decoded asset's mean RGB so `bake_node_material_maps` succeeds cleanly for
-///   both direct and downstream procedural graphs instead of failing on unsupported node type.
+/// - Decoded full-resolution RGBA8 pixel buffers for all referenced image nodes are returned
+///   in `decoded_images` (keyed by asset ID and node ID) for real per-pixel bilinear sampling
+///   inside `zc_shader::node_graph::bake_node_material_with_images`.
+/// - Missing/undecodable image nodes fall back cleanly to `"color"` nodes so baking still succeeds.
+#[allow(clippy::type_complexity)]
 pub(super) fn prepare_node_material_graph_with_assets(
     graph: &serde_json::Value,
     project: &Project,
-) -> (serde_json::Value, HashMap<String, String>) {
+) -> (
+    serde_json::Value,
+    HashMap<String, String>,
+    HashMap<String, (u32, u32, Vec<u8>)>,
+) {
     let mut direct_slots: HashMap<String, String> = HashMap::new();
+    let mut decoded_images: HashMap<String, (u32, u32, Vec<u8>)> = HashMap::new();
     let Some(root_obj) = graph.as_object() else {
-        return (graph.clone(), direct_slots);
+        return (graph.clone(), direct_slots, decoded_images);
     };
     let Some(raw_nodes) = root_obj.get("nodes").and_then(serde_json::Value::as_array) else {
-        return (graph.clone(), direct_slots);
+        return (graph.clone(), direct_slots, decoded_images);
     };
 
     let mut image_node_assets: HashMap<String, String> = HashMap::new();
@@ -799,11 +1242,34 @@ pub(super) fn prepare_node_material_graph_with_assets(
     }
 
     if image_node_assets.is_empty() && synth_nodes.is_empty() {
-        return (graph.clone(), direct_slots);
+        return (graph.clone(), direct_slots, decoded_images);
     }
 
-    // Substitute image/texture nodes in a sanitized clone with `"color"` nodes carrying the
-    // decoded image's mean RGB so `bake_node_material_maps` succeeds cleanly on all downstream nodes.
+    // Decode full RGBA8 pixel buffers for all referenced image nodes so
+    // `zc_shader::node_graph::bake_node_material_with_images` samples real pixels with UV transforms.
+    let mut decoded_node_ids: HashSet<String> = HashSet::new();
+    for (node_id, asset_id) in &image_node_assets {
+        if let Some(existing) = decoded_images.get(asset_id).cloned() {
+            decoded_images.entry(node_id.clone()).or_insert(existing);
+            decoded_node_ids.insert(node_id.clone());
+            continue;
+        }
+        if let Some(img) = project
+            .assets
+            .get(asset_id)
+            .and_then(|rec| rec.bytes.as_deref())
+            .and_then(|bytes| image::load_from_memory(bytes).ok())
+        {
+            let rgba = img.to_rgba8();
+            let entry = (rgba.width(), rgba.height(), rgba.into_raw());
+            if node_id != asset_id {
+                decoded_images.insert(node_id.clone(), entry.clone());
+            }
+            decoded_images.insert(asset_id.clone(), entry);
+            decoded_node_ids.insert(node_id.clone());
+        }
+    }
+
     let mut sanitized = graph.clone();
     if let Some(obj_mut) = sanitized.as_object_mut() {
         if let Some(nodes_mut) = obj_mut
@@ -821,30 +1287,17 @@ pub(super) fn prepare_node_material_graph_with_assets(
                 }) else {
                     continue;
                 };
-                let Some(asset_id) = image_node_assets.get(&id) else {
+                if !image_node_assets.contains_key(&id) {
                     continue;
-                };
-                let mean_rgb = project
-                    .assets
-                    .get(asset_id)
-                    .and_then(|rec| rec.bytes.as_deref())
-                    .and_then(|bytes| image::load_from_memory(bytes).ok())
-                    .map(|img| {
-                        let rgba = img.to_rgba8();
-                        let n_px = (rgba.width() as u64 * rgba.height() as u64).max(1) as f64;
-                        let (mut sr, mut sg, mut sb) = (0.0_f64, 0.0_f64, 0.0_f64);
-                        for p in rgba.pixels() {
-                            sr += f64::from(p[0]) / 255.0;
-                            sg += f64::from(p[1]) / 255.0;
-                            sb += f64::from(p[2]) / 255.0;
-                        }
-                        [sr / n_px, sg / n_px, sb / n_px]
-                    })
-                    .unwrap_or([0.8, 0.8, 0.8]);
+                }
+                if decoded_node_ids.contains(&id) {
+                    // Keep as `"image"` node so `bake_node_material_with_images` samples the real buffer.
+                    continue;
+                }
                 no.insert("type".to_owned(), serde_json::json!("color"));
                 no.insert(
                     "params".to_owned(),
-                    serde_json::json!({ "color": mean_rgb }),
+                    serde_json::json!({ "color": [0.8, 0.8, 0.8] }),
                 );
             }
             nodes_mut.extend(synth_nodes);
@@ -863,7 +1316,7 @@ pub(super) fn prepare_node_material_graph_with_assets(
             }
         }
     }
-    (sanitized, direct_slots)
+    (sanitized, direct_slots, decoded_images)
 }
 
 /// Checks if `ident` appears as a whole identifier token in GLSL source `src`.
@@ -988,7 +1441,7 @@ pub(super) fn apply_pbr_plus_surface_props(
     // Cel / Toon Shading
     if eval_flag(&["celEnabled", "cel_enabled", "celShading", "toon"], false) {
         params.cel_enabled = true;
-        params.cel_steps = eval_num(&["celSteps", "cel_steps"], 4.0).clamp(1.0, 32.0);
+        params.cel_steps = eval_num(&["celSteps", "cel_steps", "celBands"], 4.0).clamp(1.0, 32.0);
         params.cel_smoothness = eval_num(&["celSmoothness", "cel_smoothness"], 0.1).clamp(0.0, 1.0);
         params.cel_specular_steps =
             eval_num(&["celSpecularSteps", "cel_specular_steps"], 6.0).clamp(1.0, 32.0);
@@ -1003,6 +1456,7 @@ pub(super) fn apply_pbr_plus_surface_props(
             &[
                 "fresnelMixStrength",
                 "fresnelStrength",
+                "fresnelIntensity",
                 "fresnel_mix_strength",
             ],
             0.7,
@@ -1013,8 +1467,11 @@ pub(super) fn apply_pbr_plus_surface_props(
     // 4-stop Inline Color Ramp
     if eval_flag(&["rampEnabled", "ramp_enabled", "colorRampEnabled"], false) {
         params.ramp_enabled = true;
-        params.ramp_factor =
-            eval_num(&["rampFactor", "ramp_factor", "rampStrength"], 1.0).clamp(0.0, 1.0);
+        params.ramp_factor = eval_num(
+            &["rampFactor", "ramp_factor", "rampStrength", "rampMix"],
+            1.0,
+        )
+        .clamp(0.0, 1.0);
         let unwrap_val = |v: &serde_json::Value| -> serde_json::Value {
             if let Some(kfs) = v.get("keyframes").and_then(serde_json::Value::as_array)
                 && let Some(first_val) = kfs.first().and_then(|kf| kf.get("value"))
@@ -1097,11 +1554,20 @@ pub(super) fn apply_pbr_plus_surface_props(
                 parsed.push([last[0], last[1], last[2], 1.0]);
             }
             params.ramp_colors = [parsed[0], parsed[1], parsed[2], parsed[3]];
+        } else if preserved.contains_key("rampColorA") || preserved.contains_key("rampColorB") {
+            let ca = eval_rgb(&["rampColorA"], [0.1, 0.15, 0.25]);
+            let cb = eval_rgb(&["rampColorB"], [1.0, 0.9, 0.7]);
+            params.ramp_colors = [
+                [ca[0], ca[1], ca[2], 0.0],
+                [cb[0], cb[1], cb[2], 1.0],
+                [cb[0], cb[1], cb[2], 1.0],
+                [cb[0], cb[1], cb[2], 1.0],
+            ];
         }
     }
 
     // Procedural Bump Noise
-    let bump_strength = eval_num(&["bumpStrength", "bump_strength"], 0.0);
+    let bump_strength = eval_num(&["bumpStrength", "bump_strength", "bumpNoiseStrength"], 0.0);
     if eval_flag(&["bumpNoise", "bump_noise", "bumpNoiseEnabled"], false)
         || bump_strength.abs() > 1e-4
     {
@@ -1160,5 +1626,8 @@ pub(super) fn apply_pbr_plus_surface_props(
         &["reflectionEnvColorBottom", "reflection_env_color_bottom"],
         params.reflection_env_color_bottom,
     );
-    params.env_rotation = eval_num(&["envRotation", "env_rotation"], params.env_rotation);
+    params.env_rotation = eval_num(
+        &["reflectionEnvRotation", "envRotation", "env_rotation"],
+        params.env_rotation,
+    );
 }

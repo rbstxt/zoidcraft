@@ -1208,3 +1208,327 @@ pub fn export_shape_plus_path_to_svg_d(vertices: &[[f32; 6]], closed: bool) -> S
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// Font-Aware Rasterizer & Convert-to-Path Engine
+// ---------------------------------------------------------------------------
+
+/// Compiles and rasterizes a Shape+ JSON payload into a premultiplied RGBA8 buffer
+/// of length `width * height * 4`, using real TrueType/OpenType glyph outlines from
+/// `primary_font` / `fallback_font` whenever available (falling back to built-in
+/// vector stroke outlines only when neither font resolves a glyph).
+///
+/// For half-resolution previews or non-30fps sequences, prefer [`rasterize_shape_plus_ex`],
+/// which accepts explicit `seq_res` and `fps` alongside `primary_font` and `fallback_font`.
+#[must_use]
+#[allow(clippy::type_complexity)]
+pub fn rasterize_shape_plus_with_fonts(
+    payload: &serde_json::Value,
+    width: u32,
+    height: u32,
+    frame: f64,
+    eval_expr: Option<&dyn Fn(&str, f64) -> Option<f64>>,
+    primary_font: Option<&[u8]>,
+    fallback_font: Option<&[u8]>,
+) -> Vec<u8> {
+    rasterize_shape_plus_ex(
+        payload,
+        width,
+        height,
+        [width, height],
+        frame,
+        30.0,
+        eval_expr,
+        primary_font,
+        fallback_font,
+    )
+}
+
+fn infer_vertex_mode(in_h: [f64; 2], out_h: [f64; 2]) -> &'static str {
+    let in_len = in_h[0].hypot(in_h[1]);
+    let out_len = out_h[0].hypot(out_h[1]);
+    if in_len > 1e-6 && out_len > 1e-6 {
+        let dot = (in_h[0] * out_h[0] + in_h[1] * out_h[1]) / (in_len * out_len);
+        if dot < -0.995 {
+            return "smooth";
+        }
+    }
+    "corner"
+}
+
+fn decimate_bezier_vertices(verts: Vec<BezierVertex>) -> Vec<BezierVertex> {
+    if verts.len() <= MAX_SHAPE_PLUS_VERTICES {
+        return verts;
+    }
+    let n = verts.len();
+    let mut out = Vec::with_capacity(MAX_SHAPE_PLUS_VERTICES);
+    for i in 0..MAX_SHAPE_PLUS_VERTICES {
+        let idx = (i * n) / MAX_SHAPE_PLUS_VERTICES;
+        out.push(BezierVertex::sharp(verts[idx].point));
+    }
+    out
+}
+
+fn bezier_vertices_to_path_json(
+    id: String,
+    name: Value,
+    enabled: Value,
+    vertices: Vec<BezierVertex>,
+    closed: bool,
+) -> Value {
+    let vertices = decimate_bezier_vertices(vertices);
+    let mut vertex_ids = Vec::with_capacity(vertices.len());
+    let mut vertex_modes = Map::with_capacity(vertices.len());
+    let mut flat = Vec::with_capacity(vertices.len() * 6);
+    for (idx, v) in vertices.iter().enumerate() {
+        let vid = format!("v{}", idx + 1);
+        vertex_modes.insert(vid.clone(), json!(infer_vertex_mode(v.in_h, v.out_h)));
+        vertex_ids.push(vid);
+        flat.extend_from_slice(&[
+            v.point[0], v.point[1], v.in_h[0], v.in_h[1], v.out_h[0], v.out_h[1],
+        ]);
+    }
+    let mut props = Map::new();
+    props.insert("name".to_owned(), name);
+    props.insert("enabled".to_owned(), enabled);
+    props.insert("closed".to_owned(), json!(closed));
+    props.insert("path".to_owned(), json!(flat));
+    json!({
+        "id": id,
+        "kind": "path",
+        "vertexIds": vertex_ids,
+        "vertexModes": Value::Object(vertex_modes),
+        "properties": Value::Object(props)
+    })
+}
+
+fn find_item_and_animators(
+    list: &[Value],
+    item_id: &str,
+    frame: f64,
+    outer_animators: &[Value],
+) -> Option<(Value, Vec<Value>)> {
+    for (index, item) in list.iter().enumerate() {
+        let mut below: Vec<Value> = list[index + 1..]
+            .iter()
+            .filter(|sibling| {
+                sibling.get("kind").and_then(Value::as_str) == Some("textAnimator")
+                    && eval_prop_enabled(
+                        sibling.get("properties").and_then(Value::as_object),
+                        frame,
+                        None,
+                    )
+            })
+            .cloned()
+            .collect();
+        below.extend_from_slice(outer_animators);
+
+        if item.get("id").and_then(Value::as_str) == Some(item_id) {
+            return Some((item.clone(), below));
+        }
+        if let Some(children) = item.get("contents").and_then(Value::as_array)
+            && let Some(found) = find_item_and_animators(children, item_id, frame, &below)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn replace_item_by_id(list: &mut [Value], item_id: &str, replacement: &mut Option<Value>) -> bool {
+    for item in list.iter_mut() {
+        if item.get("id").and_then(Value::as_str) == Some(item_id) {
+            if let Some(rep) = replacement.take() {
+                *item = rep;
+            }
+            return true;
+        }
+        if let Some(children) = item.get_mut("contents").and_then(Value::as_array_mut)
+            && replace_item_by_id(children, item_id, replacement)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Converts a Shape+ primitive (`"rectangle"`, `"ellipse"`, `"polystar"`) or `"text"` item
+/// into editable cubic Bezier `"path"` item(s) at `frame`, updating `nextId` cleanly.
+///
+/// - `"rectangle"`, `"ellipse"`, and `"polystar"` are replaced in-place by a single closed
+///   `"path"` item preserving the item's ID, returning `Ok(vec![item_id])`.
+/// - `"text"` is replaced in-place by a `"group"` containing closed `"path"` items for each
+///   glyph contour (using exact cubic Bezier font outlines from `primary_font`/`fallback_font`
+///   when available, or fallback vector contours otherwise), returning the newly allocated
+///   `"path"` item IDs.
+pub fn convert_shape_plus_item_to_path(
+    payload: &mut serde_json::Value,
+    item_id: &str,
+    frame: f64,
+    primary_font: Option<&[u8]>,
+    fallback_font: Option<&[u8]>,
+) -> Result<Vec<String>, String> {
+    let eval_frame = if frame.is_finite() { frame } else { 0.0 };
+    let mut seq = payload
+        .get("nextId")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let (item_clone, collected_animators) = {
+        let root = payload
+            .get("contents")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Shape+ payload missing contents array".to_owned())?;
+        let _ = parse_items(root, 0, &mut seq);
+        find_item_and_animators(root, item_id, eval_frame, &[])
+            .ok_or_else(|| format!("Shape+ item not found: {item_id}"))?
+    };
+
+    let kind = item_clone
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Shape+ item '{item_id}' missing kind"))?;
+    let props_obj = item_clone.get("properties").and_then(Value::as_object);
+    let orig_enabled = props_obj
+        .and_then(|p| p.get("enabled"))
+        .cloned()
+        .unwrap_or_else(|| json!(1));
+
+    let (replacement, returned_ids) = match kind {
+        "rectangle" | "ellipse" | "polystar" => {
+            let orig_name = props_obj
+                .and_then(|p| p.get("name"))
+                .cloned()
+                .unwrap_or_else(|| json!("Path"));
+            let shape_path = build_primitive_path(&item_clone, eval_frame, DEFAULT_TOLERANCE, None)
+                .ok_or_else(|| format!("Failed to evaluate Shape+ {kind} '{item_id}'"))?;
+            let vertices = shape_path
+                .vertices
+                .filter(|vs| !vs.is_empty())
+                .ok_or_else(|| format!("Shape+ {kind} '{item_id}' produced no vertices"))?;
+            let path_item = bezier_vertices_to_path_json(
+                item_id.to_owned(),
+                orig_name,
+                orig_enabled,
+                vertices,
+                true,
+            );
+            (path_item, vec![item_id.to_owned()])
+        }
+        "text" => {
+            let orig_name = props_obj
+                .and_then(|p| p.get("name"))
+                .cloned()
+                .unwrap_or_else(|| json!("Text"));
+            let anim_refs: Vec<&Value> = collected_animators.iter().collect();
+            let glyph_instances = evaluate_text_glyph_instances(
+                &item_clone,
+                &anim_refs,
+                eval_frame,
+                30.0,
+                None,
+                primary_font,
+                fallback_font,
+            );
+            let mut group_children = Vec::new();
+            let mut created_ids = Vec::new();
+            for (glyph, mat, _ov) in glyph_instances {
+                if glyph.ch.is_whitespace() {
+                    continue;
+                }
+                let glyph_contours: Vec<Vec<BezierVertex>> = if (primary_font.is_some()
+                    || fallback_font.is_some())
+                    && let Some(bez) = zc_scene::extract_glyph_bezier_outline_2d_with_fallback(
+                        primary_font,
+                        fallback_font,
+                        glyph.render_ch,
+                        glyph.eff_font_size,
+                    ) {
+                    bez.contours
+                        .into_iter()
+                        .filter(|c| c.len() >= 2)
+                        .map(|c| {
+                            c.into_iter()
+                                .map(|v| {
+                                    let pt = [
+                                        glyph.x + v[0] * glyph.h_scale,
+                                        glyph.y + v[1] * glyph.v_scale,
+                                    ];
+                                    let in_h = [v[2] * glyph.h_scale, v[3] * glyph.v_scale];
+                                    let out_h = [v[4] * glyph.h_scale, v[5] * glyph.v_scale];
+                                    BezierVertex::new(
+                                        mat_transform_pt(pt, mat),
+                                        mat_transform_vec(in_h, mat),
+                                        mat_transform_vec(out_h, mat),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect()
+                } else {
+                    glyph
+                        .paths
+                        .into_iter()
+                        .filter(|p| p.points.len() >= 3)
+                        .map(|p| {
+                            p.points
+                                .into_iter()
+                                .map(|pt| BezierVertex::sharp(mat_transform_pt(pt, mat)))
+                                .collect()
+                        })
+                        .collect()
+                };
+
+                for contour_verts in glyph_contours {
+                    if contour_verts.is_empty() {
+                        continue;
+                    }
+                    seq += 1;
+                    let path_id = format!("s{seq}");
+                    let path_item = bezier_vertices_to_path_json(
+                        path_id.clone(),
+                        json!(glyph.ch.to_string()),
+                        json!(1),
+                        contour_verts,
+                        true,
+                    );
+                    created_ids.push(path_id);
+                    group_children.push(path_item);
+                }
+            }
+            let group_item = json!({
+                "id": item_id,
+                "kind": "group",
+                "properties": {
+                    "name": orig_name,
+                    "enabled": orig_enabled,
+                    "anchor": [0.0, 0.0],
+                    "position": [0.0, 0.0],
+                    "scale": [1.0, 1.0],
+                    "rotation": 0.0,
+                    "opacity": 1.0
+                },
+                "contents": group_children
+            });
+            (group_item, created_ids)
+        }
+        other => {
+            return Err(format!(
+                "Shape+ item kind '{other}' cannot be converted to path"
+            ));
+        }
+    };
+
+    let mut rep_opt = Some(replacement);
+    let replaced = payload
+        .get_mut("contents")
+        .and_then(Value::as_array_mut)
+        .is_some_and(|root| replace_item_by_id(root, item_id, &mut rep_opt));
+    if !replaced {
+        return Err(format!("Shape+ item not found: {item_id}"));
+    }
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("nextId".to_owned(), json!(seq + 1));
+    }
+    Ok(returned_ids)
+}

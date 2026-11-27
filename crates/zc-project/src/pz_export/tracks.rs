@@ -282,6 +282,31 @@ pub(super) fn serialize_gradient_stops(stops: &[GradientStop]) -> Value {
     )
 }
 
+pub(super) fn track_is_dynamic(track: &PropertyTrack) -> bool {
+    if track.animated
+        || track.expression.is_some()
+        || track.keyframes.len() > 1
+        || track.keyframes.iter().any(|k| k.frame.abs() > 1e-6)
+    {
+        return true;
+    }
+    track.channels.iter().any(track_is_dynamic)
+}
+
+/// Serializes static CM3/Zoidium tracks as raw primitives (preserving legacy compatibility)
+/// while serializing animated, multi-keyframe, or expression-driven tracks as full dynamic
+/// track objects so keyframes and expressions never collapse across `.pz` round-trips.
+pub(super) fn serialize_static_or_animated_track(
+    track: &PropertyTrack,
+    remap: &BTreeMap<String, String>,
+) -> Value {
+    if track_is_dynamic(track) {
+        serialize_property_track(track, remap)
+    } else {
+        serialize_property_value(&track.value, remap)
+    }
+}
+
 pub(super) fn is_non_default_scalar(track: &PropertyTrack, default: f64) -> bool {
     track.animated
         || track.expression.is_some()

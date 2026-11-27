@@ -1373,6 +1373,371 @@ pub fn build_spline(
     )
 }
 
+/// Builds a surface of revolution (`Lathe`) around the Y axis from 2D `[radius, y]` profile
+/// points with smooth unit normals and arc-length UVs.
+#[must_use]
+pub fn build_lathe_mesh(
+    points: &[[f32; 2]],
+    segments: u32,
+    phi_start: f32,
+    phi_length: f32,
+) -> MeshData {
+    if points.len() < 2 {
+        return MeshData::empty();
+    }
+
+    let segs = segments.max(3);
+    let phi_s = if phi_start.is_finite() {
+        phi_start
+    } else {
+        0.0
+    };
+    let phi_len = if phi_length.is_finite() {
+        phi_length.clamp(1e-4, TAU)
+    } else {
+        TAU
+    };
+
+    let n = points.len();
+    let profile: Vec<[f32; 2]> = points
+        .iter()
+        .map(|&[r, y]| {
+            let rr = if r.is_finite() { r.max(0.0) } else { 0.0 };
+            let yy = if y.is_finite() { y } else { 0.0 };
+            [rr, yy]
+        })
+        .collect();
+
+    // Cumulative profile arc length for clean V coordinates.
+    let mut v_coords = Vec::with_capacity(n);
+    v_coords.push(0.0_f32);
+    let mut total_arc = 0.0_f32;
+    for pair in profile.windows(2) {
+        let dr = pair[1][0] - pair[0][0];
+        let dy = pair[1][1] - pair[0][1];
+        total_arc += (dr * dr + dy * dy).sqrt();
+        v_coords.push(total_arc);
+    }
+    if total_arc > 1e-6 {
+        for v in &mut v_coords {
+            *v /= total_arc;
+        }
+    } else {
+        for (j, v) in v_coords.iter_mut().enumerate() {
+            *v = j as f32 / (n - 1) as f32;
+        }
+    }
+
+    // 2D outward profile normals (nr, ny) aligned with (dP/dphi) x (dP/dv) = (dy*sin, -dr, dy*cos).
+    let mut seg_normals = Vec::with_capacity(n - 1);
+    for pair in profile.windows(2) {
+        let dr = pair[1][0] - pair[0][0];
+        let dy = pair[1][1] - pair[0][1];
+        let len = (dr * dr + dy * dy).sqrt();
+        if len > 1e-6 {
+            seg_normals.push(Vec2::new(dy / len, -dr / len));
+        } else {
+            seg_normals.push(Vec2::new(1.0, 0.0));
+        }
+    }
+    let mut profile_normals = Vec::with_capacity(n);
+    for j in 0..n {
+        let sum = if j == 0 {
+            seg_normals[0]
+        } else if j == n - 1 {
+            seg_normals[n - 2]
+        } else {
+            seg_normals[j - 1] + seg_normals[j]
+        };
+        let unit = if sum.length_squared() > 1e-12 {
+            sum.normalize()
+        } else {
+            seg_normals[j.min(n - 2)]
+        };
+        profile_normals.push(unit);
+    }
+
+    let stride = n as u32;
+    let mut vertices = Vec::with_capacity(((segs + 1) as usize) * n);
+    let mut indices = Vec::with_capacity((segs as usize) * (n - 1) * 6);
+
+    for i in 0..=segs {
+        let u = i as f32 / segs as f32;
+        let phi = phi_s + u * phi_len;
+        let (sin_p, cos_p) = phi.sin_cos();
+        for j in 0..n {
+            let r = profile[j][0];
+            let y = profile[j][1];
+            let pn = profile_normals[j];
+            let n_vec = Vec3::new(pn.x * sin_p, pn.y, pn.x * cos_p).normalize_or_zero();
+            let n_arr = if n_vec.length_squared() > 1e-12 {
+                n_vec.to_array()
+            } else {
+                [sin_p, 0.0, cos_p]
+            };
+            vertices.push(Vertex3D::new(
+                [r * sin_p, y, r * cos_p],
+                n_arr,
+                [u, v_coords[j]],
+                0,
+            ));
+        }
+    }
+
+    for i in 0..segs {
+        let col0 = i * stride;
+        let col1 = (i + 1) * stride;
+        for j in 0..(n - 1) {
+            let r0 = profile[j][0];
+            let r1 = profile[j + 1][0];
+            let ju = j as u32;
+            let a = col0 + ju;
+            let b = col1 + ju;
+            let c = col1 + ju + 1;
+            let d = col0 + ju + 1;
+            if r0 > 1e-6 {
+                indices.extend_from_slice(&[a, b, c]);
+            }
+            if r1 > 1e-6 {
+                indices.extend_from_slice(&[a, c, d]);
+            }
+        }
+    }
+
+    MeshData::new(vertices, indices)
+}
+
+#[inline]
+fn superquadric_sgn_pow(v: f32, e: f32) -> f32 {
+    if v.abs() <= 1e-12 {
+        0.0
+    } else {
+        v.signum() * v.abs().powf(e)
+    }
+}
+
+/// Builds a true Barr superellipsoid (`Superquadric`) centered at the origin with semi-axes
+/// `(rx, ry, rz)` and shape exponents `(e1, e2)` (north-south and east-west squareness).
+#[must_use]
+pub fn build_superquadric_mesh(
+    rx: f32,
+    ry: f32,
+    rz: f32,
+    e1: f32,
+    e2: f32,
+    u_segs: u32,
+    v_segs: u32,
+) -> MeshData {
+    let rx = if rx.is_finite() {
+        rx.abs().max(1e-4)
+    } else {
+        1.0
+    };
+    let ry = if ry.is_finite() {
+        ry.abs().max(1e-4)
+    } else {
+        1.0
+    };
+    let rz = if rz.is_finite() {
+        rz.abs().max(1e-4)
+    } else {
+        1.0
+    };
+    let e1 = if e1.is_finite() {
+        e1.clamp(0.05, 4.0)
+    } else {
+        1.0
+    };
+    let e2 = if e2.is_finite() {
+        e2.clamp(0.05, 4.0)
+    } else {
+        1.0
+    };
+    let u_s = u_segs.max(4);
+    let v_s = v_segs.max(3);
+    let use_analytical_normals = e1 <= 1.95 && e2 <= 1.95;
+
+    let stride = u_s + 1;
+    let mut vertices = Vec::with_capacity(((u_s + 1) * (v_s + 1)) as usize);
+    let mut indices = Vec::with_capacity((u_s * v_s * 6) as usize);
+
+    for iy in 0..=v_s {
+        let v = iy as f32 / v_s as f32;
+        // Latitude eta runs from +PI/2 (top pole +Y) to -PI/2 (bottom pole -Y).
+        let eta = FRAC_PI_2 - v * PI;
+        let cos_eta = eta.cos().max(0.0);
+        let sin_eta = eta.sin();
+        let c_e1 = superquadric_sgn_pow(cos_eta, e1);
+        let s_e1 = superquadric_sgn_pow(sin_eta, e1);
+
+        for ix in 0..=u_s {
+            let u = ix as f32 / u_s as f32;
+            let omega = u * TAU;
+            let (sin_o, cos_o) = omega.sin_cos();
+            let s_e2 = superquadric_sgn_pow(sin_o, e2);
+            let c_e2 = superquadric_sgn_pow(cos_o, e2);
+
+            let pos = [rx * c_e1 * s_e2, ry * s_e1, rz * c_e1 * c_e2];
+            let normal = if iy == 0 {
+                [0.0, 1.0, 0.0]
+            } else if iy == v_s {
+                [0.0, -1.0, 0.0]
+            } else if use_analytical_normals {
+                let nc_e1 = superquadric_sgn_pow(cos_eta, 2.0 - e1);
+                let ns_e1 = superquadric_sgn_pow(sin_eta, 2.0 - e1);
+                let ns_e2 = superquadric_sgn_pow(sin_o, 2.0 - e2);
+                let nc_e2 = superquadric_sgn_pow(cos_o, 2.0 - e2);
+                let nv = Vec3::new(nc_e1 * ns_e2 / rx, ns_e1 / ry, nc_e1 * nc_e2 / rz);
+                if nv.length_squared() > 1e-12 {
+                    nv.normalize().to_array()
+                } else {
+                    [sin_o, 0.0, cos_o]
+                }
+            } else {
+                [0.0, 0.0, 1.0]
+            };
+
+            vertices.push(Vertex3D::new(pos, normal, [u, 1.0 - v], 0));
+        }
+    }
+
+    for iy in 0..v_s {
+        for ix in 0..u_s {
+            let a = iy * stride + ix;
+            let b = (iy + 1) * stride + ix;
+            let c = (iy + 1) * stride + ix + 1;
+            let d = iy * stride + ix + 1;
+            if iy != v_s - 1 {
+                indices.extend_from_slice(&[a, b, c]);
+            }
+            if iy != 0 {
+                indices.extend_from_slice(&[a, c, d]);
+            }
+        }
+    }
+
+    if !use_analytical_normals {
+        let mut accum = vec![Vec3::ZERO; vertices.len()];
+        for tri in indices.as_chunks::<3>().0 {
+            let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            let p0 = Vec3::from_array(vertices[i0].position);
+            let p1 = Vec3::from_array(vertices[i1].position);
+            let p2 = Vec3::from_array(vertices[i2].position);
+            let wn = (p1 - p0).cross(p2 - p0);
+            accum[i0] += wn;
+            accum[i1] += wn;
+            accum[i2] += wn;
+        }
+        // Stitch longitude UV seam ix=0 <-> ix=u_s.
+        for iy in 0..=v_s as usize {
+            let first = iy * stride as usize;
+            let last = first + u_s as usize;
+            let combined = accum[first] + accum[last];
+            accum[first] = combined;
+            accum[last] = combined;
+        }
+        for (vi, (v, n_vec)) in vertices.iter_mut().zip(accum).enumerate() {
+            let iy = vi / stride as usize;
+            if iy == 0 {
+                v.normal = [0.0, 1.0, 0.0];
+            } else if iy == v_s as usize {
+                v.normal = [0.0, -1.0, 0.0];
+            } else if n_vec.length_squared() > 1e-12 {
+                v.normal = n_vec.normalize().to_array();
+            }
+        }
+    }
+
+    MeshData::new(vertices, indices)
+}
+
+/// Builds a CM3 3D `Wire` mesh with an optional `closed` loop flag.
+///
+/// When `closed` is `false`, delegates directly to [`crate::mesh::build_wire`].
+/// When `closed` is `true`, closes the helical Catmull-Rom spline cleanly back to the start
+/// point with twist-compensated parallel-transport frames and seam-stitched smooth normals.
+#[must_use]
+pub fn build_wire_mesh_closed(
+    size: Vec3,
+    thickness: f32,
+    loops: u32,
+    inner_segs: u32,
+    outer_segs: u32,
+    closed: bool,
+) -> MeshData {
+    if !closed {
+        return crate::mesh::build_wire(size, thickness, loops, inner_segs, outer_segs);
+    }
+
+    let loops = loops.max(1);
+    let inner = inner_segs.max(3);
+    let outer = outer_segs.max(3);
+    let radius = thickness.max(1e-4);
+
+    let point_count = ((loops * outer) as usize).max(3);
+    let mut control_points = Vec::with_capacity(point_count);
+    for k in 0..point_count {
+        let frac = k as f32 / outer as f32;
+        let angle = TAU * frac;
+        control_points.push(Vec3::new(
+            size.x * angle.cos(),
+            size.y * angle.sin(),
+            size.z * frac,
+        ));
+    }
+
+    let steps = (10 * outer).max(8) as usize;
+    let mut centerline = Vec::with_capacity(steps + 1);
+    let mut radii = Vec::with_capacity(steps + 1);
+    for s in 0..=steps {
+        let u = s as f32 / steps as f32;
+        centerline.push(sample_catmull_rom_spline(&control_points, u, true, 1.0));
+        radii.push(radius);
+    }
+    // Pin closing seam vertex strictly to ring 0 so loop closure is watertight.
+    if let Some(&first) = centerline.first()
+        && let Some(last) = centerline.last_mut()
+    {
+        *last = first;
+    }
+
+    let mut mesh = sweep_tube_mesh(&centerline, &radii, inner, true, false, 0, true);
+    mesh.center_at_origin();
+    mesh
+}
+
+/// Bounds-fitted variant of [`build_wire_mesh_closed`], matching [`crate::mesh::build_wire_in_bounds`]
+/// when `closed == false` and closing the loop cleanly when `closed == true`.
+#[must_use]
+pub fn build_wire_in_bounds_closed(
+    size: Vec3,
+    thickness: f32,
+    loops: u32,
+    inner_segs: u32,
+    outer_segs: u32,
+    closed: bool,
+) -> MeshData {
+    if !closed {
+        return crate::mesh::build_wire_in_bounds(size, thickness, loops, inner_segs, outer_segs);
+    }
+    let loops = loops.max(1);
+    let outer = outer_segs.max(3);
+    let radius = thickness.max(1e-4);
+    let rx = (size.x.abs() * 0.5 - radius).max(0.0);
+    let ry = (size.y.abs() * 0.5 - radius).max(0.0);
+    let total_spine_z = (size.z.abs() - 2.0 * radius).max(0.0);
+    let max_frac = ((loops * outer - 1) as f32 / outer as f32).max(1e-4);
+    let pitch_z = total_spine_z / max_frac;
+    build_wire_mesh_closed(
+        Vec3::new(rx, ry, pitch_z),
+        radius,
+        loops,
+        inner_segs,
+        outer,
+        true,
+    )
+}
+
 /* ----------------------------------------------------- Material+ UV layout */
 
 const UV_EPSILON: f32 = 1e-5;
@@ -2500,6 +2865,108 @@ mod uv_index_tests {
             assert_eq!(
                 scratch, expected,
                 "spatial index diverged from brute-force at query point {pt:?}"
+            );
+        }
+    }
+
+    fn assert_valid_primitive_mesh(mesh: &MeshData, label: &str) {
+        assert!(!mesh.vertices.is_empty(), "{label}: empty vertices");
+        assert!(!mesh.indices.is_empty(), "{label}: empty indices");
+        assert!(
+            mesh.indices.len().is_multiple_of(3),
+            "{label}: index count not multiple of 3"
+        );
+        let vcount = mesh.vertices.len() as u32;
+        for &idx in &mesh.indices {
+            assert!(idx < vcount, "{label}: index out of bounds");
+        }
+        for (vi, v) in mesh.vertices.iter().enumerate() {
+            assert!(
+                v.position.iter().all(|c| c.is_finite()),
+                "{label}: non-finite pos {vi}"
+            );
+            assert!(
+                v.normal.iter().all(|c| c.is_finite()),
+                "{label}: non-finite norm {vi}"
+            );
+            assert!(
+                v.uv.iter().all(|c| c.is_finite()),
+                "{label}: non-finite uv {vi}"
+            );
+            let n_len = Vec3::from_array(v.normal).length();
+            assert!(
+                (n_len - 1.0).abs() < 1e-3,
+                "{label}: non-unit normal at {vi}: {n_len}"
+            );
+        }
+        let mut checked = 0usize;
+        for tri in mesh.indices.as_chunks::<3>().0 {
+            let v0 = mesh.vertices[tri[0] as usize];
+            let v1 = mesh.vertices[tri[1] as usize];
+            let v2 = mesh.vertices[tri[2] as usize];
+            let p0 = Vec3::from_array(v0.position);
+            let p1 = Vec3::from_array(v1.position);
+            let p2 = Vec3::from_array(v2.position);
+            let cross = (p1 - p0).cross(p2 - p0);
+            if cross.length_squared() > 1e-8 {
+                let face_n = cross.normalize();
+                let avg_vn = (Vec3::from_array(v0.normal)
+                    + Vec3::from_array(v1.normal)
+                    + Vec3::from_array(v2.normal))
+                .normalize_or_zero();
+                assert!(
+                    face_n.dot(avg_vn) > -0.1,
+                    "{label}: inverted winding dot={}",
+                    face_n.dot(avg_vn)
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "{label}: no non-degenerate triangles");
+    }
+
+    #[test]
+    fn lathe_superquadric_and_closed_wire_meshes_are_valid() {
+        // 1. Lathe vase (with pole point r=0 at bottom) and partial arc
+        let vase = build_lathe_mesh(
+            &[[0.0, -5.0], [3.0, -4.0], [2.0, 0.0], [4.0, 4.0], [3.0, 6.0]],
+            24,
+            0.0,
+            TAU,
+        );
+        assert_valid_primitive_mesh(&vase, "lathe_vase");
+        assert!((vase.bounds.min.y - (-5.0)).abs() < 1e-3);
+        assert!((vase.bounds.max.y - 6.0).abs() < 1e-3);
+
+        let arc = build_lathe_mesh(&[[2.0, -2.0], [4.0, 0.0], [2.0, 2.0]], 12, 0.25, PI);
+        assert_valid_primitive_mesh(&arc, "lathe_partial_arc");
+
+        // 2. Superquadric: sphere (1,1), rounded box (0.2,0.2), pinched star (2.4,2.4)
+        let sq_sphere = build_superquadric_mesh(5.0, 5.0, 5.0, 1.0, 1.0, 24, 16);
+        assert_valid_primitive_mesh(&sq_sphere, "superquadric_sphere");
+        assert!((sq_sphere.bounds.max.x - 5.0).abs() < 1e-2);
+
+        let sq_box = build_superquadric_mesh(4.0, 6.0, 3.0, 0.2, 0.2, 24, 16);
+        assert_valid_primitive_mesh(&sq_box, "superquadric_rounded_box");
+        assert!((sq_box.bounds.max.y - 6.0).abs() < 1e-2);
+
+        let sq_star = build_superquadric_mesh(4.0, 4.0, 4.0, 2.4, 2.4, 24, 16);
+        assert_valid_primitive_mesh(&sq_star, "superquadric_star");
+
+        // 3. 3D Wire open vs closed loop
+        let wire_open = build_wire_mesh_closed(Vec3::new(8.0, 8.0, 4.0), 1.0, 2, 8, 12, false);
+        let wire_closed = build_wire_mesh_closed(Vec3::new(8.0, 8.0, 4.0), 1.0, 2, 8, 12, true);
+        assert_valid_primitive_mesh(&wire_open, "wire_open");
+        assert_valid_primitive_mesh(&wire_closed, "wire_closed");
+        // Verify first and last rings of closed wire coincide at the closing seam.
+        let stride = 9usize; // inner_segs + 1
+        let last_ring = wire_closed.vertices.len() - stride;
+        for j in 0..stride {
+            let p0 = Vec3::from_array(wire_closed.vertices[j].position);
+            let p1 = Vec3::from_array(wire_closed.vertices[last_ring + j].position);
+            assert!(
+                (p0 - p1).length() < 1e-3,
+                "closed wire seam ring mismatch at {j}: {p0:?} vs {p1:?}"
             );
         }
     }

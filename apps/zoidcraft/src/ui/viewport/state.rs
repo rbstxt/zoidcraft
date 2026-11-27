@@ -1,6 +1,7 @@
 //! Viewport persistent state, drag state machines, and shared property evaluation.
 
 use super::*;
+use std::collections::BTreeSet;
 
 pub(crate) const COLOR_LETTERBOX_BG: Color32 = Color32::from_rgb(0x1d, 0x1d, 0x1d);
 
@@ -317,6 +318,8 @@ pub enum BezierDragPart {
     InHandle(usize),
     OutHandle(usize),
     WholeContour,
+    BoxScale { sx: i8, sy: i8 },
+    BoxRotate,
 }
 
 /// Selected Bezier vertex for tangent display & keyboard deletion.
@@ -325,6 +328,34 @@ pub struct SelectedPathVertex {
     pub clip_id: String,
     pub source: PathContourSource,
     pub vertex_index: usize,
+}
+
+/// Multi-vertex selection set on a single editable Bezier contour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BezierVertexSelection {
+    pub clip_id: String,
+    pub source: PathContourSource,
+    pub vertices: BTreeSet<usize>,
+}
+
+/// In-progress rectangular marquee selection over Bezier contour vertices.
+#[derive(Debug, Clone)]
+pub struct BezierMarqueeState {
+    pub clip_id: String,
+    pub source: Option<PathContourSource>,
+    pub start_screen: Pos2,
+    pub current_screen: Pos2,
+    pub shift_additive: bool,
+    pub initial_selection: Option<BezierVertexSelection>,
+}
+
+/// Floating right-click context menu for Bezier vertex & contour actions.
+#[derive(Debug, Clone)]
+pub struct BezierContextMenu {
+    pub clip_id: String,
+    pub source: PathContourSource,
+    pub vertex_index: Option<usize>,
+    pub screen_pos: Pos2,
 }
 
 #[derive(Debug, Clone)]
@@ -345,6 +376,11 @@ pub struct BezierEditDrag {
     pub init_vertex_ids: Vec<String>,
     pub closed: bool,
     pub changed: bool,
+    pub selected_indices: Vec<usize>,
+    pub box_pivot_screen: Pos2,
+    pub box_handle_screen: Pos2,
+    pub box_opposite_screen: Pos2,
+    pub broken_opposite: Option<[f64; 2]>,
 }
 
 /// Sub-mode for Quick Shape / Freehand tool (`active_draw_tool == Some(2)`).
@@ -410,14 +446,24 @@ pub struct Transform2DDrag {
     pub changed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionPathHandleKind {
+    Keyframe,
+    InTangent,
+    OutTangent,
+}
+
 #[derive(Debug, Clone)]
 pub struct MotionPathDrag {
     pub target_id: String,
     pub is_3d: bool,
     pub local_frame: f64,
     pub tween: u16,
+    pub handle_kind: MotionPathHandleKind,
     pub orig_pos: Vec3,
     pub current_pos: Vec3,
+    pub orig_control_points: [[f64; 2]; 2],
+    pub continuous: bool,
     pub last_pointer: Pos2,
     pub changed: bool,
 }
@@ -531,6 +577,14 @@ pub struct ViewportState {
     pub last_frame_times: VecDeque<f32>,
     /// Selected Bezier path vertex for handle display & deletion.
     pub(crate) selected_path_vertex: Option<SelectedPathVertex>,
+    /// Multi-vertex Bezier selection set synchronized with `selected_path_vertex`.
+    pub(crate) selected_path_vertices: Option<BezierVertexSelection>,
+    /// Active marquee box selection over Bezier contour vertices.
+    pub(crate) bezier_marquee: Option<BezierMarqueeState>,
+    /// Open right-click context menu for Bezier vertex & contour actions.
+    pub(crate) bezier_context_menu: Option<BezierContextMenu>,
+    /// Prevents the Bezier context menu from closing on the same frame it opened.
+    pub(crate) bezier_context_menu_opened_this_frame: bool,
     /// In-progress Pen tool draft contour.
     pub(crate) pen_draft: Option<PenDraftState>,
     /// Active Quick Shape / Freehand sub-mode when `active_draw_tool == Some(2)`.
@@ -577,6 +631,10 @@ impl ViewportState {
             show_fps_meter: true,
             last_frame_times: VecDeque::new(),
             selected_path_vertex: None,
+            selected_path_vertices: None,
+            bezier_marquee: None,
+            bezier_context_menu: None,
+            bezier_context_menu_opened_this_frame: false,
             pen_draft: None,
             quick_shape_kind: QuickShapeKind::Freehand,
             last_frame_time_sec: None,
@@ -642,6 +700,137 @@ impl ViewportState {
         self.pan_2d.y = self.pan_2d.y.clamp(-max_pan_y, max_pan_y);
     }
 
+    /// Clears both single- and multi-vertex Bezier selections.
+    pub(crate) fn clear_path_vertex_selection(&mut self) {
+        self.selected_path_vertex = None;
+        self.selected_path_vertices = None;
+    }
+
+    /// Selects exactly one Bezier vertex on `(clip_id, source)`.
+    pub(crate) fn select_single_path_vertex(
+        &mut self,
+        clip_id: String,
+        source: PathContourSource,
+        vertex_index: usize,
+    ) {
+        let mut vertices = BTreeSet::new();
+        vertices.insert(vertex_index);
+        self.selected_path_vertex = Some(SelectedPathVertex {
+            clip_id: clip_id.clone(),
+            source: source.clone(),
+            vertex_index,
+        });
+        self.selected_path_vertices = Some(BezierVertexSelection {
+            clip_id,
+            source,
+            vertices,
+        });
+    }
+
+    /// Replaces the selected vertex set on `(clip_id, source)`.
+    pub(crate) fn set_path_vertex_selection(
+        &mut self,
+        clip_id: String,
+        source: PathContourSource,
+        vertices: BTreeSet<usize>,
+        primary_hint: Option<usize>,
+    ) {
+        if vertices.is_empty() {
+            self.clear_path_vertex_selection();
+            return;
+        }
+        let primary = primary_hint
+            .filter(|i| vertices.contains(i))
+            .or_else(|| vertices.iter().next().copied())
+            .unwrap_or(0);
+        self.selected_path_vertex = Some(SelectedPathVertex {
+            clip_id: clip_id.clone(),
+            source: source.clone(),
+            vertex_index: primary,
+        });
+        self.selected_path_vertices = Some(BezierVertexSelection {
+            clip_id,
+            source,
+            vertices,
+        });
+    }
+
+    /// Toggles `vertex_index` in/out of the selection set for `(clip_id, source)`.
+    /// Returns `true` if the vertex is selected after toggling, `false` if deselected.
+    pub(crate) fn toggle_path_vertex_selection(
+        &mut self,
+        clip_id: String,
+        source: PathContourSource,
+        vertex_index: usize,
+    ) -> bool {
+        let mut set = self.selected_vertex_indices_for(&clip_id, &source);
+        let now_selected = if set.contains(&vertex_index) {
+            set.remove(&vertex_index);
+            false
+        } else {
+            set.insert(vertex_index);
+            true
+        };
+        let hint = if now_selected {
+            Some(vertex_index)
+        } else {
+            set.iter().next_back().copied()
+        };
+        self.set_path_vertex_selection(clip_id, source, set, hint);
+        now_selected
+    }
+
+    /// Returns all currently selected vertex indices for `(clip_id, source)`.
+    #[must_use]
+    pub(crate) fn selected_vertex_indices_for(
+        &self,
+        clip_id: &str,
+        source: &PathContourSource,
+    ) -> BTreeSet<usize> {
+        if self.selected_path_vertex.is_none() {
+            return BTreeSet::new();
+        }
+        if let Some(multi) = &self.selected_path_vertices
+            && multi.clip_id == clip_id
+            && multi.source == *source
+            && !multi.vertices.is_empty()
+        {
+            return multi.vertices.clone();
+        }
+        if let Some(single) = &self.selected_path_vertex
+            && single.clip_id == clip_id
+            && single.source == *source
+        {
+            let mut set = BTreeSet::new();
+            set.insert(single.vertex_index);
+            return set;
+        }
+        BTreeSet::new()
+    }
+
+    /// Returns the active `(source, selected_indices)` for `clip_id`, if any vertices are selected.
+    #[must_use]
+    pub(crate) fn active_bezier_selection(
+        &self,
+        clip_id: &str,
+    ) -> Option<(PathContourSource, BTreeSet<usize>)> {
+        self.selected_path_vertex.as_ref()?;
+        if let Some(multi) = &self.selected_path_vertices
+            && multi.clip_id == clip_id
+            && !multi.vertices.is_empty()
+        {
+            return Some((multi.source.clone(), multi.vertices.clone()));
+        }
+        if let Some(single) = &self.selected_path_vertex
+            && single.clip_id == clip_id
+        {
+            let mut set = BTreeSet::new();
+            set.insert(single.vertex_index);
+            return Some((single.source.clone(), set));
+        }
+        None
+    }
+
     /// Cancels an active 2D/3D transform, motion-path, or Bezier edit drag and rolls back its undo transaction.
     pub fn cancel_active_interaction(&mut self, session: &mut Session) -> bool {
         let was_tx = matches!(
@@ -652,12 +841,22 @@ impl ViewportState {
                 | ViewportDragState::BezierEdit(_)
         );
         self.active_snap_guides = None;
+        let had_menu = self.bezier_context_menu.take().is_some();
+        self.bezier_context_menu_opened_this_frame = false;
+        if let Some(marquee) = self.bezier_marquee.take() {
+            if let Some(prev) = marquee.initial_selection {
+                self.set_path_vertex_selection(prev.clip_id, prev.source, prev.vertices, None);
+            } else {
+                self.clear_path_vertex_selection();
+            }
+            return true;
+        }
         if self.pen_draft.is_some() && matches!(self.drag_state, ViewportDragState::None) {
             self.pen_draft = None;
             return true;
         }
         if matches!(self.drag_state, ViewportDragState::None) {
-            return false;
+            return had_menu;
         }
         if was_tx && session.history.is_in_transaction() {
             let _ = session.cancel_transaction();

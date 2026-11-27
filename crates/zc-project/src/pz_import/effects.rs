@@ -35,14 +35,11 @@ pub(crate) fn parse_effect(
         )
     });
 
-    let custom_props_val = obj
-        .get("customProperties")
-        .or_else(|| props.and_then(|p| p.get("customProperties")));
+    let custom_properties_all = parse_custom_properties_from_maps(obj, props);
 
     let mut instance = match eff_type.and_then(value_as_u32) {
         Some(0) => {
             let mut grp = create_effect_group("Group");
-            let custom_properties = parse_custom_properties(custom_props_val);
             let mut children = Vec::new();
             for arr in [
                 obj.get("objects").and_then(Value::as_array),
@@ -56,14 +53,13 @@ pub(crate) fn parse_effect(
                 }
             }
             grp.kind = EffectKind::EffectGroup {
-                custom_properties,
+                custom_properties: custom_properties_all.clone(),
                 children,
             };
             grp
         }
         None if is_string_effect_group => {
             let mut grp = create_effect_group("Group");
-            let custom_properties = parse_custom_properties(custom_props_val);
             let mut children = Vec::new();
             for arr in [
                 obj.get("objects").and_then(Value::as_array),
@@ -77,7 +73,7 @@ pub(crate) fn parse_effect(
                 }
             }
             grp.kind = EffectKind::EffectGroup {
-                custom_properties,
+                custom_properties: custom_properties_all.clone(),
                 children,
             };
             grp
@@ -88,10 +84,9 @@ pub(crate) fn parse_effect(
                 .and_then(extract_shader_string)
                 .unwrap_or_default();
             let mut shader = create_custom_shader("Custom Shader", frag_shader.clone());
-            let custom_properties = parse_custom_properties(custom_props_val);
             shader.kind = EffectKind::CustomShader {
                 frag_shader,
-                custom_properties,
+                custom_properties: custom_properties_all.clone(),
             };
             shader
         }
@@ -171,7 +166,11 @@ pub(crate) fn parse_effect(
         );
         for (k, v) in props {
             if matches!(k.as_str(), "name" | "enabled" | "fragShader")
-                || (has_custom_props && k == "customProperties")
+                || (has_custom_props
+                    && matches!(
+                        k.as_str(),
+                        "customProperties" | "userProperties" | "extraProperties"
+                    ))
             {
                 continue;
             }
@@ -219,17 +218,33 @@ pub(crate) fn parse_effect(
         }
     }
 
+    if !matches!(
+        instance.kind,
+        EffectKind::EffectGroup { .. } | EffectKind::CustomShader { .. }
+    ) {
+        for cp in &custom_properties_all {
+            instance
+                .params
+                .entry(cp.name.clone())
+                .or_insert_with(|| cp.track.clone());
+        }
+    }
+
     let is_effect_group = matches!(instance.kind, EffectKind::EffectGroup { .. });
     for (k, v) in obj {
         if !matches!(
             k.as_str(),
-            "type" | "properties" | "objects" | "customProperties"
+            "type"
+                | "properties"
+                | "objects"
+                | "customProperties"
+                | "userProperties"
+                | "extraProperties"
         ) && !(is_effect_group && k == "effects")
         {
             instance.preserved.insert(k.clone(), v.clone());
         }
     }
-
     instance
 }
 
@@ -248,7 +263,68 @@ pub(super) fn extract_shader_string(val: &Value) -> Option<String> {
     obj.get("value").and_then(extract_shader_string)
 }
 
+pub(super) fn parse_custom_properties_from_maps(
+    obj: &serde_json::Map<String, Value>,
+    props: Option<&serde_json::Map<String, Value>>,
+) -> Vec<CustomProperty> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    let sources = [
+        obj.get("customProperties"),
+        props.and_then(|p| p.get("customProperties")),
+        obj.get("userProperties"),
+        props.and_then(|p| p.get("userProperties")),
+        obj.get("extraProperties"),
+        props.and_then(|p| p.get("extraProperties")),
+    ];
+    for src in sources.into_iter().flatten() {
+        for cp in parse_custom_properties(Some(src)) {
+            if seen.insert(cp.name.clone()) {
+                out.push(cp);
+            }
+        }
+    }
+    out
+}
+
+fn parse_custom_prop_type_token(val: &Value) -> Option<u32> {
+    if let Some(n) = value_as_u32(val) {
+        return Some(n);
+    }
+    let s = val.as_str()?.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "number" | "slider" | "float" | "angle" => Some(0),
+        "vec2" | "vector2" | "point2d" | "point 2d" => Some(1),
+        "vec3" | "vector3" | "point3d" | "point 3d" => Some(2),
+        "vec4" | "vector4" => Some(3),
+        "color" | "rgb" => Some(4),
+        "bool" | "boolean" | "checkbox" | "gradient" => Some(5),
+        "option" | "enum" | "select" => Some(6),
+        "text" | "string" => Some(7),
+        "asset" | "texture" | "image" => Some(8),
+        "list" => Some(9),
+        "curve" => Some(10),
+        "shader" => Some(11),
+        _ => None,
+    }
+}
+
 pub(super) fn parse_custom_properties(val: Option<&Value>) -> Vec<CustomProperty> {
+    if let Some(map) = val.and_then(Value::as_object) {
+        let mut out = Vec::with_capacity(map.len());
+        for (raw_name, item) in map {
+            let name = sanitize_display_name(raw_name);
+            let default_val = infer_default_value(item);
+            let track = parse_property_track(item, default_val);
+            out.push(CustomProperty {
+                name,
+                prop_type: None,
+                track,
+                metadata: BTreeMap::new(),
+            });
+        }
+        return out;
+    }
     let Some(arr) = val.and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -261,9 +337,17 @@ pub(super) fn parse_custom_properties(val: Option<&Value>) -> Vec<CustomProperty
         let type_obj = obj.get("type").and_then(Value::as_object);
         let prop_type = obj
             .get("type")
-            .and_then(value_as_u32)
-            .or_else(|| type_obj.and_then(|t| t.get("type")).and_then(value_as_u32))
-            .or_else(|| props.and_then(|p| p.get("type")).and_then(value_as_u32));
+            .and_then(parse_custom_prop_type_token)
+            .or_else(|| {
+                type_obj
+                    .and_then(|t| t.get("type"))
+                    .and_then(parse_custom_prop_type_token)
+            })
+            .or_else(|| {
+                props
+                    .and_then(|p| p.get("type"))
+                    .and_then(parse_custom_prop_type_token)
+            });
         let name = props
             .and_then(|p| prop_str(p, "name"))
             .or_else(|| {
@@ -325,22 +409,24 @@ pub(super) fn parse_custom_properties(val: Option<&Value>) -> Vec<CustomProperty
             _ => infer_default_value(value_node),
         };
         let mut track = parse_property_track(value_node, default_val);
-        if obj.contains_key("value") || used_props_value {
-            if track.expression.is_none()
-                && let Some(expr) = obj
-                    .get("expression")
-                    .or_else(|| props.and_then(|p| p.get("expression")))
-                    .and_then(Value::as_str)
-            {
-                track.expression = Some(expr.to_owned());
-            }
-            if let Some(anim) = obj
-                .get("animated")
-                .or_else(|| props.and_then(|p| p.get("animated")))
-                .and_then(Value::as_bool)
-            {
-                track.animated = track.animated || anim;
-            }
+        if track.expression.is_none()
+            && let Some(expr) = obj
+                .get("expression")
+                .or_else(|| props.and_then(|p| p.get("expression")))
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+        {
+            track.expression = Some(expr.to_owned());
+        }
+        if let Some(anim) = obj
+            .get("animated")
+            .or_else(|| props.and_then(|p| p.get("animated")))
+            .and_then(Value::as_bool)
+        {
+            track.animated = track.animated || anim;
+        }
+        if track.expression.is_some() {
+            track.animated = true;
         }
         let mut metadata = BTreeMap::new();
         for (k, v) in obj {

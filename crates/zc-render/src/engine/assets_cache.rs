@@ -168,7 +168,8 @@ impl ProjectRenderEngine {
     }
 
     /// Decodes an animated GIF asset (`GIF87a` / `GIF89a`) once per asset ID and returns the
-    /// frame matching `time_secs % total_duration_sec` as a cached GPU texture.
+    /// frame matching `time_secs` (respecting GIF `< 20ms => 100ms` delay rules and NETSCAPE2.0
+    /// loop count metadata) as a cached GPU texture.
     pub(super) fn ensure_gif_frame_texture(
         &mut self,
         project: &Project,
@@ -177,29 +178,35 @@ impl ProjectRenderEngine {
         premultiply: bool,
     ) -> Option<Arc<RenderTarget>> {
         let record = project.assets.get(asset_id)?;
-        let bytes = record.bytes.as_deref()?;
-        if bytes.len() < 6 || (&bytes[..6] != b"GIF87a" && &bytes[..6] != b"GIF89a") {
+        if !peek_gif_magic(record) {
             return None;
         }
-        let content_hash = hash_asset_record(record);
+        let content_hash = asset_record_effective_hash(record)?;
         let needs_decode = self
             .gif_cache
             .get(asset_id)
             .is_none_or(|c| c.content_hash != content_hash);
         if needs_decode {
+            const MAX_GIF_FRAMES: usize = 10_000;
+            const MAX_GIF_DECODED_BYTES: usize = 256 * 1024 * 1024;
+            let bytes_cow = load_asset_bytes(record)?;
+            let bytes = bytes_cow.as_ref();
+            if bytes.len() < 6 || (&bytes[..6] != b"GIF87a" && &bytes[..6] != b"GIF89a") {
+                return None;
+            }
+            let loop_count = parse_gif_loop_count(bytes);
             let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
             let mut decoded_frames = Vec::new();
             let mut acc_sec = 0.0_f64;
+            let mut total_bytes = 0_usize;
             for frame_res in decoder.into_frames() {
                 let Ok(frame) = frame_res else {
                     break;
                 };
                 let (num, den) = frame.delay().numer_denom_ms();
-                let dur = if num == 0 {
-                    0.1
-                } else {
-                    (f64::from(num) / (f64::from(den.max(1)) * 1000.0)).max(0.01)
-                };
+                let ms = f64::from(num) / f64::from(den.max(1));
+                // Standard browser / Zoidium GIF delay rule: delays < 20ms default to 100ms.
+                let dur = if ms < 20.0 { 0.1 } else { ms / 1000.0 };
                 acc_sec += dur;
                 let buf = frame.into_buffer();
                 let (w, h) = buf.dimensions();
@@ -210,13 +217,15 @@ impl ProjectRenderEngine {
                 {
                     return None;
                 }
+                let raw = buf.into_raw();
+                total_bytes = total_bytes.saturating_add(raw.len());
                 decoded_frames.push(CachedGifFrame {
                     width: w,
                     height: h,
-                    rgba_straight: buf.into_raw(),
+                    rgba_straight: raw,
                     end_time_sec: acc_sec,
                 });
-                if decoded_frames.len() >= 1024 {
+                if decoded_frames.len() >= MAX_GIF_FRAMES || total_bytes >= MAX_GIF_DECODED_BYTES {
                     break;
                 }
             }
@@ -241,6 +250,7 @@ impl ProjectRenderEngine {
                 CachedGifAnimation {
                     content_hash,
                     total_duration_sec: acc_sec.max(1e-4),
+                    loop_count,
                     frames: decoded_frames,
                     last_used: tick,
                 },
@@ -251,16 +261,21 @@ impl ProjectRenderEngine {
             let entry = self.gif_cache.get_mut(asset_id)?;
             self.cache_tick = self.cache_tick.wrapping_add(1);
             entry.last_used = self.cache_tick;
-            let t_mod = if entry.frames.len() <= 1 {
-                0.0
+            let t_pos = time_secs.max(0.0);
+            let idx = if entry.frames.len() <= 1 {
+                0
+            } else if let Some(max_repeats) = entry.loop_count.filter(|&n| n > 0)
+                && t_pos >= entry.total_duration_sec * f64::from(max_repeats + 1)
+            {
+                entry.frames.len() - 1
             } else {
-                time_secs.max(0.0) % entry.total_duration_sec
+                let t_mod = t_pos % entry.total_duration_sec;
+                entry
+                    .frames
+                    .iter()
+                    .position(|f| t_mod < f.end_time_sec)
+                    .unwrap_or(entry.frames.len() - 1)
             };
-            let idx = entry
-                .frames
-                .iter()
-                .position(|f| t_mod < f.end_time_sec)
-                .unwrap_or(entry.frames.len() - 1);
             let f = &entry.frames[idx];
             (idx, f.width, f.height)
         };
@@ -390,12 +405,7 @@ impl ProjectRenderEngine {
         premultiply: bool,
     ) -> Option<Arc<RenderTarget>> {
         let record = project.assets.get(asset_id)?;
-        let bytes = record.bytes.as_deref()?;
-        let content_hash = if !record.sha256.is_empty() {
-            fnv1a_hash64(record.sha256.as_bytes())
-        } else {
-            fnv1a_hash64(bytes)
-        };
+        let content_hash = asset_record_effective_hash(record)?;
         let key = TextureCacheKey {
             asset_key: asset_id.to_owned(),
             content_hash,
@@ -405,6 +415,8 @@ impl ProjectRenderEngine {
             return Some(cached);
         }
 
+        let bytes_cow = load_asset_bytes(record)?;
+        let bytes = bytes_cow.as_ref();
         let max_dim = self.ctx.device.limits().max_texture_dimension_2d;
         let dim_reader =
             match image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format() {
@@ -560,16 +572,17 @@ impl ProjectRenderEngine {
         &mut self,
         record: &zc_project::AssetRecord,
     ) -> Option<Arc<ParsedCubeLut>> {
-        let bytes = record.bytes.as_deref()?;
+        let base_hash = asset_record_effective_hash(record)?;
         let max_dim = self.ctx.device.limits().max_texture_dimension_2d;
-        let key = hash_u64(hash_asset_record(record), u64::from(max_dim));
+        let key = hash_u64(base_hash, u64::from(max_dim));
         if let Some(entry) = self.cube_lut_cache.get_mut(&key) {
             self.cache_tick = self.cache_tick.wrapping_add(1);
             entry.last_used = self.cache_tick;
             return Some(Arc::clone(&entry.parsed));
         }
 
-        let (lut, domain_min, domain_max) = parse_cube_lut_bytes(bytes, max_dim)?;
+        let bytes_cow = load_asset_bytes(record)?;
+        let (lut, domain_min, domain_max) = parse_cube_lut_bytes(bytes_cow.as_ref(), max_dim)?;
         let parsed = Arc::new(ParsedCubeLut {
             lut,
             domain_min,
@@ -837,6 +850,155 @@ pub(super) fn hash_effectors(mut h: u64, obj: &Object3D, env: &EvalEnv<'_>) -> u
         h = hash_json_value(h, val);
     }
     h
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_EXTERNAL_ASSET_BYTES: u64 = 256 * 1024 * 1024;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn decode_percent_encoded_path(raw: &str) -> Option<String> {
+    if !raw.contains('%') {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_asset_disk_path(url: &str) -> Option<PathBuf> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("data:")
+        || lower.starts_with("blob:")
+    {
+        return None;
+    }
+    let raw_path = if let Some(rest) = trimmed.strip_prefix("file://") {
+        #[cfg(windows)]
+        {
+            let b = rest.as_bytes();
+            if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+                &rest[1..]
+            } else {
+                rest
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            rest
+        }
+    } else {
+        trimmed
+    };
+    let direct = Path::new(raw_path);
+    if direct.is_file() {
+        return Some(direct.to_path_buf());
+    }
+    if let Some(decoded) = decode_percent_encoded_path(raw_path) {
+        let dec_path = Path::new(&decoded);
+        if dec_path.is_file() {
+            return Some(dec_path.to_path_buf());
+        }
+    }
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn disk_file_content_hash(url: &str, path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_EXTERNAL_ASSET_BYTES {
+        return None;
+    }
+    let mtime_nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0u64, |d| d.as_nanos() as u64);
+    let mut h = fnv1a_hash64(b"disk_asset_v1");
+    h = hash_u64(h, fnv1a_hash64(url.as_bytes()));
+    h = hash_u64(h, meta.len());
+    h = hash_u64(h, mtime_nanos);
+    Some(h)
+}
+
+fn asset_record_effective_hash(record: &zc_project::AssetRecord) -> Option<u64> {
+    if let Some(bytes) = record.bytes.as_deref() {
+        return Some(if !record.sha256.is_empty() {
+            fnv1a_hash64(record.sha256.as_bytes())
+        } else {
+            fnv1a_hash64(bytes)
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(url) = record.url.as_deref()
+        && let Some(path) = resolve_asset_disk_path(url)
+    {
+        if !record.sha256.is_empty() {
+            return Some(fnv1a_hash64(record.sha256.as_bytes()));
+        }
+        return disk_file_content_hash(url, &path);
+    }
+    None
+}
+
+fn load_asset_bytes<'a>(record: &'a zc_project::AssetRecord) -> Option<Cow<'a, [u8]>> {
+    if let Some(bytes) = record.bytes.as_deref() {
+        return Some(Cow::Borrowed(bytes));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(url) = record.url.as_deref()
+        && let Some(path) = resolve_asset_disk_path(url)
+    {
+        let meta = std::fs::metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_EXTERNAL_ASSET_BYTES {
+            return None;
+        }
+        let data = std::fs::read(&path).ok()?;
+        return Some(Cow::Owned(data));
+    }
+    None
+}
+
+fn peek_gif_magic(record: &zc_project::AssetRecord) -> bool {
+    if let Some(bytes) = record.bytes.as_deref() {
+        return bytes.len() >= 6 && (&bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a");
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(url) = record.url.as_deref()
+        && let Some(path) = resolve_asset_disk_path(url)
+    {
+        use std::io::Read;
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            return false;
+        };
+        let mut header = [0u8; 6];
+        if file.read_exact(&mut header).is_ok() {
+            return &header == b"GIF87a" || &header == b"GIF89a";
+        }
+    }
+    false
 }
 
 pub(super) fn hash_asset_record(rec: &zc_project::AssetRecord) -> u64 {
@@ -1163,10 +1325,17 @@ pub(super) fn resolve_font_bytes<'a>(
     if font_key.is_empty() {
         return None;
     }
-    if let Some(rec) = project.assets.get(font_key)
-        && let Some(bytes) = rec.bytes.as_deref()
-    {
-        return Some(ResolvedFont::Borrowed(bytes));
+    if let Some(rec) = project.assets.get(font_key) {
+        if let Some(bytes) = rec.bytes.as_deref() {
+            return Some(ResolvedFont::Borrowed(bytes));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(url) = rec.url.as_deref()
+            && let Some(path) = resolve_asset_disk_path(url)
+            && let Some(bytes) = load_font_file_cached(&path)
+        {
+            return Some(ResolvedFont::Owned(bytes));
+        }
     }
     // Fallback lookup by URL, filename, or legacy `.pz` asset key in `project.assets`.
     for rec in project.assets.values() {
@@ -1177,8 +1346,17 @@ pub(super) fn resolve_font_bytes<'a>(
                 .get("legacy_pz_asset_key")
                 .and_then(serde_json::Value::as_str)
                 == Some(font_key);
-        if matches && let Some(bytes) = rec.bytes.as_deref() {
-            return Some(ResolvedFont::Borrowed(bytes));
+        if matches {
+            if let Some(bytes) = rec.bytes.as_deref() {
+                return Some(ResolvedFont::Borrowed(bytes));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(url) = rec.url.as_deref()
+                && let Some(path) = resolve_asset_disk_path(url)
+                && let Some(bytes) = load_font_file_cached(&path)
+            {
+                return Some(ResolvedFont::Owned(bytes));
+            }
         }
     }
     // Built-in bundled OFL fonts available offline without embedding.

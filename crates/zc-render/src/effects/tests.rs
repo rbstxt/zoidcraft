@@ -1912,10 +1912,10 @@ fn gpu_regression_c5_cardwipe_alpha_blur_fisheye_exposure_pixelsort_keycleaner_s
         "smart-motion-blur-lite with sensitivity=0.7 must produce motion blur diff (changed={smbl_changed})"
     );
 
-    // 12. keycleaner: default Zoidium alphaContrast=100, strength=100 tightens soft edges.
+    // 12. keycleaner: Zoidium alphaContrast=100 is neutral (1.0), 250 tightens soft edges.
     let kc_p = EffectParams::new([w as f32, h as f32], 0.0, 0.0)
         .with_param("additionalEdgeRadius", EffectParamValue::Float(3.0))
-        .with_param("alphaContrast", EffectParamValue::Float(100.0))
+        .with_param("alphaContrast", EffectParamValue::Float(250.0))
         .with_param("strength", EffectParamValue::Float(100.0));
     let kc_out = run_one(&mut registry, "keycleaner", &tex_cyan, None, None, &kc_p);
     let kc_changed = kc_out

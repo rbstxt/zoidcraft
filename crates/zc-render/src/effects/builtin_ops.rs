@@ -507,6 +507,9 @@ impl EffectRegistry {
             "ccpixelpolly" => {
                 self.run_pixel_polly(device, encoder, params, targets, width, height)?
             }
+            "smartmotionblur" => self.run_smart_motion_blur(
+                device, encoder, effect_id, params, targets, width, height,
+            )?,
             _ => {
                 let uploaded_lut = if targets.aux.is_none() {
                     self.upload_param_lut(device, queue, resolved, params)
@@ -1242,7 +1245,12 @@ impl EffectRegistry {
         let thresh_add = params.vec3_or("thresholdAddColor", [0.0, 0.0, 0.0]);
         let threshold = params.float_or("threshold", 0.5);
         let brightness = params.float_or("brightness", 2.0).max(0.0);
-        let height_scale = ((height as f32) / 1080.0).max(0.01);
+        let preview_match = params.int_or("previewMatch", 1) != 0;
+        let height_scale = if preview_match {
+            ((height as f32) / 1080.0).max(0.01)
+        } else {
+            1.0
+        };
         let glow_width = params.float_or("glowWidth", 96.0).max(0.0) * height_scale;
         let width_x = params.float_or("widthX", 1.0).max(0.0);
         let width_y = params.float_or("widthY", 1.0).max(0.0);
@@ -1253,7 +1261,12 @@ impl EffectRegistry {
         ];
         let show = params.int_or("show", 0) != 0;
         let combine = params.int_or("combine", 2).clamp(0, 4) as u32;
-        let edge_mode = params.int_or("edgeMode", 1).clamp(0, 1) as f32;
+        let expand_borders = params.float_or("expandBorders", 0.0);
+        let edge_mode = if expand_borders > 0.5 && !params.values.contains_key("edgeMode") {
+            0.0
+        } else {
+            params.int_or("edgeMode", 1).clamp(0, 1) as f32
+        };
         let opacity_mode = params.int_or("opacity", 1).clamp(0, 2) as f32;
         let subpixel_off = params.int_or("subpixel", 1) == 0;
         let quality = params.int_or("quality", 2).clamp(0, 3);
@@ -1281,6 +1294,7 @@ impl EffectRegistry {
         let atmo_detail = params.float_or("atmosphereDetail", 0.6);
         let atmo_seed = params.float_or("atmosphereSeed", 0.123);
         let atmo_speed = params.float_or("atmosphereSpeed", 1.0);
+        let atmo_model = params.int_or("atmosphereModel", 0).clamp(0, 2) as f32;
 
         let wf = width as f32;
         let hf = height as f32;
@@ -1745,7 +1759,7 @@ impl EffectRegistry {
         u_fin.p0 = [brightness, source_opacity, glow_under, affect_alpha];
         u_fin.p1 = [atmo_amp, atmo_freq, atmo_seed, atmo_t];
         u_fin.p2 = [threshold, from_alpha, opacity_mode, light_bg];
-        u_fin.p3 = [atmo_detail, atmo_speed, ae_mix, 0.0];
+        u_fin.p3 = [atmo_detail, atmo_speed, ae_mix, atmo_model];
         self.encode_pass(
             device,
             encoder,

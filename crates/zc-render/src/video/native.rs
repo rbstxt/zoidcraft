@@ -1,9 +1,9 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -48,16 +48,128 @@ fn is_usable_executable(path: &Path) -> bool {
     }
 }
 
+/// Returns ZoidCraft's per-user managed media tools directory where external binaries
+/// (`ffmpeg` / `ffprobe`) can be placed without modifying system directories.
+#[must_use]
+pub fn default_managed_tools_dir() -> PathBuf {
+    let env_path = |key: &str| {
+        std::env::var_os(key)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    #[cfg(target_os = "macos")]
+    let base = env_path("HOME").map(|h| h.join("Library/Application Support/ZoidCraft/bin"));
+    #[cfg(target_os = "windows")]
+    let base = env_path("APPDATA")
+        .or_else(|| env_path("LOCALAPPDATA"))
+        .map(|d| d.join("ZoidCraft").join("bin"));
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let base = env_path("XDG_DATA_HOME")
+        .filter(|p| p.is_absolute())
+        .or_else(|| env_path("HOME").map(|h| h.join(".local/share")))
+        .map(|d| d.join("zoidcraft/bin"));
+
+    base.unwrap_or_else(|| std::env::temp_dir().join("zoidcraft-bin"))
+}
+
+/// Derives a usable sibling `ffprobe` executable sitting next to a user-selected `ffmpeg` binary.
+#[must_use]
+pub fn derive_sibling_ffprobe_path(ffmpeg_path: &Path) -> Option<PathBuf> {
+    let candidate = ffmpeg_path.parent()?.join(executable_file_name("ffprobe"));
+    is_usable_executable(&candidate).then_some(candidate)
+}
+
+#[derive(Default)]
+struct MediaToolState {
+    custom_ffmpeg: Option<PathBuf>,
+    custom_ffprobe: Option<PathBuf>,
+    cached_ffmpeg: Option<PathBuf>,
+    cached_ffprobe: Option<PathBuf>,
+}
+
+impl MediaToolState {
+    fn set_custom(&mut self, ffmpeg: Option<PathBuf>, ffprobe: Option<PathBuf>) {
+        let clean = |opt: Option<PathBuf>| opt.filter(|p| !p.as_os_str().is_empty());
+        let custom_ffmpeg = clean(ffmpeg);
+        let custom_ffprobe = clean(ffprobe).or_else(|| {
+            custom_ffmpeg
+                .as_deref()
+                .and_then(derive_sibling_ffprobe_path)
+        });
+        self.custom_ffmpeg = custom_ffmpeg;
+        self.custom_ffprobe = custom_ffprobe;
+        self.cached_ffmpeg = None;
+        self.cached_ffprobe = None;
+    }
+
+    fn clear_cache(&mut self) {
+        self.cached_ffmpeg = None;
+        self.cached_ffprobe = None;
+    }
+
+    fn preferred_ffmpeg(&self) -> Option<PathBuf> {
+        if let Some(custom) = &self.custom_ffmpeg
+            && is_usable_executable(custom)
+        {
+            return Some(custom.clone());
+        }
+        if let Some(cached) = &self.cached_ffmpeg
+            && is_usable_executable(cached)
+        {
+            return Some(cached.clone());
+        }
+        None
+    }
+
+    fn preferred_ffprobe(&self) -> Option<PathBuf> {
+        if let Some(custom) = &self.custom_ffprobe
+            && is_usable_executable(custom)
+        {
+            return Some(custom.clone());
+        }
+        if let Some(cached) = &self.cached_ffprobe
+            && is_usable_executable(cached)
+        {
+            return Some(cached.clone());
+        }
+        None
+    }
+}
+
+fn media_tool_state() -> &'static RwLock<MediaToolState> {
+    static STATE: OnceLock<RwLock<MediaToolState>> = OnceLock::new();
+    STATE.get_or_init(|| RwLock::new(MediaToolState::default()))
+}
+
+/// Sets optional user-configured `ffmpeg` and `ffprobe` executable overrides (from Settings)
+/// and clears the discovery cache so changes take effect immediately without restarting.
+pub fn set_custom_media_tool_paths(ffmpeg: Option<PathBuf>, ffprobe: Option<PathBuf>) {
+    let mut state = media_tool_state()
+        .write()
+        .unwrap_or_else(|poison| poison.into_inner());
+    state.set_custom(ffmpeg, ffprobe);
+}
+
+/// Clears cached `ffmpeg` and `ffprobe` lookup results so freshly installed binaries are found
+/// immediately without restarting the process.
+pub fn refresh_media_tool_cache() {
+    let mut state = media_tool_state()
+        .write()
+        .unwrap_or_else(|poison| poison.into_inner());
+    state.clear_cache();
+}
+
 /// Resolves an external media CLI tool (`ffmpeg` or `ffprobe`) across GUI bundles whose `PATH`
 /// excludes package-manager directories (notably macOS `.app` bundles launched from Finder/DMG,
 /// which omit `/opt/homebrew/bin` and `/usr/local/bin`).
 ///
 /// Search order:
 /// 1. Explicit environment override (`env_var`, e.g. `ZOIDCRAFT_FFMPEG` / `ZOIDCRAFT_FFPROBE`)
-/// 2. Bundled sibling binary next to `current_exe()` (or `../Resources/` inside a macOS `.app`)
-/// 3. Entries in `path_env` (`PATH`)
-/// 4. Standard OS install locations (Homebrew, MacPorts, Nix, WinGet, Chocolatey, Program Files)
-/// 5. Bare `tool_name` fallback
+/// 2. Managed per-user tools directory (`default_managed_tools_dir()`)
+/// 3. Bundled sibling binary next to `current_exe()` (or `../Resources/` inside a macOS `.app`)
+/// 4. Entries in `path_env` (`PATH`)
+/// 5. Standard OS install locations (Homebrew, MacPorts, Nix, WinGet, Scoop, Chocolatey, Program Files)
+/// 6. Bare `tool_name` fallback
 fn resolve_media_tool_with_path(
     env_var: Option<&str>,
     tool_name: &str,
@@ -74,6 +186,12 @@ fn resolve_media_tool_with_path(
     }
 
     let exe_name = executable_file_name(tool_name);
+
+    // Check per-user managed tools directory (used by on-demand setup).
+    let managed = default_managed_tools_dir().join(&exe_name);
+    if is_usable_executable(&managed) {
+        return managed;
+    }
 
     // Check bundled sibling locations relative to the running executable.
     if let Ok(cur_exe) = std::env::current_exe()
@@ -119,6 +237,7 @@ fn resolve_media_tool_with_path(
     {
         fallback_dirs.push(PathBuf::from("/usr/bin"));
         fallback_dirs.push(PathBuf::from("/usr/local/bin"));
+        fallback_dirs.push(PathBuf::from("/home/linuxbrew/.linuxbrew/bin"));
         fallback_dirs.push(PathBuf::from("/snap/bin"));
         if let Some(home) = std::env::var_os("HOME") {
             let home = PathBuf::from(home);
@@ -130,6 +249,9 @@ fn resolve_media_tool_with_path(
     {
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
             fallback_dirs.push(PathBuf::from(local_app_data).join("Microsoft\\WinGet\\Links"));
+        }
+        if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+            fallback_dirs.push(PathBuf::from(user_profile).join("scoop\\shims"));
         }
         if let Some(pf) = std::env::var_os("ProgramFiles") {
             fallback_dirs.push(PathBuf::from(pf).join("ffmpeg\\bin"));
@@ -148,44 +270,58 @@ fn resolve_media_tool_with_path(
     PathBuf::from(tool_name)
 }
 
-/// Resolves the `ffmpeg` executable path, searching `ZOIDCRAFT_FFMPEG`, bundled app directories,
-/// `PATH`, and standard OS install locations (including `/opt/homebrew/bin` for macOS `.app`).
+/// Resolves the `ffmpeg` executable path, searching user Settings overrides, `ZOIDCRAFT_FFMPEG`,
+/// managed tools directory, bundled app directories, `PATH`, and standard OS install locations.
 #[must_use]
 pub fn resolve_ffmpeg_binary_path() -> PathBuf {
+    {
+        let state = media_tool_state()
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(p) = state.preferred_ffmpeg() {
+            return p;
+        }
+    }
     if let Some(explicit) = std::env::var_os("ZOIDCRAFT_FFMPEG")
         && !explicit.is_empty()
     {
         return PathBuf::from(explicit);
     }
-    static CACHED_FFMPEG: OnceLock<PathBuf> = OnceLock::new();
-    if let Some(p) = CACHED_FFMPEG.get() {
-        return p.clone();
-    }
     let path_env = std::env::var_os("PATH");
     let resolved = resolve_media_tool_with_path(None, "ffmpeg", path_env.as_deref());
     if is_usable_executable(&resolved) {
-        let _ = CACHED_FFMPEG.set(resolved.clone());
+        let mut state = media_tool_state()
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.cached_ffmpeg = Some(resolved.clone());
     }
     resolved
 }
 
-/// Resolves the `ffprobe` executable path, searching `ZOIDCRAFT_FFPROBE`, bundled app directories,
-/// `PATH`, and standard OS install locations (including `/opt/homebrew/bin` for macOS `.app`).
+/// Resolves the `ffprobe` executable path, searching user Settings overrides, `ZOIDCRAFT_FFPROBE`,
+/// managed tools directory, bundled app directories, `PATH`, and standard OS install locations.
 #[must_use]
 pub fn resolve_ffprobe_binary_path() -> PathBuf {
+    {
+        let state = media_tool_state()
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(p) = state.preferred_ffprobe() {
+            return p;
+        }
+    }
     if let Some(explicit) = std::env::var_os("ZOIDCRAFT_FFPROBE")
         && !explicit.is_empty()
     {
         return PathBuf::from(explicit);
     }
-    static CACHED_FFPROBE: OnceLock<PathBuf> = OnceLock::new();
-    if let Some(p) = CACHED_FFPROBE.get() {
-        return p.clone();
-    }
     let path_env = std::env::var_os("PATH");
     let resolved = resolve_media_tool_with_path(None, "ffprobe", path_env.as_deref());
     if is_usable_executable(&resolved) {
-        let _ = CACHED_FFPROBE.set(resolved.clone());
+        let mut state = media_tool_state()
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.cached_ffprobe = Some(resolved.clone());
     }
     resolved
 }
@@ -407,14 +543,74 @@ impl PrefetchState {
     }
 }
 
+/// Probes whether a `.webm`/`.mkv` file uses VP8 or VP9 so `ffmpeg` can be invoked with
+/// `-c:v libvpx` / `-c:v libvpx-vp9` before `-i` to preserve `yuva420p` alpha transparency.
+fn probe_webm_vpx_decoder(path: &Path) -> Option<&'static str> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    if !matches!(ext.as_deref(), Some("webm" | "mkv")) {
+        return None;
+    }
+    let output = Command::new(resolve_ffprobe_binary_path())
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let codec = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    match codec.as_str() {
+        "vp9" => Some("libvpx-vp9"),
+        "vp8" => Some("libvpx"),
+        _ => None,
+    }
+}
+
+/// Parses a `pts_time` value from an FFmpeg `showinfo` stderr line.
+///
+/// Returns:
+/// - `None` if `line` is not a per-frame `showinfo` line.
+/// - `Some(Some(secs))` for a valid numeric `pts_time`.
+/// - `Some(None)` for an explicit `pts_time:NOPTS` frame line.
+fn parse_showinfo_pts_time(line: &str) -> Option<Option<f64>> {
+    if !line.contains("pts:") || !line.contains("pts_time:") {
+        return None;
+    }
+    let after = line.split_once("pts_time:")?.1.trim_start();
+    let token = after.split_whitespace().next()?;
+    if token.eq_ignore_ascii_case("nopts") {
+        return Some(None);
+    }
+    let val = token.parse::<f64>().ok().filter(|v| v.is_finite())?;
+    Some(Some(val))
+}
+
 struct ActiveStream {
     start_secs: f64,
     child: Child,
     state: Arc<(Mutex<PrefetchState>, Condvar)>,
     reader_thread: Option<JoinHandle<()>>,
+    stderr_thread: Option<JoinHandle<()>>,
 }
 
 impl ActiveStream {
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         input_path: &Path,
         meta: &VideoMetadata,
@@ -422,6 +618,7 @@ impl ActiveStream {
         dec_h: u32,
         start_secs: f64,
         use_hwaccel: bool,
+        vpx_decoder: Option<&'static str>,
     ) -> Option<Self> {
         let frame_bytes = (dec_w as usize)
             .checked_mul(dec_h as usize)?
@@ -433,36 +630,58 @@ impl ActiveStream {
         let seek = start_secs.max(0.0);
 
         let mut cmd = Command::new(resolve_ffmpeg_binary_path());
-        cmd.args(["-v", "error", "-nostdin"]);
-        if use_hwaccel {
+        cmd.args(["-hide_banner", "-v", "info", "-nostdin"]);
+        if let Some(decoder) = vpx_decoder {
+            // Pass `-c:v libvpx` / `-c:v libvpx-vp9` before `-i` so WebM `yuva420p` alpha
+            // side-data is decoded instead of stripped by native/hardware decoders.
+            cmd.args(["-c:v", decoder]);
+        } else if use_hwaccel {
             cmd.args(["-hwaccel", "auto"]);
         }
         cmd.args(["-ss", &format!("{seek:.6}"), "-i"])
             .arg(input_path)
-            .args(["-an", "-sn", "-dn"]);
-        if (dec_w, dec_h) != (meta.width, meta.height) {
-            cmd.args(["-vf", &format!("scale={dec_w}:{dec_h}:flags=fast_bilinear")]);
-        }
-        cmd.args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
+            .args(["-an", "-sn", "-dn", "-fps_mode", "passthrough"]);
+        let vf = if (dec_w, dec_h) != (meta.width, meta.height) {
+            format!("scale={dec_w}:{dec_h}:flags=fast_bilinear,format=rgba,showinfo")
+        } else {
+            "format=rgba,showinfo".to_owned()
+        };
+        cmd.args(["-vf", &vf, "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         let mut child = cmd.spawn().ok()?;
         let stdout = child.stdout.take()?;
+        let stderr = child.stderr.take()?;
+
+        let (pts_tx, pts_rx) = mpsc::channel::<Option<f64>>();
+        let stderr_thread = thread::Builder::new()
+            .name("zc-video-pts".to_owned())
+            .spawn(move || {
+                showinfo_pts_reader_loop(stderr, pts_tx);
+            })
+            .ok();
+
+        let Some(stderr_thread) = stderr_thread else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        };
 
         let state = Arc::new((Mutex::new(PrefetchState::new()), Condvar::new()));
         let reader_state = Arc::clone(&state);
         let reader_thread = thread::Builder::new()
             .name("zc-video-prefetch".to_owned())
             .spawn(move || {
-                prefetch_reader_loop(stdout, reader_state, frame_bytes, seek, stream_fps);
+                prefetch_reader_loop(stdout, pts_rx, reader_state, frame_bytes, seek, stream_fps);
             })
             .ok();
 
         let Some(reader_thread) = reader_thread else {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stderr_thread.join();
             return None;
         };
 
@@ -471,6 +690,7 @@ impl ActiveStream {
             child,
             state,
             reader_thread: Some(reader_thread),
+            stderr_thread: Some(stderr_thread),
         })
     }
 
@@ -485,12 +705,29 @@ impl ActiveStream {
         if let Some(handle) = self.reader_thread.take() {
             let _ = handle.join();
         }
+        if let Some(handle) = self.stderr_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 
 impl Drop for ActiveStream {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+fn showinfo_pts_reader_loop(stderr: ChildStderr, pts_tx: mpsc::Sender<Option<f64>>) {
+    let reader = BufReader::new(stderr);
+    for line_res in reader.lines() {
+        let Ok(line) = line_res else {
+            break;
+        };
+        if let Some(pts_opt) = parse_showinfo_pts_time(&line)
+            && pts_tx.send(pts_opt).is_err()
+        {
+            break;
+        }
     }
 }
 
@@ -510,6 +747,7 @@ fn read_exact_frame(stdout: &mut ChildStdout, frame_bytes: usize) -> Option<Vec<
 
 fn prefetch_reader_loop(
     mut stdout: ChildStdout,
+    pts_rx: mpsc::Receiver<Option<f64>>,
     state: Arc<(Mutex<PrefetchState>, Condvar)>,
     frame_bytes: usize,
     start_secs: f64,
@@ -517,6 +755,7 @@ fn prefetch_reader_loop(
 ) {
     let (lock, cvar) = &*state;
     let mut frame_seq: u64 = 0;
+    let mut last_pts: Option<f64> = None;
 
     loop {
         // Wait for queue space before allocating and reading the next frame.
@@ -539,7 +778,18 @@ fn prefetch_reader_loop(
             break;
         };
 
-        let pts_secs = start_secs + (frame_seq as f64) / stream_fps;
+        let parsed_pts = pts_rx
+            .recv_timeout(Duration::from_millis(500))
+            .ok()
+            .flatten();
+        let pts_secs = if let Some(pt) = parsed_pts {
+            (start_secs + pt).max(0.0)
+        } else if let Some(prev) = last_pts {
+            prev + 1.0 / stream_fps
+        } else {
+            start_secs + (frame_seq as f64) / stream_fps
+        };
+        last_pts = Some(pts_secs);
         frame_seq = frame_seq.saturating_add(1);
 
         let Ok(mut st) = lock.lock() else {
@@ -570,6 +820,7 @@ pub struct VideoStreamSession {
     dec_w: u32,
     dec_h: u32,
     use_hwaccel: bool,
+    vpx_decoder: Option<&'static str>,
     active: Option<ActiveStream>,
     last_returned: Option<DecodedVideoFrame>,
 }
@@ -583,12 +834,14 @@ impl VideoStreamSession {
     #[must_use]
     pub fn new(input_path: PathBuf, meta: VideoMetadata, dec_w: u32, dec_h: u32) -> Self {
         let use_hwaccel = std::env::var("ZOIDCRAFT_VIDEO_HWACCEL").as_deref() == Ok("1");
+        let vpx_decoder = probe_webm_vpx_decoder(&input_path);
         Self {
             input_path,
             meta,
             dec_w: dec_w.max(2),
             dec_h: dec_h.max(2),
             use_hwaccel,
+            vpx_decoder,
             active: None,
             last_returned: None,
         }
@@ -684,11 +937,32 @@ impl VideoStreamSession {
         self.active = None;
 
         let try_hwaccel = self.use_hwaccel;
-        if let Some((stream, first_frame)) = self.spawn_and_wait_first(seek_secs, try_hwaccel) {
+        let try_vpx = self.vpx_decoder;
+        if let Some((stream, first_frame)) =
+            self.spawn_and_wait_first(seek_secs, try_hwaccel, try_vpx)
+        {
             let rgba = Arc::clone(&first_frame.rgba);
             self.last_returned = Some(first_frame);
             self.active = Some(stream);
             return Some(rgba);
+        }
+
+        // If explicit `-c:v libvpx*` failed (e.g. stripped ffmpeg build), fall back to default decoder.
+        if let Some(decoder) = try_vpx {
+            debug!(
+                path = %self.input_path.display(),
+                decoder,
+                "ffmpeg libvpx decoder produced 0 frames; retrying with default decoder"
+            );
+            self.vpx_decoder = None;
+            if let Some((stream, first_frame)) =
+                self.spawn_and_wait_first(seek_secs, try_hwaccel, None)
+            {
+                let rgba = Arc::clone(&first_frame.rgba);
+                self.last_returned = Some(first_frame);
+                self.active = Some(stream);
+                return Some(rgba);
+            }
         }
 
         // If `-hwaccel auto` produced 0 frames / immediate EOF, retry once with software decoding.
@@ -698,7 +972,9 @@ impl VideoStreamSession {
                 "ffmpeg -hwaccel auto produced 0 frames; retrying with software decoding"
             );
             self.use_hwaccel = false;
-            if let Some((stream, first_frame)) = self.spawn_and_wait_first(seek_secs, false) {
+            if let Some((stream, first_frame)) =
+                self.spawn_and_wait_first(seek_secs, false, self.vpx_decoder)
+            {
                 let rgba = Arc::clone(&first_frame.rgba);
                 self.last_returned = Some(first_frame);
                 self.active = Some(stream);
@@ -713,6 +989,7 @@ impl VideoStreamSession {
         &self,
         seek_secs: f64,
         use_hwaccel: bool,
+        vpx_decoder: Option<&'static str>,
     ) -> Option<(ActiveStream, DecodedVideoFrame)> {
         let stream = ActiveStream::spawn(
             &self.input_path,
@@ -721,6 +998,7 @@ impl VideoStreamSession {
             self.dec_h,
             seek_secs,
             use_hwaccel,
+            vpx_decoder,
         )?;
         let (lock, cvar) = &*stream.state;
         let deadline = Instant::now() + FRAME_WAIT_TIMEOUT;
@@ -1422,5 +1700,64 @@ mod tests {
         assert_eq!(parse_stream_rotation_degrees(&tag), 90);
         let none = serde_json::json!({});
         assert_eq!(parse_stream_rotation_degrees(&none), 0);
+    }
+
+    #[test]
+    fn custom_media_tool_override_and_cache_refresh_work() {
+        let dir = std::env::temp_dir().join(format!(
+            "zc-media-tool-override-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let fake_ffmpeg = dir.join(executable_file_name("ffmpeg"));
+        let fake_ffprobe = dir.join(executable_file_name("ffprobe"));
+        std::fs::write(&fake_ffmpeg, b"#!/bin/sh\nexit 0\n").expect("write fake ffmpeg");
+        std::fs::write(&fake_ffprobe, b"#!/bin/sh\nexit 0\n").expect("write fake ffprobe");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&fake_ffmpeg, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::set_permissions(&fake_ffprobe, std::fs::Permissions::from_mode(0o755));
+        }
+
+        assert_eq!(
+            derive_sibling_ffprobe_path(&fake_ffmpeg).as_deref(),
+            Some(fake_ffprobe.as_path())
+        );
+
+        let mut local_state = MediaToolState {
+            cached_ffmpeg: Some(PathBuf::from("/stale/ffmpeg")),
+            cached_ffprobe: Some(PathBuf::from("/stale/ffprobe")),
+            ..MediaToolState::default()
+        };
+        local_state.set_custom(Some(fake_ffmpeg.clone()), None);
+        assert!(local_state.cached_ffmpeg.is_none());
+        assert!(local_state.cached_ffprobe.is_none());
+        assert_eq!(local_state.preferred_ffmpeg(), Some(fake_ffmpeg));
+        assert_eq!(local_state.preferred_ffprobe(), Some(fake_ffprobe));
+
+        local_state.set_custom(None, None);
+        local_state.clear_cache();
+        assert!(local_state.preferred_ffmpeg().is_none());
+        assert!(local_state.preferred_ffprobe().is_none());
+        assert!(!default_managed_tools_dir().as_os_str().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_showinfo_pts_time_handles_vfr_nopts_and_headers() {
+        let frame_line = "[Parsed_showinfo_0 @ 0x748ec24c00] n:   2 pts:   1500 pts_time:0.125   duration: 1 fmt:rgba";
+        assert_eq!(parse_showinfo_pts_time(frame_line), Some(Some(0.125)));
+
+        let neg_line = "[Parsed_showinfo_1 @ 0x1] n: 0 pts: -10 pts_time:-0.033333 fmt:rgba";
+        assert_eq!(parse_showinfo_pts_time(neg_line), Some(Some(-0.033333)));
+
+        let nopts_line = "[Parsed_showinfo_0 @ 0x1] n: 0 pts: NOPTS pts_time:NOPTS fmt:rgba";
+        assert_eq!(parse_showinfo_pts_time(nopts_line), Some(None));
+
+        let config_line =
+            "[Parsed_showinfo_0 @ 0x748ec24c00] config in time_base: 1/30, frame_rate: 30/1";
+        assert_eq!(parse_showinfo_pts_time(config_line), None);
     }
 }

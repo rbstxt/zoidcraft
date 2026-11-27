@@ -9,6 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+zc-expr = { workspace = true }
 zc-project = { workspace = true }
 symphonia = { workspace = true }
 thiserror = { workspace = true }

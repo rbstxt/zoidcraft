@@ -19,6 +19,8 @@ struct PpState {
     int_defines: HashMap<String, u32>,
     included: HashSet<String>,
     cond_stack: Vec<CondFrame>,
+    glsl_version: Option<u32>,
+    extensions: BTreeMap<String, ExtensionBehavior>,
     budget: usize,
 }
 
@@ -63,6 +65,8 @@ impl PpState {
             int_defines,
             included: HashSet::new(),
             cond_stack: Vec::new(),
+            glsl_version: None,
+            extensions: BTreeMap::new(),
             budget: 0,
         }
     }
@@ -907,6 +911,8 @@ pub(super) struct PreprocessedSource {
     pub(super) source: String,
     pub(super) included: HashSet<String>,
     pub(super) int_defines: HashMap<String, u32>,
+    pub(super) glsl_version: Option<u32>,
+    pub(super) extensions: BTreeMap<String, ExtensionBehavior>,
 }
 
 fn parse_define_directive(rest: &str) -> Option<(String, MacroDef)> {
@@ -963,6 +969,8 @@ pub(super) fn preprocess_source(
         source: out,
         included: state.included,
         int_defines: state.int_defines,
+        glsl_version: state.glsl_version,
+        extensions: state.extensions,
     })
 }
 
@@ -1110,19 +1118,106 @@ fn preprocess_lines_into(
                         out.push('\n');
                     }
                 }
-                "version" | "pragma" | "line" | "" => {}
-                "extension" => {
-                    let mut parts = rest.splitn(2, ':');
-                    let ext_name = parts.next().unwrap_or("").trim();
-                    let behavior = parts.next().map_or("", str::trim);
-                    if behavior == "disable"
-                        || behavior == "warn"
-                        || ext_name == "GL_OES_standard_derivatives"
-                        || ext_name == "GL_EXT_shader_texture_lod"
+                "version" => {
+                    let mut parts = rest.split_whitespace();
+                    let Some(ver_str) = parts.next() else {
+                        return Err(ShaderError::GlslParse(
+                            "expected version number after #version".to_string(),
+                        ));
+                    };
+                    let Ok(ver) = ver_str.parse::<u32>() else {
+                        return Err(ShaderError::GlslParse(format!(
+                            "invalid #version number `{ver_str}`"
+                        )));
+                    };
+                    if ver == 0 {
+                        return Err(ShaderError::GlslParse(
+                            "invalid #version number `0`".to_string(),
+                        ));
+                    }
+                    if let Some(profile) = parts.next()
+                        && !matches!(profile, "es" | "core" | "compatibility")
                     {
+                        return Err(ShaderError::GlslParse(format!(
+                            "invalid #version profile `{profile}`"
+                        )));
+                    }
+                    if parts.next().is_some() {
+                        return Err(ShaderError::GlslParse(format!(
+                            "unexpected trailing tokens in #version directive: {trimmed}"
+                        )));
+                    }
+                    state.glsl_version = Some(ver);
+                    state.macros.insert(
+                        "__VERSION__".to_string(),
+                        MacroDef {
+                            params: None,
+                            body: ver.to_string(),
+                        },
+                    );
+                    state.int_defines.insert("__VERSION__".to_string(), ver);
+                }
+                "pragma" | "line" | "" => {}
+                "extension" => {
+                    let Some((ext_raw, behavior_raw)) = rest.split_once(':') else {
+                        return Err(ShaderError::GlslParse(format!(
+                            "malformed #extension directive (missing ':'): {trimmed}"
+                        )));
+                    };
+                    let ext_name = ext_raw.trim();
+                    let behavior_str = behavior_raw.trim();
+                    if ext_name.is_empty() {
+                        return Err(ShaderError::GlslParse(format!(
+                            "missing extension name in #extension directive: {trimmed}"
+                        )));
+                    }
+                    let behavior = match behavior_str {
+                        "enable" => ExtensionBehavior::Enable,
+                        "require" => ExtensionBehavior::Require,
+                        "warn" => ExtensionBehavior::Warn,
+                        "disable" => ExtensionBehavior::Disable,
+                        _ => {
+                            return Err(ShaderError::GlslParse(format!(
+                                "invalid #extension behavior `{behavior_str}` for `{ext_name}`"
+                            )));
+                        }
+                    };
+                    if ext_name == "all" {
+                        match behavior {
+                            ExtensionBehavior::Enable | ExtensionBehavior::Require => {
+                                return Err(ShaderError::GlslParse(
+                                    "#extension all only supports `warn` or `disable`".to_string(),
+                                ));
+                            }
+                            ExtensionBehavior::Disable => {
+                                for v in state.extensions.values_mut() {
+                                    *v = ExtensionBehavior::Disable;
+                                }
+                                state
+                                    .extensions
+                                    .insert("all".to_string(), ExtensionBehavior::Disable);
+                            }
+                            ExtensionBehavior::Warn => {
+                                state
+                                    .extensions
+                                    .insert("all".to_string(), ExtensionBehavior::Warn);
+                            }
+                        }
                         continue;
                     }
-                    return Err(ShaderError::UnsupportedExtension(ext_name.to_string()));
+                    let is_supported = matches!(
+                        ext_name,
+                        "GL_OES_standard_derivatives" | "GL_EXT_shader_texture_lod"
+                    );
+                    if !is_supported
+                        && matches!(
+                            behavior,
+                            ExtensionBehavior::Enable | ExtensionBehavior::Require
+                        )
+                    {
+                        return Err(ShaderError::UnsupportedExtension(ext_name.to_string()));
+                    }
+                    state.extensions.insert(ext_name.to_string(), behavior);
                 }
                 "define" => {
                     if let Some((name, def)) = parse_define_directive(rest) {
@@ -1172,6 +1267,56 @@ fn preprocess_lines_into(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod preprocess_tests {
+    use super::*;
+
+    #[test]
+    fn handles_version_and_extension_directives_cleanly() {
+        let src = r#"
+            #version 300 es
+            #extension GL_OES_standard_derivatives : enable
+            #extension GL_EXT_shader_texture_lod : warn
+            #extension GL_EXT_frag_depth : disable
+            precision highp float;
+            void main() {
+                #if __VERSION__ >= 300
+                    gl_FragColor = vec4(1.0, 0.5, 0.25, 1.0);
+                #else
+                    gl_FragColor = vec4(0.0);
+                #endif
+            }
+        "#;
+        let compiled = translate_glsl_es100(src).expect("#version 300 es + extensions compile");
+        assert_eq!(compiled.glsl_version, Some(300));
+        assert_eq!(
+            compiled.extensions.get("GL_OES_standard_derivatives"),
+            Some(&ExtensionBehavior::Enable)
+        );
+        assert_eq!(
+            compiled.extensions.get("GL_EXT_shader_texture_lod"),
+            Some(&ExtensionBehavior::Warn)
+        );
+        assert_eq!(
+            compiled.extensions.get("GL_EXT_frag_depth"),
+            Some(&ExtensionBehavior::Disable)
+        );
+        assert!(
+            compiled
+                .glsl450_source
+                .contains("vec4(1.0, 0.5, 0.25, 1.0)")
+        );
+
+        // `#extension all : enable` must be rejected per GLSL spec.
+        let bad_all = "#extension all : enable\nvoid main() { gl_FragColor = vec4(1.0); }";
+        assert!(translate_glsl_es100(bad_all).is_err());
+
+        // Malformed `#version` must be rejected.
+        let bad_ver = "#version bogus\nvoid main() { gl_FragColor = vec4(1.0); }";
+        assert!(translate_glsl_es100(bad_ver).is_err());
+    }
 }
 
 // ---------------------------------------------------------------------------

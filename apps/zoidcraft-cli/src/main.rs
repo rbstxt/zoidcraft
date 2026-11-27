@@ -3,7 +3,7 @@
 //! ZoidCraft headless CLI, batch renderer, `.pz` converter, effect self-test runner,
 //! and JSON-Lines session control loop (L5 headless — zero GUI dependencies).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -25,9 +25,9 @@ use zc_export::{
 };
 use zc_plugin::PluginRegistry;
 use zc_project::{
-    AssetKind, Layer, LayerKind, Project, PropertyKeyframe, PropertyTrack, PropertyValue, Uuid,
-    VideoClip, VideoTrack, create_effect_by_id, export_pz, import_pz, load_zcraft, save_zcraft,
-    standard_effect_catalog, zoidium_effect_catalog,
+    AssetKind, EffectInstance, Layer, LayerKind, Project, PropertyKeyframe, PropertyTrack,
+    PropertyValue, Uuid, VideoClip, VideoTrack, create_effect_by_id, export_pz, import_pz,
+    load_zcraft, save_zcraft, standard_effect_catalog, zoidium_effect_catalog,
 };
 use zc_render::ProjectRenderEngine;
 use zc_session::{Session, dispatch_json_lines};
@@ -172,6 +172,22 @@ enum Commands {
         #[arg(long, short = 'p')]
         project: Option<PathBuf>,
     },
+
+    /// Check, verify, or install external FFmpeg (No FFmpeg Inside policy).
+    SetupFfmpeg {
+        /// Only check whether FFmpeg is installed and print its resolved path (exit non-zero if missing).
+        #[arg(long, default_value_t = false)]
+        check: bool,
+        /// Print the detected OS install plan and exact command without executing it.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Skip interactive confirmation prompt and run the detected installer immediately.
+        #[arg(long, short = 'y', default_value_t = false)]
+        yes: bool,
+        /// Verify a specific custom `ffmpeg` executable path instead of installing.
+        #[arg(long)]
+        ffmpeg_path: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -255,7 +271,114 @@ fn run(cli: Cli) -> Result<(), String> {
         }),
         Commands::SelftestEffects { width, height } => cmd_selftest_effects(width, height),
         Commands::Control { project } => cmd_control(project.as_deref()),
+        Commands::SetupFfmpeg {
+            check,
+            dry_run,
+            yes,
+            ffmpeg_path,
+        } => cmd_setup_ffmpeg(check, dry_run, yes, ffmpeg_path.as_deref()),
     }
+}
+
+fn cmd_setup_ffmpeg(
+    check: bool,
+    dry_run: bool,
+    yes: bool,
+    ffmpeg_path: Option<&Path>,
+) -> Result<(), String> {
+    if let Some(custom) = ffmpeg_path {
+        let outcome = zc_export::verify_custom_ffmpeg_binary(custom)
+            .map_err(|err| format!("FFmpeg verification failed: {err}"))?;
+        println!("FFmpeg verified: {}", outcome.version);
+        println!("  ffmpeg:  {}", outcome.ffmpeg_path.display());
+        if let Some(probe) = outcome.ffprobe_path {
+            println!("  ffprobe: {}", probe.display());
+        } else {
+            println!("  ffprobe: (not found next to ffmpeg)");
+        }
+        return Ok(());
+    }
+
+    if let Ok(version) = zc_export::probe_ffmpeg(None) {
+        let ffmpeg = zc_render::video::resolve_ffmpeg_binary_path();
+        let ffprobe = zc_render::video::resolve_ffprobe_binary_path();
+        println!("FFmpeg is already available: {version}");
+        println!("  ffmpeg:  {}", ffmpeg.display());
+        println!("  ffprobe: {}", ffprobe.display());
+        return Ok(());
+    }
+
+    let plan = zc_export::detect_ffmpeg_install_plan();
+    if check {
+        eprintln!("FFmpeg was not found on this machine.");
+        eprintln!("Recommended installer: {}", plan.manager_name);
+        eprintln!("Command: {}", plan.display_command);
+        eprintln!("Download: {}", plan.download_url);
+        return Err(
+            "FFmpeg is not installed; run `zoidcraft-cli setup-ffmpeg` to install it.".to_owned(),
+        );
+    }
+
+    if dry_run {
+        println!("FFmpeg is not installed.");
+        println!("Detected installer: {}", plan.manager_name);
+        println!(
+            "Automatic install:  {}",
+            if plan.can_run_automatically {
+                "yes"
+            } else {
+                "no (manual)"
+            }
+        );
+        println!("Command:            {}", plan.display_command);
+        println!(
+            "Managed bin dir:    {}",
+            zc_render::video::default_managed_tools_dir().display()
+        );
+        println!("Download URL:       {}", plan.download_url);
+        println!("Note:               {}", plan.manual_hint);
+        return Ok(());
+    }
+
+    if !plan.can_run_automatically {
+        eprintln!(
+            "Automatic FFmpeg installation is unavailable ({}).",
+            plan.manager_name
+        );
+        eprintln!("Run this command manually: {}", plan.display_command);
+        eprintln!("Or download from: {}", plan.download_url);
+        return Err(plan.manual_hint);
+    }
+
+    if !yes {
+        use std::io::Write;
+        eprint!(
+            "Install FFmpeg via {} (`{}`)? [y/N] ",
+            plan.manager_name, plan.display_command
+        );
+        let _ = io::stderr().flush();
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(|err| format!("failed to read confirmation: {err}"))?;
+        let trimmed = answer.trim();
+        if !trimmed.eq_ignore_ascii_case("y") && !trimmed.eq_ignore_ascii_case("yes") {
+            return Err("FFmpeg installation cancelled by user.".to_owned());
+        }
+    }
+
+    let cancel = AtomicBool::new(false);
+    let outcome = zc_export::run_ffmpeg_install(&plan, &cancel, |line| {
+        println!("{line}");
+    })
+    .map_err(|err| format!("FFmpeg installation failed: {err}"))?;
+
+    println!("FFmpeg installed successfully: {}", outcome.version);
+    println!("  ffmpeg:  {}", outcome.ffmpeg_path.display());
+    if let Some(probe) = outcome.ffprobe_path {
+        println!("  ffprobe: {}", probe.display());
+    }
+    Ok(())
 }
 
 fn load_project_any(path: &Path) -> Result<(Project, Vec<String>), String> {
@@ -1042,16 +1165,276 @@ fn build_selftest_gradient_png(width: u32, height: u32) -> Result<Vec<u8>, Strin
         for x in 0..width {
             let u = x as f32 / width.max(1) as f32;
             let v = y as f32 / height.max(1) as f32;
-            // Vibrant red/amber/blue diagonal pattern (avoiding pure chroma-green so keying
-            // effects retain visible foreground pixels).
-            let r = (40.0 + u * 200.0).clamp(0.0, 255.0) as u8;
-            let g = (30.0 + (u * v) * 140.0).clamp(0.0, 255.0) as u8;
-            let b = (60.0 + (1.0 - v) * 180.0).clamp(0.0, 255.0) as u8;
-            rgba.extend_from_slice(&[r, g, b, 255]);
+            // Transparent outer border + 1px partial-alpha ring so shadow & key-cleaner
+            // effects always have real alpha edges to operate on.
+            if x < 2 || x + 2 >= width || y < 2 || y + 2 >= height {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+            let alpha = if x == 2 || x + 3 == width || y == 2 || y + 3 == height {
+                140u8
+            } else {
+                255u8
+            };
+            let dx = u - 0.5;
+            let dy = v - 0.5;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let (r, g, b) = if dist < 0.18 {
+                // Bright highlight disk in center for bloom/glow/lumakey/tracery.
+                (255u8, 245u8, 224u8)
+            } else if (0.12..=0.32).contains(&u) && (0.12..=0.32).contains(&v) {
+                // Small chroma-green patch for chromakey/colordiffkey/advspill.
+                (25u8, 235u8, 25u8)
+            } else if (0.12..=0.32).contains(&u) && (0.68..=0.88).contains(&v) {
+                // Small pure-blue patch for linearcolorkey.
+                (15u8, 25u8, 245u8)
+            } else {
+                // Vibrant diagonal gradient with crisp diagonal stripes on the right half
+                // so FXAA/sharpen/blurs/edge-detection produce strong measurable diffs.
+                let stripe = if u > 0.55 && ((x + y) / 4) % 2 == 0 {
+                    55.0
+                } else {
+                    0.0
+                };
+                let r = (40.0 + u * 185.0 + stripe).clamp(0.0, 255.0) as u8;
+                let g = (30.0 + (u * v) * 140.0 + stripe * 0.7).clamp(0.0, 255.0) as u8;
+                let b = (60.0 + (1.0 - v) * 170.0 + stripe * 0.5).clamp(0.0, 255.0) as u8;
+                (r, g, b)
+            };
+            rgba.extend_from_slice(&[r, g, b, alpha]);
         }
     }
     zc_render::encode_png(&rgba, width, height)
         .map_err(|e| format!("failed to encode selftest gradient PNG: {e}"))
+}
+
+fn build_selftest_aux_png(width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    for y in 0..height {
+        let v = y as f32 / height.max(1) as f32;
+        for x in 0..width {
+            let u = x as f32 / width.max(1) as f32;
+            let wx = ((u * std::f32::consts::TAU * 3.0).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+            let wy = ((v * std::f32::consts::TAU * 3.0).cos() * 0.5 + 0.5).clamp(0.0, 1.0);
+            let r = (wx * 255.0).round() as u8;
+            let g = (wy * 255.0).round() as u8;
+            let b = (((wx + wy) * 0.5) * 255.0).round() as u8;
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    zc_render::encode_png(&rgba, width, height)
+        .map_err(|e| format!("failed to encode selftest aux PNG: {e}"))
+}
+
+fn build_selftest_cube_lut_bytes() -> Vec<u8> {
+    b"TITLE \"Selftest Warm Swap\"\nLUT_3D_SIZE 2\n0.0 0.0 0.2\n0.2 0.1 1.0\n0.0 1.0 0.1\n0.3 1.0 1.0\n1.0 0.0 0.0\n1.0 0.2 0.8\n1.0 1.0 0.0\n1.0 1.0 0.9\n"
+        .to_vec()
+}
+
+/// Applies explicit non-identity test parameters for catalog effects whose factory defaults
+/// are neutral pass-throughs, ensuring every single catalog effect is genuinely exercised
+/// and verified to produce a real visual difference against the unmodified baseline frame.
+fn apply_selftest_non_identity_params(
+    effect_id: &str,
+    fx: &mut EffectInstance,
+    aux_asset_id: &str,
+    cube_asset_id: &str,
+    width: u32,
+    height: u32,
+) {
+    match effect_id {
+        "brightnesscontrast" => {
+            fx.params
+                .insert("brightness".to_owned(), PropertyTrack::number(0.15));
+            fx.params
+                .insert("contrast".to_owned(), PropertyTrack::number(1.25));
+        }
+        "colorgrading" => {
+            fx.params.insert(
+                "shadows".to_owned(),
+                PropertyTrack::color([0.35, 0.5, 0.75]),
+            );
+            fx.params.insert(
+                "highlights".to_owned(),
+                PropertyTrack::color([0.9, 0.75, 0.45]),
+            );
+        }
+        "crop" => {
+            fx.params
+                .insert("left".to_owned(), PropertyTrack::number(0.15));
+            fx.params
+                .insert("right".to_owned(), PropertyTrack::number(0.15));
+        }
+        "cubelut" => {
+            fx.params.insert(
+                "lut".to_owned(),
+                PropertyTrack::asset(Some(cube_asset_id.to_owned())),
+            );
+        }
+        "displacementmap" => {
+            fx.params.insert(
+                "texture".to_owned(),
+                PropertyTrack::asset(Some(aux_asset_id.to_owned())),
+            );
+            fx.params
+                .insert("amount".to_owned(), PropertyTrack::number(0.15));
+        }
+        "exposure" => {
+            fx.params
+                .insert("exposure".to_owned(), PropertyTrack::number(0.45));
+        }
+        "grayscale" => {
+            fx.params
+                .insert("saturation".to_owned(), PropertyTrack::number(0.25));
+        }
+        "mask" => {
+            fx.params.insert(
+                "size".to_owned(),
+                PropertyTrack::vec2([f64::from(width) * 0.25, f64::from(height) * 0.25]),
+            );
+        }
+        "shake" => {
+            fx.params
+                .insert("amplitude".to_owned(), PropertyTrack::number(0.15));
+            fx.params.insert(
+                "zoom".to_owned(),
+                PropertyTrack::number(f64::from(width.max(height)) * 0.1),
+            );
+            fx.params.insert(
+                "shake.amplitude".to_owned(),
+                PropertyTrack::vec4([120.0, 120.0, 40.0, 8.0]),
+            );
+        }
+        "overlay" => {
+            fx.params.insert(
+                "texture".to_owned(),
+                PropertyTrack::asset(Some(aux_asset_id.to_owned())),
+            );
+            fx.params
+                .insert("opacity".to_owned(), PropertyTrack::number(0.6));
+        }
+        "transform" => {
+            fx.params
+                .insert("imageScale".to_owned(), PropertyTrack::vec2([0.8, 0.8]));
+            fx.params.insert(
+                "imageRotation".to_owned(),
+                PropertyTrack::vec3([0.0, 0.0, 0.25]),
+            );
+        }
+        "timeoffset" => {
+            fx.params
+                .insert("offset".to_owned(), PropertyTrack::number(3.0));
+        }
+        "posterizetime" => {
+            fx.params
+                .insert("fps".to_owned(), PropertyTrack::number(6.0));
+        }
+        "posterizetime-legacy" => {
+            fx.params
+                .insert("frameRate".to_owned(), PropertyTrack::number(6.0));
+        }
+        "timeremap" => {
+            fx.params
+                .insert("speed".to_owned(), PropertyTrack::number(0.5));
+            fx.params
+                .insert("blend".to_owned(), PropertyTrack::option(2));
+        }
+        "timedisplacement" => {
+            fx.params.insert(
+                "sourceImage".to_owned(),
+                PropertyTrack::asset(Some(aux_asset_id.to_owned())),
+            );
+            fx.params
+                .insert("maxTime".to_owned(), PropertyTrack::number(0.5));
+        }
+        "colorcurves" => {
+            fx.params.insert(
+                "curves".to_owned(),
+                PropertyTrack::constant(PropertyValue::Curve(serde_json::json!({
+                    "rgb": [[0.0, 0.0], [0.5, 0.75], [1.0, 1.0]],
+                    "r": [[0.0, 0.0], [1.0, 1.0]],
+                    "g": [[0.0, 0.0], [1.0, 1.0]],
+                    "b": [[0.0, 0.0], [1.0, 1.0]],
+                    "a": [[0.0, 0.0], [1.0, 1.0]]
+                }))),
+            );
+        }
+        "radialshadow" => {
+            fx.params
+                .insert("softness".to_owned(), PropertyTrack::number(10.0));
+            fx.params
+                .insert("projectionDistance".to_owned(), PropertyTrack::number(20.0));
+        }
+        "keycleaner" => {
+            fx.params
+                .insert("alphaContrast".to_owned(), PropertyTrack::number(220.0));
+            fx.params
+                .insert("reduceChatter".to_owned(), PropertyTrack::option(1));
+            fx.params.insert(
+                "additionalEdgeRadius".to_owned(),
+                PropertyTrack::number(6.0),
+            );
+        }
+        "cardwipe" => {
+            fx.params
+                .insert("completion".to_owned(), PropertyTrack::number(50.0));
+        }
+        "smartmotionblur" | "smart-motion-blur-lite" => {
+            fx.params
+                .insert("amount".to_owned(), PropertyTrack::number(1.0));
+        }
+        "layerinput" => {
+            fx.params.insert(
+                "sourceImage".to_owned(),
+                PropertyTrack::asset(Some(aux_asset_id.to_owned())),
+            );
+            fx.params
+                .insert("opacity".to_owned(), PropertyTrack::number(0.5));
+        }
+        "layerinputdisplacement" => {
+            fx.params.insert(
+                "sourceImage".to_owned(),
+                PropertyTrack::asset(Some(aux_asset_id.to_owned())),
+            );
+            fx.params
+                .insert("amount".to_owned(), PropertyTrack::number(0.15));
+        }
+        "nodeeffect" => {
+            let graph = serde_json::json!({
+                "version": 1,
+                "nodes": [
+                    { "id": "uv", "type": "uv" },
+                    { "id": "samp", "type": "sample" },
+                    { "id": "vor", "type": "voronoi", "params": { "mode": 2, "scale": 5.0 } },
+                    { "id": "ramp", "type": "colorRamp", "params": {
+                        "interpolation": 1,
+                        "stops": [[0.0, 0.1, 0.0, 0.8, 1.0], [1.0, 1.0, 0.5, 0.0, 1.0]]
+                    }},
+                    { "id": "mix", "type": "mix", "params": { "mode": 0, "factor": 0.75 } },
+                    { "id": "out", "type": "output" }
+                ],
+                "links": [
+                    { "from": { "node": "uv", "port": "out" }, "to": { "node": "samp", "port": "uv" } },
+                    { "from": { "node": "vor", "port": "out" }, "to": { "node": "ramp", "port": "factor" } },
+                    { "from": { "node": "samp", "port": "color" }, "to": { "node": "mix", "port": "a" } },
+                    { "from": { "node": "ramp", "port": "color" }, "to": { "node": "mix", "port": "b" } },
+                    { "from": { "node": "mix", "port": "color" }, "to": { "node": "out", "port": "color" } },
+                    { "from": { "node": "samp", "port": "alpha" }, "to": { "node": "out", "port": "alpha" } }
+                ]
+            });
+            fx.params.insert(
+                "graph".to_owned(),
+                PropertyTrack::constant(PropertyValue::Json(graph)),
+            );
+        }
+        "magiclooks" => {
+            fx.params
+                .insert("diffusion".to_owned(), PropertyTrack::number(0.6));
+            fx.params
+                .insert("exposure".to_owned(), PropertyTrack::number(0.25));
+        }
+        _ => {}
+    }
 }
 
 fn cmd_selftest_effects(width: u32, height: u32) -> Result<(), String> {
@@ -1061,41 +1444,22 @@ fn cmd_selftest_effects(width: u32, height: u32) -> Result<(), String> {
         .selftest_all_effects(width, height)
         .map_err(|e| format!("selftest failed: {e}"))?;
 
-    let mut tested_std: HashSet<String> = HashSet::new();
-    let mut tested_plugin: HashSet<String> = HashSet::new();
-    let mut std_passed = 0usize;
-    let mut plugin_passed = 0usize;
-
+    // Part 1: Direct EffectRegistry GPU pass results (44 standard + 12 core plugin shaders).
+    let mut part1_errors: HashMap<String, String> = HashMap::new();
     for entry in &report.entries {
-        let kind = if entry.is_plugin { "plugin" } else { "std" };
-        if entry.is_plugin {
-            tested_plugin.insert(entry.effect_id.to_ascii_lowercase());
-            if entry.passed {
-                plugin_passed += 1;
-            }
-        } else {
-            tested_std.insert(entry.effect_id.to_ascii_lowercase());
-            if entry.passed {
-                std_passed += 1;
-            }
-        }
-        if entry.passed {
-            println!(
-                "PASS [{kind:6}] {:<24} non_zero_pixels={}",
-                entry.effect_id, entry.non_zero_pixels
-            );
-        } else {
-            eprintln!(
-                "FAIL [{kind:6}] {:<24} bypassed={} error={}",
-                entry.effect_id,
-                entry.bypassed,
-                entry.error.as_deref().unwrap_or("unknown"),
+        if !entry.passed {
+            part1_errors.insert(
+                entry.effect_id.to_ascii_lowercase(),
+                entry
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("bypassed={}", entry.bypassed)),
             );
         }
     }
 
-    // Verify all remaining catalog entries across standard_effect_catalog() (44) and
-    // zoidium_effect_catalog() (36) — 80 total — through the full ProjectRenderEngine pipeline.
+    // Part 2: Verify ALL 80 catalog effects (44 standard + 36 plugin) through the full
+    // ProjectRenderEngine pipeline against a baseline (no-effect) render of the exact same frame.
     let mut all_plugins = PluginRegistry::new();
     for desc in zoidium_effect_catalog() {
         if let Some(pid) = desc.plugin_id {
@@ -1103,13 +1467,17 @@ fn cmd_selftest_effects(width: u32, height: u32) -> Result<(), String> {
         }
     }
     let test_png = build_selftest_gradient_png(width, height)?;
+    let aux_png = build_selftest_aux_png(width, height)?;
+    let cube_bytes = build_selftest_cube_lut_bytes();
     let expected_bytes = (width as usize) * (height as usize) * 4;
+    let test_frame = 4.0_f64;
 
-    let mut run_catalog_effect = |effect_id: &str, is_plugin: bool, plugin_id: Option<&str>| {
+    let build_scene_project = |plugin_id: Option<&str>, effect_opt: Option<EffectInstance>| {
         let mut proj = Project::new_cm3_default();
         proj.sequence.resolution = [width, height];
         proj.sequence.fps = 30;
         proj.sequence.length_frames = 30.0;
+        proj.sequence.background_color = [0.0, 0.0, 0.0, 0.0];
         if let Some(pid) = plugin_id {
             proj.plugin_requirements.insert(pid.to_owned());
         }
@@ -1118,99 +1486,162 @@ fn cmd_selftest_effects(width: u32, height: u32) -> Result<(), String> {
             "selftest_grad.png".to_owned(),
             test_png.clone(),
         );
+        let aux_asset_id = proj.insert_binary_asset(
+            AssetKind::Image,
+            "selftest_aux.png".to_owned(),
+            aux_png.clone(),
+        );
+        let cube_asset_id = proj.insert_binary_asset(
+            AssetKind::Misc,
+            "selftest_warm.cube".to_owned(),
+            cube_bytes.clone(),
+        );
 
-        let mut base_layer = Layer::new(
-            "Base",
+        let mut fx_layer = Layer::new(
+            "Selftest Layer",
             LayerKind::Image {
-                image: Some(asset_id.clone()),
+                image: Some(asset_id),
             },
             [width, height],
         );
         // Animate position across frames 0..10 so temporal/motion effects observe real motion.
-        base_layer.position = PropertyTrack {
+        fx_layer.position = PropertyTrack {
             animated: true,
             expression: None,
             static_behavior: zc_project::StaticBehavior::Constant,
             value: PropertyValue::Vec2([0.0, 0.0]),
             keyframes: vec![
-                PropertyKeyframe::linear(0.0, PropertyValue::Vec2([-12.0, -6.0])),
-                PropertyKeyframe::linear(10.0, PropertyValue::Vec2([12.0, 6.0])),
+                PropertyKeyframe::linear(0.0, PropertyValue::Vec2([-16.0, -8.0])),
+                PropertyKeyframe::linear(10.0, PropertyValue::Vec2([16.0, 8.0])),
             ],
             channels: Vec::new(),
         };
+        // Put the effect on an Adjustment track above Track 1 so temporal/motion effects
+        // observe Track 1's live animated position across frames rather than a static source.
+        let mut tracks = vec![VideoTrack {
+            id: Uuid::new_v4(),
+            name: "Track 1".to_owned(),
+            enabled: true,
+            solo: false,
+            locked: false,
+            is_3d: false,
+            clips: vec![VideoClip {
+                id: Uuid::new_v4(),
+                name: "Selftest Clip".to_owned(),
+                start: 0.0,
+                length: 30.0,
+                link: None,
+                media: None,
+                time_curve: PropertyTrack::linear_time_curve(30.0, 30),
+                layer: fx_layer,
+                preserved: BTreeMap::new(),
+            }],
+            preserved: BTreeMap::new(),
+        }];
+        if let Some(mut fx) = effect_opt {
+            let fx_key = match &fx.kind {
+                zc_project::EffectKind::Standard(effect_id)
+                | zc_project::EffectKind::Plugin { effect_id, .. } => effect_id.clone(),
+                _ => String::new(),
+            };
+            apply_selftest_non_identity_params(
+                &fx_key,
+                &mut fx,
+                &aux_asset_id,
+                &cube_asset_id,
+                width,
+                height,
+            );
+            let mut adj_layer = Layer::new(
+                "Selftest Adjustment",
+                LayerKind::Adjustment,
+                [width, height],
+            );
+            adj_layer.effects.push(fx);
+            tracks.push(VideoTrack {
+                id: Uuid::new_v4(),
+                name: "Track 2".to_owned(),
+                enabled: true,
+                solo: false,
+                locked: false,
+                is_3d: false,
+                clips: vec![VideoClip {
+                    id: Uuid::new_v4(),
+                    name: "Selftest Effect".to_owned(),
+                    start: 0.0,
+                    length: 30.0,
+                    link: None,
+                    media: None,
+                    time_curve: PropertyTrack::linear_time_curve(30.0, 30),
+                    layer: adj_layer,
+                    preserved: BTreeMap::new(),
+                }],
+                preserved: BTreeMap::new(),
+            });
+        }
+        proj.sequence.video_tracks = tracks;
+        proj
+    };
 
-        let mut fx_layer = base_layer.clone();
-        fx_layer.id = Uuid::new_v4();
-        fx_layer.name = format!("FX {effect_id}");
+    let baseline_proj = build_scene_project(None, None);
+    let baseline_pixels = engine
+        .render_frame_rgba8(&baseline_proj, &all_plugins, test_frame, width, height)
+        .map_err(|e| format!("failed to render selftest baseline frame: {e}"))?;
+    if baseline_pixels.len() != expected_bytes {
+        return Err(format!(
+            "selftest baseline byte count mismatch: got {}, expected {expected_bytes}",
+            baseline_pixels.len()
+        ));
+    }
 
+    let mut tested_std: HashSet<String> = HashSet::new();
+    let mut tested_plugin: HashSet<String> = HashSet::new();
+    let mut std_passed = 0usize;
+    let mut plugin_passed = 0usize;
+
+    let mut run_catalog_effect = |effect_id: &str, is_plugin: bool, plugin_id: Option<&str>| {
+        let kind = if is_plugin { "plugin" } else { "std" };
+        let lower = effect_id.to_ascii_lowercase();
+        if let Some(p1_err) = part1_errors.get(&lower) {
+            eprintln!("FAIL [{kind:6}] {effect_id:<24} error=part1 GPU selftest failed: {p1_err}");
+            return false;
+        }
         let fx_res = create_effect_by_id(effect_id).ok_or_else(|| {
             format!(
                 "catalog effect `{effect_id}` could not be instantiated via create_effect_by_id"
             )
         });
-
-        let kind = if is_plugin { "plugin" } else { "std" };
         match fx_res.and_then(|fx| {
-            fx_layer.effects.push(fx);
-            proj.sequence.video_tracks = vec![
-                VideoTrack {
-                    id: Uuid::new_v4(),
-                    name: "Track 1".to_owned(),
-                    enabled: true,
-                    solo: false,
-                    locked: false,
-                    is_3d: false,
-                    clips: vec![VideoClip {
-                        id: Uuid::new_v4(),
-                        name: "Base Clip".to_owned(),
-                        start: 0.0,
-                        length: 30.0,
-                        link: None,
-                        media: None,
-                        time_curve: PropertyTrack::linear_time_curve(30.0, 30),
-                        layer: base_layer,
-                        preserved: BTreeMap::new(),
-                    }],
-                    preserved: BTreeMap::new(),
-                },
-                VideoTrack {
-                    id: Uuid::new_v4(),
-                    name: "Track 2".to_owned(),
-                    enabled: true,
-                    solo: false,
-                    locked: false,
-                    is_3d: false,
-                    clips: vec![VideoClip {
-                        id: Uuid::new_v4(),
-                        name: format!("FX Clip {effect_id}"),
-                        start: 0.0,
-                        length: 30.0,
-                        link: None,
-                        media: None,
-                        time_curve: PropertyTrack::linear_time_curve(30.0, 30),
-                        layer: fx_layer,
-                        preserved: BTreeMap::new(),
-                    }],
-                    preserved: BTreeMap::new(),
-                },
-            ];
+            let proj = build_scene_project(plugin_id, Some(fx));
             engine
-                .render_frame_rgba8(&proj, &all_plugins, 5.0, width, height)
+                .render_frame_rgba8(&proj, &all_plugins, test_frame, width, height)
                 .map_err(|e| e.to_string())
         }) {
             Ok(pixels) => {
-                let non_zero = pixels
-                    .as_chunks::<4>()
-                    .0
+                let chunks = pixels.as_chunks::<4>().0;
+                let base_chunks = baseline_pixels.as_chunks::<4>().0;
+                let non_transparent = chunks.iter().filter(|px| px[3] > 0).count();
+                let non_black = chunks
                     .iter()
-                    .filter(|px| px[0] > 0 || px[1] > 0 || px[2] > 0 || px[3] > 0)
+                    .filter(|px| px[0] > 0 || px[1] > 0 || px[2] > 0)
                     .count();
-                if pixels.len() == expected_bytes && non_zero > 0 {
-                    println!("PASS [{kind:6}] {effect_id:<24} non_zero_pixels={non_zero}");
+                let diff_pixels = chunks
+                    .iter()
+                    .zip(base_chunks.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                if pixels.len() == expected_bytes
+                    && non_transparent > 0
+                    && non_black > 0
+                    && diff_pixels > 0
+                {
+                    println!(
+                        "PASS [{kind:6}] {effect_id:<24} non_black={non_black} diff_pixels={diff_pixels}"
+                    );
                     true
                 } else {
                     eprintln!(
-                        "FAIL [{kind:6}] {effect_id:<24} error=empty output (bytes={}, non_zero_pixels={non_zero})",
+                        "FAIL [{kind:6}] {effect_id:<24} error=invalid output (bytes={}, non_transparent={non_transparent}, non_black={non_black}, diff_pixels={diff_pixels})",
                         pixels.len()
                     );
                     false
@@ -1331,6 +1762,18 @@ mod tests {
 
         let ctrl = Cli::try_parse_from(["zoidcraft-cli", "control"]).expect("control must parse");
         assert!(matches!(ctrl.command, Commands::Control { project: None }));
+
+        let setup = Cli::try_parse_from(["zoidcraft-cli", "setup-ffmpeg", "--dry-run"])
+            .expect("setup-ffmpeg must parse");
+        assert!(matches!(
+            setup.command,
+            Commands::SetupFfmpeg {
+                check: false,
+                dry_run: true,
+                yes: false,
+                ffmpeg_path: None,
+            }
+        ));
 
         let exp = Cli::try_parse_from([
             "zoidcraft-cli",

@@ -1132,6 +1132,102 @@ pub(crate) fn paste_timeline_at_playhead_with_text(
     false
 }
 
+/// Resolves the target nested composition UUID for a timeline clip ID (supporting
+/// `LayerKind::PrecompRef`, `zoidium:precomp-plus/precomp` plugin clips, and `compositionId`
+/// clip properties) while verifying the composition exists in `session.project.compositions`.
+pub(crate) fn resolve_clip_precomp_target(
+    session: &Session,
+    clip_id: &str,
+) -> Option<zc_project::Uuid> {
+    if let Some(found) = session
+        .document()
+        .video_tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .find(|c| c.id == clip_id)
+        .and_then(|clip| precomp_target_composition_id(session, clip))
+    {
+        return Some(found);
+    }
+
+    let uid = zc_project::Uuid::parse_str(clip_id).ok()?;
+    session
+        .active_sequence()
+        .video_tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .find(|c| c.id == uid)
+        .and_then(|c| match &c.layer.kind {
+            zc_project::LayerKind::PrecompRef { composition_id } => session
+                .project
+                .compositions
+                .contains_key(composition_id)
+                .then_some(*composition_id),
+            zc_project::LayerKind::Plugin {
+                plugin_type,
+                payload,
+            } if plugin_type.to_ascii_lowercase().contains("precomp") => {
+                for key in ["compositionId", "compId", "composition_id"] {
+                    if let Some(raw) = payload.get(key).and_then(Value::as_str)
+                        && let Ok(id) = zc_project::Uuid::parse_str(raw.trim())
+                        && session.project.compositions.contains_key(&id)
+                    {
+                        return Some(id);
+                    }
+                }
+                None
+            }
+            _ => None,
+        })
+}
+
+/// Switches the active timeline composition (`Some(comp_id)` to dive into a Precomp+,
+/// `None` to return to Main), resetting scroll/drag state cleanly and emitting a toast.
+pub(crate) fn enter_composition_in_timeline(
+    session: &mut Session,
+    state: &mut TimelineViewState,
+    target_comp_id: Option<zc_project::Uuid>,
+    fallback_label: Option<&str>,
+    now_secs: f64,
+    action: &mut TimelineAction,
+) -> bool {
+    let toast = match target_comp_id {
+        Some(comp_id) => {
+            let comp_name = session
+                .project
+                .compositions
+                .get(&comp_id)
+                .map(|c| c.name.clone())
+                .filter(|n| !n.trim().is_empty())
+                .or_else(|| fallback_label.map(ToOwned::to_owned))
+                .unwrap_or_else(|| "Precomp".to_owned());
+            format!("Entered composition: {comp_name}")
+        }
+        None => "Returned to Main composition".to_owned(),
+    };
+
+    if session
+        .execute(Command::SetActiveComposition {
+            comp_id: target_comp_id,
+        })
+        .is_ok()
+    {
+        state.scroll_x = 0.0;
+        state.video_scroll_y = 0.0;
+        state.audio_scroll_y = 0.0;
+        state.keyframe_scroll_y = 0.0;
+        state.drag_state = TimelineDragState::None;
+        state.last_video_track_count = None;
+        state.last_audio_track_count = None;
+        state.last_active_composition_id = Some(target_comp_id);
+        state.set_status_toast(toast, now_secs);
+        action.clips_modified = true;
+        true
+    } else {
+        false
+    }
+}
+
 pub(crate) fn show_timeline_context_menu(
     ui: &mut Ui,
     session: &mut Session,
@@ -1158,7 +1254,7 @@ pub(crate) fn show_timeline_context_menu(
     let viewport = ui.ctx().input(|i| i.viewport_rect());
     let est_w = 216.0_f32;
     let est_h = match &menu {
-        TimelineContextMenu::Clip { .. } => 236.0,
+        TimelineContextMenu::Clip { .. } => 264.0,
         TimelineContextMenu::Lane { .. } => 126.0,
         TimelineContextMenu::Ruler { .. } => 64.0,
         TimelineContextMenu::Marker { .. } => 124.0,
@@ -1344,6 +1440,33 @@ pub(crate) fn show_timeline_context_menu(
                             }
 
                             let clip_uuid = zc_project::Uuid::parse_str(clip_id).ok();
+                            let precomp_target_id = resolve_clip_precomp_target(session, clip_id);
+                            if let Some(target_comp_id) = precomp_target_id
+                                && menu_item(ui, "Open Source Composition", true, false)
+                            {
+                                let _ = enter_composition_in_timeline(
+                                    session,
+                                    state,
+                                    Some(target_comp_id),
+                                    Some(clip_name),
+                                    ui.input(|i| i.time),
+                                    action,
+                                );
+                                close_menu = true;
+                            }
+                            if session.document().active_composition_id.is_some()
+                                && menu_item(ui, "Back to Main Composition", true, false)
+                            {
+                                let _ = enter_composition_in_timeline(
+                                    session,
+                                    state,
+                                    None,
+                                    None,
+                                    ui.input(|i| i.time),
+                                    action,
+                                );
+                                close_menu = true;
+                            }
                             if menu_item(
                                 ui,
                                 "Freeze Frame at Playhead",

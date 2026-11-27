@@ -1,5 +1,5 @@
 //! Audio decoding via `symphonia` (WAV, MP3, OGG/Vorbis, FLAC, AAC, MP4),
-//! stereo linear resampling to 48 kHz, and lightweight WAV encoders.
+//! windowed-sinc stereo resampling to 48 kHz, and lightweight WAV encoders.
 
 use std::f32::consts::FRAC_1_SQRT_2;
 use std::f64::consts::PI;
@@ -231,13 +231,16 @@ pub fn decode_audio_bytes(bytes: &[u8], hint_ext: Option<&str>) -> Result<AudioB
     })
 }
 
-/// Converts and linearly resamples an [`AudioBuffer`] to stereo `48,000 Hz`.
+/// Converts and resamples an [`AudioBuffer`] to stereo `48,000 Hz` using windowed-sinc
+/// anti-aliased interpolation.
 #[must_use]
 pub fn resample_stereo_48k(buffer: &AudioBuffer) -> Vec<[f32; 2]> {
     resample_stereo(buffer, STANDARD_SAMPLE_RATE)
 }
 
-/// Converts and linearly resamples an [`AudioBuffer`] to stereo at `target_sample_rate`.
+/// Converts and resamples an [`AudioBuffer`] to stereo at `target_sample_rate` using a
+/// Hann-windowed sinc anti-aliasing filter when downsampling and a 16-tap Blackman-windowed
+/// sinc filter when upsampling.
 ///
 /// Rejects out-of-range sample rates and caps output allocations to
 /// [`MAX_RESAMPLED_STEREO_FRAMES`] (256 MiB) so malformed metadata cannot exhaust memory.
@@ -272,7 +275,6 @@ pub fn resample_stereo(buffer: &AudioBuffer, target_sample_rate: u32) -> Vec<[f3
     }
     let out_frames = (out_frames_f64.round().max(1.0) as usize).min(MAX_RESAMPLED_STEREO_FRAMES);
     let ratio = f64::from(buffer.sample_rate) / f64::from(target_sample_rate);
-    let last_frame = in_frames - 1;
     let use_antialias = ratio > 1.0 + 1e-6;
 
     let mut out = Vec::with_capacity(out_frames);
@@ -283,19 +285,153 @@ pub fn resample_stereo(buffer: &AudioBuffer, target_sample_rate: u32) -> Vec<[f3
             out.push(sinc_kernel.sample_stereo(buffer, src_pos));
         }
     } else {
+        let upsample_kernel = BlackmanSincUpsampleKernel::new();
         for out_idx in 0..out_frames {
             let src_pos = (out_idx as f64) * ratio;
-            let idx0 = (src_pos.floor() as usize).min(last_frame);
-            let idx1 = (idx0 + 1).min(last_frame);
-            let frac = (src_pos - idx0 as f64).clamp(0.0, 1.0) as f32;
-
-            let a = downmix_frame_to_stereo(buffer, idx0);
-            let b = downmix_frame_to_stereo(buffer, idx1);
-            out.push([a[0] + (b[0] - a[0]) * frac, a[1] + (b[1] - a[1]) * frac]);
+            out.push(upsample_kernel.sample_stereo(buffer, src_pos));
         }
     }
 
     out
+}
+
+/// Precomputed 16-tap (half-width 8) Blackman-windowed sinc interpolation kernel for
+/// anti-imaged audio upsampling (e.g. 44.1 kHz -> 48 kHz).
+///
+/// Uses a single window oscillator recurrence (`cos(2u) = 2 * cos^2(u) - 1`) and exact
+/// sign-alternating `sin(pi * d)` evaluation so integer source positions are preserved
+/// bit-accurately and high-frequency imaging artifacts above source Nyquist are suppressed
+/// by >55 dB.
+#[derive(Debug, Clone, Copy)]
+struct BlackmanSincUpsampleKernel {
+    radius: isize,
+    inv_radius_pi: f64,
+    w_sin_step: f64,
+    w_cos_step: f64,
+}
+
+impl BlackmanSincUpsampleKernel {
+    const RADIUS: isize = 8;
+
+    #[must_use]
+    fn new() -> Self {
+        let inv_radius_pi = PI / (Self::RADIUS as f64);
+        let (w_sin_step, w_cos_step) = (-inv_radius_pi).sin_cos();
+        Self {
+            radius: Self::RADIUS,
+            inv_radius_pi,
+            w_sin_step,
+            w_cos_step,
+        }
+    }
+
+    #[must_use]
+    fn sample_stereo(&self, buffer: &AudioBuffer, src_pos: f64) -> [f32; 2] {
+        let frames = buffer.frame_count();
+        if !src_pos.is_finite() || src_pos < 0.0 || frames == 0 {
+            return [0.0, 0.0];
+        }
+        let center = src_pos.floor() as isize;
+        if center as usize >= frames {
+            return [0.0, 0.0];
+        }
+        let frac = src_pos - center as f64;
+        if frac < 1e-12 {
+            return downmix_frame_to_stereo(buffer, (center as usize).min(frames - 1));
+        }
+        if frac > 1.0 - 1e-12 {
+            return downmix_frame_to_stereo(buffer, ((center + 1) as usize).min(frames - 1));
+        }
+
+        let max_idx = (frames - 1) as isize;
+        let start = (center - (self.radius - 1)).max(0);
+        let end = (center + self.radius).min(max_idx);
+        let start_u = start as usize;
+        let end_u = end as usize;
+
+        let d0 = src_pos - start as f64;
+        let (mut w_sin, mut w_cos) = (self.inv_radius_pi * d0).sin_cos();
+        let base_sin = (PI * frac).sin();
+        let mut x_sin = if (center - start) % 2 == 0 {
+            base_sin
+        } else {
+            -base_sin
+        };
+        let mut x = PI * d0;
+
+        let w_sin_step = self.w_sin_step;
+        let w_cos_step = self.w_cos_step;
+
+        let mut acc_l = 0.0_f64;
+        let mut acc_r = 0.0_f64;
+        let mut weight_sum = 0.0_f64;
+
+        let samples = &buffer.samples_interleaved_f32;
+        match buffer.channels {
+            1 => {
+                for &raw in &samples[start_u..=end_u] {
+                    let w_cos2 = 2.0 * w_cos * w_cos - 1.0;
+                    let window = 0.42 + 0.5 * w_cos + 0.08 * w_cos2;
+                    let w = (x_sin / x) * window;
+                    acc_l += f64::from(clean_sample(raw)) * w;
+                    weight_sum += w;
+
+                    let next_w_sin = w_sin * w_cos_step + w_cos * w_sin_step;
+                    let next_w_cos = w_cos * w_cos_step - w_sin * w_sin_step;
+                    w_sin = next_w_sin;
+                    w_cos = next_w_cos;
+                    x -= PI;
+                    x_sin = -x_sin;
+                }
+                if weight_sum.abs() <= 1e-12 {
+                    return downmix_frame_to_stereo(buffer, (center as usize).min(frames - 1));
+                }
+                let out = (acc_l / weight_sum) as f32;
+                return [out, out];
+            }
+            2 => {
+                for &[raw_l, raw_r] in samples[start_u * 2..(end_u + 1) * 2].as_chunks::<2>().0 {
+                    let w_cos2 = 2.0 * w_cos * w_cos - 1.0;
+                    let window = 0.42 + 0.5 * w_cos + 0.08 * w_cos2;
+                    let w = (x_sin / x) * window;
+                    acc_l += f64::from(clean_sample(raw_l)) * w;
+                    acc_r += f64::from(clean_sample(raw_r)) * w;
+                    weight_sum += w;
+
+                    let next_w_sin = w_sin * w_cos_step + w_cos * w_sin_step;
+                    let next_w_cos = w_cos * w_cos_step - w_sin * w_sin_step;
+                    w_sin = next_w_sin;
+                    w_cos = next_w_cos;
+                    x -= PI;
+                    x_sin = -x_sin;
+                }
+            }
+            _ => {
+                for idx in start_u..=end_u {
+                    let w_cos2 = 2.0 * w_cos * w_cos - 1.0;
+                    let window = 0.42 + 0.5 * w_cos + 0.08 * w_cos2;
+                    let w = (x_sin / x) * window;
+                    let s = downmix_frame_to_stereo(buffer, idx);
+                    acc_l += f64::from(s[0]) * w;
+                    acc_r += f64::from(s[1]) * w;
+                    weight_sum += w;
+
+                    let next_w_sin = w_sin * w_cos_step + w_cos * w_sin_step;
+                    let next_w_cos = w_cos * w_cos_step - w_sin * w_sin_step;
+                    w_sin = next_w_sin;
+                    w_cos = next_w_cos;
+                    x -= PI;
+                    x_sin = -x_sin;
+                }
+            }
+        }
+
+        if weight_sum.abs() <= 1e-12 {
+            return downmix_frame_to_stereo(buffer, (center as usize).min(frames - 1));
+        }
+        let inv = 1.0 / weight_sum;
+        [(acc_l * inv) as f32, (acc_r * inv) as f32]
+    }
 }
 
 /// Precomputed Hann-windowed sinc oscillator step constants for a fixed downsampling ratio.
@@ -782,13 +918,82 @@ mod tests {
 
         let stereo = resample_stereo_48k(&buffer);
         assert_eq!(stereo.len(), 10);
-        // Sample 0 is 0.0, sample 1 interpolates halfway to 0.5 => 0.25.
+        // Exact integer source positions are preserved bit-accurately by windowed-sinc upsampling.
         assert!((stereo[0][0] - 0.0).abs() < 1e-6);
         assert!((stereo[0][1] - 0.0).abs() < 1e-6);
-        assert!((stereo[1][0] - 0.25).abs() < 1e-6);
-        assert!((stereo[1][1] - 0.25).abs() < 1e-6);
         assert!((stereo[2][0] - 0.5).abs() < 1e-6);
         assert!((stereo[4][0] - 1.0).abs() < 1e-6);
+        assert!((stereo[6][0] - 0.5).abs() < 1e-6);
+        assert!((stereo[8][0] - 0.0).abs() < 1e-6);
+        // Fractional positions stay symmetric (L == R) and smoothly monotonic across the rise.
+        assert!((stereo[1][0] - stereo[1][1]).abs() < 1e-6);
+        assert!(stereo[1][0] > 0.0 && stereo[1][0] < 0.5);
+        assert!(stereo[3][0] > 0.5 && stereo[3][0] < 1.0);
+    }
+
+    #[test]
+    fn upsampling_44k1_to_48k_blackman_sinc_suppresses_imaging_vs_linear() {
+        let in_sr = 44_100_u32;
+        let out_sr = STANDARD_SAMPLE_RATE;
+        let in_frames = 2_205_usize; // 50 ms at 44.1 kHz
+        let freq_hz = 14_000.0_f64;
+
+        // 1. Constant DC signal upsampled 44.1 kHz -> 48 kHz remains flat within 1e-6.
+        let dc_buf = AudioBuffer {
+            sample_rate: in_sr,
+            channels: 2,
+            samples_interleaved_f32: vec![0.6_f32; in_frames * 2],
+        };
+        let dc_out = resample_stereo(&dc_buf, out_sr);
+        assert_eq!(dc_out.len(), 2_400);
+        for &[l, r] in &dc_out {
+            assert!((l - 0.6).abs() < 1e-5, "DC ripple on L: {l}");
+            assert!((r - 0.6).abs() < 1e-5, "DC ripple on R: {r}");
+        }
+
+        // 2. 14 kHz sine wave upsampled 44.1 kHz -> 48 kHz: compare against exact analytic sine
+        //    and verify Blackman-windowed sinc dramatically beats 2-point linear interpolation.
+        let sine_samples: Vec<f32> = (0..in_frames)
+            .map(|i| (TAU * freq_hz * (i as f64) / f64::from(in_sr)).sin() as f32)
+            .collect();
+        let sine_buf = AudioBuffer {
+            sample_rate: in_sr,
+            channels: 1,
+            samples_interleaved_f32: sine_samples,
+        };
+        let sinc_out = resample_stereo(&sine_buf, out_sr);
+        let ratio = f64::from(in_sr) / f64::from(out_sr);
+
+        let mut sinc_err_sq = 0.0_f64;
+        let mut linear_err_sq = 0.0_f64;
+        let margin = 32_usize;
+        let count = sinc_out.len() - 2 * margin;
+        for (idx, &[got_l, _]) in sinc_out.iter().enumerate().skip(margin).take(count) {
+            let expected = (TAU * freq_hz * (idx as f64) / f64::from(out_sr)).sin();
+            let err_sinc = f64::from(got_l) - expected;
+            sinc_err_sq += err_sinc * err_sinc;
+
+            let src_pos = (idx as f64) * ratio;
+            let i0 = (src_pos.floor() as usize).min(in_frames - 1);
+            let i1 = (i0 + 1).min(in_frames - 1);
+            let frac = src_pos - i0 as f64;
+            let a = f64::from(sine_buf.samples_interleaved_f32[i0]);
+            let b = f64::from(sine_buf.samples_interleaved_f32[i1]);
+            let lin = a + (b - a) * frac;
+            let err_lin = lin - expected;
+            linear_err_sq += err_lin * err_lin;
+        }
+
+        let sinc_rms_err = (sinc_err_sq / count as f64).sqrt();
+        let linear_rms_err = (linear_err_sq / count as f64).sqrt();
+        assert!(
+            sinc_rms_err < 0.005,
+            "Blackman-windowed sinc 14 kHz upsampling RMS error too high: {sinc_rms_err}"
+        );
+        assert!(
+            linear_rms_err > sinc_rms_err * 20.0,
+            "expected windowed sinc ({sinc_rms_err}) to beat linear ({linear_rms_err}) by >20x"
+        );
     }
 
     #[test]

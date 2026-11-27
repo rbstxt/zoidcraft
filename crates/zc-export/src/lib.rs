@@ -10,18 +10,36 @@
 
 #![deny(unsafe_code)]
 
+pub mod datamosh;
 pub mod exporter;
 pub mod ffmpeg;
+pub mod installer;
 pub mod padding;
 pub mod settings;
 pub mod temp_audio;
 
-pub use exporter::{export_video, export_video_with_progress};
-pub use ffmpeg::{BoundedStderrBuffer, build_ffmpeg_args, probe_ffmpeg};
-pub use padding::{even_padded_dimensions, pad_rgba_frame_into};
+#[cfg(not(target_arch = "wasm32"))]
+pub use datamosh::post_process_webm_datamosh_file;
+pub use datamosh::{DatamoshMode, apply_webm_datamosh};
+pub use exporter::{export_video, export_video_with_options, export_video_with_progress};
+pub use ffmpeg::{
+    AvailableHwEncoders, BoundedStderrBuffer, build_ffmpeg_args, probe_ffmpeg,
+    probe_hardware_encoders,
+};
+pub use installer::{
+    FFMPEG_DOWNLOAD_URL, FfmpegInstallOutcome, FfmpegInstallPlan, detect_ffmpeg_install_plan_for_os,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use installer::{detect_ffmpeg_install_plan, run_ffmpeg_install, verify_custom_ffmpeg_binary};
+#[cfg(not(target_arch = "wasm32"))]
+pub use padding::encode_single_frame_image;
+pub use padding::{
+    compute_aspect_fit_render_size, downsample_rgba_thumbnail, even_padded_dimensions,
+    fit_rgba_frame_into, pad_rgba_frame_into,
+};
 pub use settings::{
-    AudioCodec, ExportContainer, ExportProgress, ExportReport, ExportSettings, FrameProvider,
-    QualityMode, VideoCodec,
+    AudioCodec, EncoderSpeedPreset, ExportContainer, ExportEncodeOptions, ExportProgress,
+    ExportReport, ExportSettings, FrameProvider, HardwareAcceleration, QualityMode, VideoCodec,
 };
 pub use temp_audio::{TempFileGuard, write_temp_stereo_wav_f32};
 

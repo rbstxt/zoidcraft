@@ -3,9 +3,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::catalog::builtin_plugins;
+use crate::catalog::{
+    builtin_plugins, builtin_shader_pack_effects, find_builtin_shader_pack_effect,
+};
 use crate::descriptor::{PluginCategory, PluginDescriptor};
 use crate::persistence::PluginSettingsState;
+
+pub use crate::catalog::{
+    ShaderPackEffect, ShaderPackParam, ShaderPackParamDefault, ShaderPackParamKind,
+};
 
 /// Errors returned by [`PluginRegistry`] operations.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -283,6 +289,33 @@ impl PluginRegistry {
             .filter(|id| !self.is_enabled(id))
             .cloned()
             .collect()
+    }
+
+    /// Returns all declarative ShaderPack effects whose owning plugin is currently enabled.
+    pub fn enabled_shader_pack_effects(&self) -> Vec<&'static ShaderPackEffect> {
+        builtin_shader_pack_effects()
+            .iter()
+            .filter(|effect| self.is_enabled(effect.plugin_id))
+            .collect()
+    }
+
+    /// Returns all declarative ShaderPack effects belonging to `plugin_id` (regardless of
+    /// enabled state, useful for Plugin Manager inspection).
+    pub fn shader_pack_effects_for_plugin(
+        &self,
+        plugin_id: &str,
+    ) -> Vec<&'static ShaderPackEffect> {
+        builtin_shader_pack_effects()
+            .iter()
+            .filter(|effect| effect.plugin_id == plugin_id)
+            .collect()
+    }
+
+    /// Looks up a declarative ShaderPack effect by ID (or namespaced `zoidcraft:<pack>/<id>` /
+    /// `zoidium:<pack>/<id>` / `<pack>/<id>`) if its owning plugin is currently enabled.
+    pub fn find_shader_pack_effect(&self, id: &str) -> Option<&'static ShaderPackEffect> {
+        let effect = find_builtin_shader_pack_effect(id)?;
+        self.is_enabled(effect.plugin_id).then_some(effect)
     }
 
     /// Stores a JSON configuration blob for a registered plugin.
@@ -632,5 +665,68 @@ mod tests {
         reg.reset_to_defaults();
         assert!(!reg.is_vanilla_cm3_mode());
         assert_invariants(&reg);
+    }
+
+    #[test]
+    fn enabled_shader_pack_effects_gates_all_three_packs() {
+        let mut reg = PluginRegistry::new();
+        let no_deps = BTreeSet::new();
+
+        // All 3 shader packs are disabled by default.
+        assert!(reg.enabled_shader_pack_effects().is_empty());
+        assert!(
+            reg.find_shader_pack_effect("afterclip-warp-stretch")
+                .is_none()
+        );
+        assert!(reg.find_shader_pack_effect("ccfx-puddle").is_none());
+        assert!(reg.find_shader_pack_effect("pack4-chromabba").is_none());
+
+        // Enabling afterclip exposes only afterclip effects.
+        reg.enable("afterclip").expect("enable afterclip");
+        let afterclip_fx = reg.enabled_shader_pack_effects();
+        assert!(!afterclip_fx.is_empty());
+        assert!(afterclip_fx.iter().all(|e| e.plugin_id == "afterclip"));
+        let stretch = reg
+            .find_shader_pack_effect("afterclip-warp-stretch")
+            .expect("afterclip stretch visible when enabled");
+        assert_eq!(
+            stretch.namespaced_id(),
+            "zoidcraft:afterclip/afterclip-warp-stretch"
+        );
+        assert_eq!(
+            reg.find_shader_pack_effect("zoidcraft:afterclip/afterclip-warp-stretch"),
+            Some(stretch)
+        );
+        assert_eq!(
+            reg.find_shader_pack_effect("zoidium:afterclip/afterclip-warp-stretch"),
+            Some(stretch)
+        );
+        assert!(reg.find_shader_pack_effect("ccfx-puddle").is_none());
+        assert!(reg.find_shader_pack_effect("pack4-chromabba").is_none());
+
+        // Enabling ccfx-shader-pack adds CCFX effects.
+        reg.enable("ccfx-shader-pack").expect("enable ccfx");
+        assert!(reg.find_shader_pack_effect("ccfx-puddle").is_some());
+        assert!(reg.find_shader_pack_effect("pack4-chromabba").is_none());
+
+        // Enabling alipfx-shader-pack-4 exposes all 3 packs.
+        reg.enable("alipfx-shader-pack-4").expect("enable pack 4");
+        let all_enabled = reg.enabled_shader_pack_effects();
+        assert_eq!(all_enabled.len(), builtin_shader_pack_effects().len());
+        assert!(reg.find_shader_pack_effect("pack4-chromabba").is_some());
+
+        // Disabling one pack removes only its effects.
+        reg.disable("ccfx-shader-pack", &no_deps)
+            .expect("disable ccfx");
+        assert!(reg.find_shader_pack_effect("ccfx-puddle").is_none());
+        assert!(
+            reg.find_shader_pack_effect("afterclip-warp-stretch")
+                .is_some()
+        );
+        assert!(reg.find_shader_pack_effect("pack4-chromabba").is_some());
+
+        // Vanilla CM3 mode disables all shader packs.
+        reg.disable_all_optional();
+        assert!(reg.enabled_shader_pack_effects().is_empty());
     }
 }

@@ -567,16 +567,23 @@ pub(super) fn parse_clipboard_clip(
                 normalized.insert("object".to_owned(), layer_val);
             } else {
                 // Synthesize a CM3 layer object from `clipType` + top-level properties/effects/objects.
+                // CM3 exact layer type table:
+                // 0 = Video, 1 = Adjustment, 2 = Composite, 3 = Image, 4 = Scene3D,
+                // 5 = Generator (solid/color), 6 = Shape2D, 7 = Text2D, 8 = PresetShape2D, 9 = CameraLayer.
                 let mut layer_obj = Map::new();
                 let mapped_layer_type: Value = match clip_type_str.as_deref() {
-                    Some("scene" | "scene3d" | "scene_3d" | "3d") => json!(2),
                     Some("adjustment") => json!(1),
+                    Some("composite" | "comp" | "precomp") => json!(2),
+                    Some("image" | "picture") => json!(3),
+                    Some("scene" | "scene3d" | "scene_3d" | "3d") => json!(4),
+                    Some("color" | "solid" | "generator") => json!(5),
+                    Some("shape2d" | "shape_2d" | "vector") => json!(6),
+                    Some("text" | "text2d" | "text_2d") => json!(7),
+                    Some("presetshape" | "preset_shape" | "preset-shape") => json!(8),
+                    Some("camera" | "cameralayer" | "camera_layer") => json!(9),
                     Some("shape" | "shapeplus" | "shape_plus" | "shape-plus") => {
                         json!("zoidium:shape-plus/shape-layer")
                     }
-                    Some("text" | "text2d") => json!(4),
-                    Some("image" | "picture") => json!(3),
-                    Some("color" | "solid") => json!(5),
                     _ => json!(0),
                 };
                 layer_obj.insert("type".to_owned(), mapped_layer_type);
@@ -589,6 +596,21 @@ pub(super) fn parse_clipboard_clip(
                     layer_props
                         .entry("name".to_owned())
                         .or_insert_with(|| Value::String(sanitize_display_name(name)));
+                }
+                if matches!(
+                    clip_type_str.as_deref(),
+                    Some("text" | "text2d" | "text_2d")
+                ) && !layer_props.contains_key("childProperties")
+                {
+                    let mut cp = Map::new();
+                    for k in ["text", "font", "size", "fontSize", "color"] {
+                        if let Some(v) = normalized.get(k).or_else(|| layer_props.get(k)).cloned() {
+                            cp.insert(k.to_owned(), v);
+                        }
+                    }
+                    if !cp.is_empty() {
+                        layer_props.insert("childProperties".to_owned(), Value::Object(cp));
+                    }
                 }
                 layer_obj.insert("properties".to_owned(), Value::Object(layer_props));
                 if let Some(fxs) = normalized.get("effects").cloned() {
@@ -1374,5 +1396,56 @@ pub(super) fn regenerate_mask_ids(masks: &mut [LayerMask]) {
     for mask in masks {
         let short = &Uuid::new_v4().simple().to_string()[..8];
         mask.id = format!("mask-{short}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::LayerKind;
+
+    #[test]
+    fn clip_type_synthesis_matches_cm3_layer_table() {
+        let cases = [
+            ("scene", "Scene3D"),
+            ("scene3d", "Scene3D"),
+            ("3d", "Scene3D"),
+            ("composite", "Composite"),
+            ("text", "Text2D"),
+            ("text2d", "Text2D"),
+            ("image", "Image"),
+            ("color", "Generator"),
+            ("adjustment", "Adjustment"),
+        ];
+        for (clip_type, expected_kind) in cases {
+            let val = json!({
+                "type": "clip",
+                "clipType": clip_type,
+                "name": format!("Test {clip_type}"),
+                "start": 0,
+                "length": 60,
+                "properties": { "text": "Hello" }
+            });
+            let mut plugins = BTreeSet::new();
+            let mut warnings = Vec::new();
+            let parsed =
+                parse_clipboard_clip(&val, &mut plugins, &mut warnings).expect("clip should parse");
+            let PzClipboardClip::Video { clip, .. } = parsed else {
+                panic!("expected video clip for {clip_type}");
+            };
+            let actual_kind = match &clip.layer.kind {
+                LayerKind::Scene3D { .. } => "Scene3D",
+                LayerKind::Composite { .. } => "Composite",
+                LayerKind::Text2D { .. } => "Text2D",
+                LayerKind::Image { .. } => "Image",
+                LayerKind::Generator => "Generator",
+                LayerKind::Adjustment => "Adjustment",
+                other => panic!("unexpected layer kind {other:?} for {clip_type}"),
+            };
+            assert_eq!(
+                actual_kind, expected_kind,
+                "clipType {clip_type:?} mapped to wrong layer kind"
+            );
+        }
     }
 }

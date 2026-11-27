@@ -674,3 +674,516 @@ fn symmetric_bowtie_mask_renders_both_lobes_and_lt3_masks_pass_through() {
     assert_eq!(combined[100 * 200 + 60], 255);
     assert_eq!(combined[100 * 200 + 140], 255);
 }
+
+/// Builds a minimal valid in-memory TrueType font mapping a single BMP `codepoint`
+/// to glyph 1 (`arch_curve = true` builds a curved arch with a quadratic Bezier control point;
+/// `arch_curve = false` builds a distinct solid diamond contour).
+fn make_minimal_test_ttf(codepoint: u16, advance_width: u16, arch_curve: bool) -> Vec<u8> {
+    let mut head = vec![0_u8; 54];
+    head[0..4].copy_from_slice(&0x0001_0000_u32.to_be_bytes());
+    head[4..8].copy_from_slice(&0x0001_0000_u32.to_be_bytes());
+    head[12..16].copy_from_slice(&0x5F0F_3CF5_u32.to_be_bytes());
+    head[18..20].copy_from_slice(&1000_u16.to_be_bytes()); // unitsPerEm
+    head[36..38].copy_from_slice(&50_i16.to_be_bytes());
+    head[38..40].copy_from_slice(&0_i16.to_be_bytes());
+    head[40..42].copy_from_slice(&750_i16.to_be_bytes());
+    head[42..44].copy_from_slice(&800_i16.to_be_bytes());
+    head[46..48].copy_from_slice(&8_u16.to_be_bytes());
+    head[48..50].copy_from_slice(&2_i16.to_be_bytes());
+    head[50..52].copy_from_slice(&1_i16.to_be_bytes()); // 32-bit loca
+
+    let mut hhea = vec![0_u8; 36];
+    hhea[0..4].copy_from_slice(&0x0001_0000_u32.to_be_bytes());
+    hhea[4..6].copy_from_slice(&800_i16.to_be_bytes());
+    hhea[6..8].copy_from_slice(&(-200_i16).to_be_bytes());
+    hhea[10..12].copy_from_slice(&advance_width.to_be_bytes());
+    hhea[34..36].copy_from_slice(&2_u16.to_be_bytes());
+
+    let mut maxp = vec![0_u8; 32];
+    maxp[0..4].copy_from_slice(&0x0001_0000_u32.to_be_bytes());
+    maxp[4..6].copy_from_slice(&2_u16.to_be_bytes());
+
+    let mut hmtx = Vec::new();
+    hmtx.extend_from_slice(&500_u16.to_be_bytes());
+    hmtx.extend_from_slice(&0_i16.to_be_bytes());
+    hmtx.extend_from_slice(&advance_width.to_be_bytes());
+    hmtx.extend_from_slice(&50_i16.to_be_bytes());
+
+    let id_delta = (1_i32 - i32::from(codepoint)) as i16;
+    let mut cmap = Vec::new();
+    cmap.extend_from_slice(&0_u16.to_be_bytes());
+    cmap.extend_from_slice(&1_u16.to_be_bytes());
+    cmap.extend_from_slice(&3_u16.to_be_bytes());
+    cmap.extend_from_slice(&1_u16.to_be_bytes());
+    cmap.extend_from_slice(&12_u32.to_be_bytes());
+    cmap.extend_from_slice(&4_u16.to_be_bytes());
+    cmap.extend_from_slice(&32_u16.to_be_bytes());
+    cmap.extend_from_slice(&0_u16.to_be_bytes());
+    cmap.extend_from_slice(&4_u16.to_be_bytes());
+    cmap.extend_from_slice(&4_u16.to_be_bytes());
+    cmap.extend_from_slice(&1_u16.to_be_bytes());
+    cmap.extend_from_slice(&0_u16.to_be_bytes());
+    cmap.extend_from_slice(&codepoint.to_be_bytes());
+    cmap.extend_from_slice(&0xFFFF_u16.to_be_bytes());
+    cmap.extend_from_slice(&0_u16.to_be_bytes());
+    cmap.extend_from_slice(&codepoint.to_be_bytes());
+    cmap.extend_from_slice(&0xFFFF_u16.to_be_bytes());
+    cmap.extend_from_slice(&id_delta.to_be_bytes());
+    cmap.extend_from_slice(&1_i16.to_be_bytes());
+    cmap.extend_from_slice(&0_u16.to_be_bytes());
+    cmap.extend_from_slice(&0_u16.to_be_bytes());
+
+    let mut glyf = Vec::new();
+    glyf.extend_from_slice(&1_i16.to_be_bytes());
+    if arch_curve {
+        glyf.extend_from_slice(&50_i16.to_be_bytes());
+        glyf.extend_from_slice(&0_i16.to_be_bytes());
+        glyf.extend_from_slice(&550_i16.to_be_bytes());
+        glyf.extend_from_slice(&800_i16.to_be_bytes());
+        glyf.extend_from_slice(&4_u16.to_be_bytes());
+        glyf.extend_from_slice(&0_u16.to_be_bytes());
+        glyf.extend_from_slice(&[0x01, 0x01, 0x01, 0x00, 0x01]);
+        for dx in [50_i16, 500, 0, -250, -250] {
+            glyf.extend_from_slice(&dx.to_be_bytes());
+        }
+        for dy in [0_i16, 0, 500, 300, -300] {
+            glyf.extend_from_slice(&dy.to_be_bytes());
+        }
+    } else {
+        glyf.extend_from_slice(&50_i16.to_be_bytes());
+        glyf.extend_from_slice(&0_i16.to_be_bytes());
+        glyf.extend_from_slice(&750_i16.to_be_bytes());
+        glyf.extend_from_slice(&700_i16.to_be_bytes());
+        glyf.extend_from_slice(&3_u16.to_be_bytes());
+        glyf.extend_from_slice(&0_u16.to_be_bytes());
+        glyf.extend_from_slice(&[0x01, 0x01, 0x01, 0x01]);
+        for dx in [400_i16, 350, -350, -350] {
+            glyf.extend_from_slice(&dx.to_be_bytes());
+        }
+        for dy in [0_i16, 350, 350, -350] {
+            glyf.extend_from_slice(&dy.to_be_bytes());
+        }
+    }
+    while !glyf.len().is_multiple_of(4) {
+        glyf.push(0);
+    }
+
+    let mut loca = Vec::new();
+    loca.extend_from_slice(&0_u32.to_be_bytes());
+    loca.extend_from_slice(&0_u32.to_be_bytes());
+    loca.extend_from_slice(&(glyf.len() as u32).to_be_bytes());
+
+    let tables: [([u8; 4], Vec<u8>); 7] = [
+        (*b"cmap", cmap),
+        (*b"glyf", glyf),
+        (*b"head", head),
+        (*b"hhea", hhea),
+        (*b"hmtx", hmtx),
+        (*b"loca", loca),
+        (*b"maxp", maxp),
+    ];
+
+    let num_tables = tables.len() as u16;
+    let mut font = Vec::new();
+    font.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
+    font.extend_from_slice(&num_tables.to_be_bytes());
+    font.extend_from_slice(&64_u16.to_be_bytes());
+    font.extend_from_slice(&2_u16.to_be_bytes());
+    font.extend_from_slice(&48_u16.to_be_bytes());
+
+    let mut offset = 12 + tables.len() * 16;
+    for (tag, data) in &tables {
+        font.extend_from_slice(tag);
+        font.extend_from_slice(&0_u32.to_be_bytes());
+        font.extend_from_slice(&(offset as u32).to_be_bytes());
+        font.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        offset += (data.len() + 3) & !3;
+    }
+    for (_, data) in tables {
+        font.extend_from_slice(&data);
+        while !font.len().is_multiple_of(4) {
+            font.push(0);
+        }
+    }
+    font
+}
+
+#[test]
+fn convert_shape_plus_item_to_path_primitives_preserve_render_and_schema() {
+    let cases = [
+        (
+            "rect_sharp",
+            json!({ "id": "p1", "kind": "rectangle", "properties": { "name": "Box", "size": [120.0, 80.0], "position": [10.0, -5.0], "roundness": 0.0 } }),
+            4usize,
+            false,
+        ),
+        (
+            "rect_round",
+            json!({ "id": "p1", "kind": "rectangle", "properties": { "name": "RBox", "size": [120.0, 80.0], "position": [0.0, 0.0], "roundness": 20.0 } }),
+            8usize,
+            true,
+        ),
+        (
+            "ellipse",
+            json!({ "id": "p1", "kind": "ellipse", "properties": { "name": "Oval", "size": [140.0, 90.0], "position": [-5.0, 8.0] } }),
+            4usize,
+            true,
+        ),
+        (
+            "polystar",
+            json!({ "id": "p1", "kind": "polystar", "properties": { "name": "Star", "mode": "star", "points": 5.0, "outerRadius": 70.0, "innerRadius": 30.0, "outerRoundness": 25.0, "innerRoundness": 15.0 } }),
+            20usize,
+            true,
+        ),
+    ];
+
+    for (label, prim, expected_verts, expect_handles) in cases {
+        let mut doc = make_doc(json!([{
+            "id": "g1", "kind": "group", "properties": {},
+            "contents": [
+                prim,
+                { "id": "f1", "kind": "fill", "properties": { "color": [1.0, 0.6, 0.2] } }
+            ]
+        }]));
+        let before = rasterize_shape_plus_with_fonts(&doc, 200, 200, 0.0, None, None, None);
+        let ids = convert_shape_plus_item_to_path(&mut doc, "p1", 0.0, None, None)
+            .unwrap_or_else(|e| panic!("{label}: convert failed: {e}"));
+        assert_eq!(ids, vec!["p1".to_owned()], "{label}: expected in-place id");
+        validate_shape_plus_payload(&doc)
+            .unwrap_or_else(|e| panic!("{label}: converted payload invalid: {e}"));
+
+        let converted = &doc["contents"][0]["contents"][0];
+        assert_eq!(converted["kind"], "path", "{label}: kind must be path");
+        assert_eq!(
+            converted["properties"]["closed"],
+            json!(true),
+            "{label}: converted path must be closed"
+        );
+        let vids = converted["vertexIds"].as_array().expect("vertexIds array");
+        assert_eq!(vids.len(), expected_verts, "{label}: vertex count mismatch");
+        let vmodes = converted["vertexModes"]
+            .as_object()
+            .expect("vertexModes object");
+        assert_eq!(vmodes.len(), expected_verts);
+        let flat = converted["properties"]["path"]
+            .as_array()
+            .expect("path array");
+        assert_eq!(flat.len(), expected_verts * 6);
+        let any_handle = flat.as_chunks::<6>().0.iter().any(|v| {
+            v[2..6]
+                .iter()
+                .any(|c| c.as_f64().unwrap_or(0.0).abs() > 1e-4)
+        });
+        assert_eq!(
+            any_handle, expect_handles,
+            "{label}: handle presence mismatch"
+        );
+
+        if label == "ellipse" {
+            for vid in vids {
+                assert_eq!(
+                    vmodes.get(vid.as_str().unwrap()),
+                    Some(&json!("smooth")),
+                    "ellipse vertices must be smooth"
+                );
+            }
+        }
+
+        let after = rasterize_shape_plus_with_fonts(&doc, 200, 200, 0.0, None, None, None);
+        assert_eq!(
+            before, after,
+            "{label}: converted path must rasterize identically to procedural primitive"
+        );
+    }
+
+    // Non-convertible items and missing IDs must return descriptive errors.
+    let mut err_doc = default_shape_plus_payload();
+    assert!(convert_shape_plus_item_to_path(&mut err_doc, "s3", 0.0, None, None).is_err());
+    assert!(convert_shape_plus_item_to_path(&mut err_doc, "missing", 0.0, None, None).is_err());
+}
+
+#[test]
+fn convert_shape_plus_item_to_path_text_with_real_and_fallback_fonts() {
+    let latin_ttf = make_minimal_test_ttf('A' as u16, 600, true);
+    let cjk_ttf = make_minimal_test_ttf('あ' as u16, 800, false);
+
+    // 1. Convert text using real primary + fallback fonts.
+    let mut doc = make_doc(json!([{
+        "id": "g1", "kind": "group", "properties": {},
+        "contents": [
+            {
+                "id": "t1", "kind": "text",
+                "properties": {
+                    "sourceText": "Aあ",
+                    "fontSize": 80.0,
+                    "alignment": "center",
+                    "position": [0.0, -30.0]
+                }
+            },
+            { "id": "f1", "kind": "fill", "properties": { "color": [1.0, 1.0, 1.0] } }
+        ]
+    }]));
+    let before = rasterize_shape_plus_with_fonts(
+        &doc,
+        256,
+        256,
+        0.0,
+        None,
+        Some(&latin_ttf),
+        Some(&cjk_ttf),
+    );
+    let before_count = count_opaque_pixels(&before);
+    assert!(before_count > 1000, "live font text must rasterize richly");
+
+    let ids =
+        convert_shape_plus_item_to_path(&mut doc, "t1", 0.0, Some(&latin_ttf), Some(&cjk_ttf))
+            .expect("text conversion with real fonts must succeed");
+    assert_eq!(
+        ids.len(),
+        2,
+        "expected 1 contour for 'A' + 1 contour for 'あ'"
+    );
+    validate_shape_plus_payload(&doc).expect("converted text payload must validate");
+    assert!(
+        doc["nextId"].as_u64().unwrap_or(0) >= 102,
+        "nextId must advance cleanly"
+    );
+
+    let grp = &doc["contents"][0]["contents"][0];
+    assert_eq!(grp["kind"], "group");
+    let paths = grp["contents"].as_array().expect("group contents");
+    assert_eq!(paths.len(), 2);
+    for (i, p) in paths.iter().enumerate() {
+        assert_eq!(p["kind"], "path");
+        assert_eq!(p["id"], json!(ids[i]));
+        assert_eq!(p["properties"]["closed"], json!(true));
+        assert!(!p["vertexIds"].as_array().unwrap().is_empty());
+    }
+    // First glyph ('A') has a quadratic curve elevated into non-zero cubic handles.
+    let a_flat = paths[0]["properties"]["path"].as_array().unwrap();
+    assert!(
+        a_flat
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .any(|v| v[2..6]
+                .iter()
+                .any(|c| c.as_f64().unwrap_or(0.0).abs() > 1e-3)),
+        "converted TrueType glyph should preserve cubic Bezier handles"
+    );
+
+    // Converted group renders without needing font bytes anymore and closely matches live render!
+    let after = rasterize_shape_plus_with_fonts(&doc, 256, 256, 0.0, None, None, None);
+    let after_count = count_opaque_pixels(&after);
+    assert!(
+        after_count.abs_diff(before_count) < 120,
+        "converted text raster count ({after_count}) should match live font render ({before_count})"
+    );
+
+    // 2. Convert text without external font bytes (built-in fallback outlines).
+    let mut fb_doc = make_doc(json!([{
+        "id": "g1", "kind": "group", "properties": {},
+        "contents": [
+            {
+                "id": "t1", "kind": "text",
+                "properties": { "sourceText": "HI", "fontSize": 70.0, "alignment": "center" }
+            },
+            { "id": "f1", "kind": "fill", "properties": { "color": [1.0, 1.0, 1.0] } }
+        ]
+    }]));
+    let fb_ids = convert_shape_plus_item_to_path(&mut fb_doc, "t1", 0.0, None, None)
+        .expect("fallback text convert must succeed");
+    assert!(!fb_ids.is_empty());
+    validate_shape_plus_payload(&fb_doc).expect("converted fallback text must validate");
+    let fb_px = rasterize_shape_plus_with_fonts(&fb_doc, 256, 256, 0.0, None, None, None);
+    assert!(count_opaque_pixels(&fb_px) > 500);
+}
+
+#[test]
+fn rasterize_shape_plus_with_fonts_parity_and_layout() {
+    let latin_ttf = make_minimal_test_ttf('A' as u16, 600, true);
+    let cjk_ttf = make_minimal_test_ttf('あ' as u16, 800, false);
+
+    let single_doc = make_doc(json!([{
+        "id": "g1", "kind": "group", "properties": {},
+        "contents": [
+            {
+                "id": "t1", "kind": "text",
+                "properties": {
+                    "sourceText": "A",
+                    "fontSize": 100.0,
+                    "alignment": "center",
+                    "position": [0.0, -35.0]
+                }
+            },
+            { "id": "f1", "kind": "fill", "properties": { "color": [1.0, 1.0, 1.0] } }
+        ]
+    }]));
+
+    // Existing rasterize_shape_plus matches rasterize_shape_plus_with_fonts(..., None, None) exactly.
+    let legacy = rasterize_shape_plus(&single_doc, 200, 200, [200, 200], 0.0, 30.0, None);
+    let no_font = rasterize_shape_plus_with_fonts(&single_doc, 200, 200, 0.0, None, None, None);
+    assert_eq!(legacy, no_font);
+
+    // Passing a real TTF replaces stroke fallback with real glyph outlines.
+    let with_font =
+        rasterize_shape_plus_with_fonts(&single_doc, 200, 200, 0.0, None, Some(&latin_ttf), None);
+    assert!(count_opaque_pixels(&with_font) > 1500);
+    assert_ne!(
+        with_font, no_font,
+        "real font outline should differ from built-in stroke fallback"
+    );
+
+    // Mixed Latin + CJK text resolves primary and fallback fonts together.
+    let mixed_doc = make_doc(json!([{
+        "id": "g1", "kind": "group", "properties": {},
+        "contents": [
+            {
+                "id": "t1", "kind": "text",
+                "properties": {
+                    "sourceText": "Aあ",
+                    "fontSize": 80.0,
+                    "horizontalScale": 110.0,
+                    "verticalScale": 90.0,
+                    "tracking": 40.0,
+                    "baselineShift": 10.0,
+                    "alignment": "center",
+                    "textMode": "box",
+                    "boxSize": [180.0, 160.0],
+                    "position": [0.0, -20.0]
+                }
+            },
+            { "id": "f1", "kind": "fill", "properties": { "color": [0.2, 0.8, 1.0] } }
+        ]
+    }]));
+    let mixed_px = rasterize_shape_plus_with_fonts(
+        &mixed_doc,
+        256,
+        256,
+        0.0,
+        None,
+        Some(&latin_ttf),
+        Some(&cjk_ttf),
+    );
+    let mixed_primary_only =
+        rasterize_shape_plus_with_fonts(&mixed_doc, 256, 256, 0.0, None, Some(&latin_ttf), None);
+    assert!(count_opaque_pixels(&mixed_px) > 1500);
+    assert_ne!(
+        mixed_px, mixed_primary_only,
+        "fallback CJK font must render distinct real glyph vs tofu fallback"
+    );
+}
+
+#[test]
+fn cm3_dynamic_property_tracks_easings_static_and_multichannel() {
+    // 1. Explicit animated: false with top-level value ignores stale keyframes.
+    let static_prop = json!({
+        "value": 42.0,
+        "animated": false,
+        "keyframes": [
+            { "frame": 0, "value": 10.0, "easing": "linear" },
+            { "frame": 10, "value": 90.0, "easing": "linear" }
+        ]
+    });
+    assert!(!shape_plus_prop_is_animated(&static_prop));
+    assert!((eval_prop_f64(Some(&static_prop), 5.0, 0.0, None) - 42.0).abs() < 1e-6);
+
+    // 2. Single-keyframe animated: false track without top-level value still evaluates its keyframe.
+    let single_kf = json!({
+        "animated": false,
+        "keyframes": [{ "frame": 0, "value": 77.5, "tween": 1 }]
+    });
+    assert!(!shape_plus_prop_is_animated(&single_kf));
+    assert!((eval_prop_f64(Some(&single_kf), 12.0, 0.0, None) - 77.5).abs() < 1e-6);
+
+    // 3. Named easing ("easeInQuad", "hold") on CM3 keyframes.
+    let quad_in = json!({
+        "value": 0.0,
+        "animated": true,
+        "keyframes": [
+            { "frame": 0, "value": 0.0, "easing": "easeInQuad" },
+            { "frame": 10, "value": 100.0, "easing": "linear" }
+        ]
+    });
+    assert!(shape_plus_prop_is_animated(&quad_in));
+    assert!((eval_prop_f64(Some(&quad_in), 5.0, 0.0, None) - 25.0).abs() < 1e-6);
+
+    let hold_named = json!({
+        "animated": true,
+        "keyframes": [
+            { "frame": 0, "value": 15.0, "easing": "hold" },
+            { "frame": 10, "value": 95.0, "easing": "linear" }
+        ]
+    });
+    assert!((eval_prop_f64(Some(&hold_named), 5.0, 0.0, None) - 15.0).abs() < 1e-6);
+
+    // 4. Multi-channel { objects: [...] } vec2 combining keyframed X and expression Y.
+    let vec2_track = json!({
+        "objects": [
+            {
+                "animated": true,
+                "keyframes": [
+                    { "frame": 0, "value": 0.0, "easing": "linear" },
+                    { "frame": 20, "value": 100.0, "easing": "linear" }
+                ]
+            },
+            { "expression": "frame * 2" }
+        ]
+    });
+    assert!(shape_plus_prop_is_animated(&vec2_track));
+    let expr_cb = |src: &str, f: f64| (src == "frame * 2").then_some(f * 2.0);
+    let xy = eval_prop_vec2(Some(&vec2_track), 10.0, [0.0, 0.0], Some(&expr_cb));
+    assert!((xy[0] - 50.0).abs() < 1e-6);
+    assert!((xy[1] - 20.0).abs() < 1e-6);
+
+    // 5. RGB color track: keyframed CSS hex strings and { objects: [r, g, b] }.
+    let css_color_kf = json!({
+        "animated": true,
+        "keyframes": [
+            { "frame": 0, "value": "#ff0000", "easing": "linear" },
+            { "frame": 10, "value": "#0000ff", "easing": "linear" }
+        ]
+    });
+    let mid_rgb = eval_prop_color_rgb(Some(&css_color_kf), 5.0, [0.0, 0.0, 0.0], None);
+    assert!((mid_rgb[0] - 0.5).abs() < 1e-6);
+    assert!(mid_rgb[1].abs() < 1e-6);
+    assert!((mid_rgb[2] - 0.5).abs() < 1e-6);
+
+    let obj_rgb = json!({
+        "objects": [
+            { "value": 255.0 },
+            { "animated": true, "keyframes": [{ "frame": 0, "value": 0.0 }, { "frame": 10, "value": 255.0 }] },
+            { "value": 0.0 }
+        ]
+    });
+    let rgb2 = eval_prop_color_rgb(Some(&obj_rgb), 5.0, [0.0, 0.0, 0.0], None);
+    assert!((rgb2[0] - 1.0).abs() < 1e-6);
+    assert!((rgb2[1] - 0.5).abs() < 1e-6);
+    assert!(rgb2[2].abs() < 1e-6);
+
+    // 6. Animated gradient stops using named easing.
+    let grad_stops = json!({
+        "keyframes": [
+            {
+                "frame": 0,
+                "easing": "easeInQuad",
+                "value": [
+                    { "position": 0.0, "color": [1.0, 0.0, 0.0, 1.0] },
+                    { "position": 1.0, "color": [0.0, 0.0, 0.0, 1.0] }
+                ]
+            },
+            {
+                "frame": 10,
+                "value": [
+                    { "position": 0.0, "color": [0.0, 0.0, 1.0, 1.0] },
+                    { "position": 1.0, "color": [1.0, 1.0, 1.0, 1.0] }
+                ]
+            }
+        ]
+    });
+    let stops_mid = eval_prop_gradient_stops(Some(&grad_stops), 5.0);
+    assert_eq!(stops_mid.len(), 2);
+    // easeInQuad(0.5) = 0.25 -> r = 0.75, b = 0.25
+    assert!((stops_mid[0].1[0] - 0.75).abs() < 1e-6);
+    assert!((stops_mid[0].1[2] - 0.25).abs() < 1e-6);
+}

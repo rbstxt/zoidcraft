@@ -47,11 +47,123 @@ impl AudioOutputFailureLatch {
     }
 }
 
-pub(crate) type AudioMixHashCacheKey = (u64, usize, u64, u64, bool);
+pub(crate) type AudioMixHashCacheKey = (u64, usize, u64, u64, bool, Option<Uuid>);
 
 pub(crate) struct AudioMixRawAsset {
-    pub(crate) bytes: Vec<u8>,
+    pub(crate) bytes: Option<Vec<u8>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) disk_path: Option<PathBuf>,
     pub(crate) ext: Option<String>,
+}
+
+/// Resolves a local filesystem path from `AssetRecord::url` (supporting both plain OS paths
+/// and `file://` URIs while rejecting remote `http://`/`https://`/`blob:` URLs).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn local_disk_path_from_asset_url(url: Option<&str>) -> Option<PathBuf> {
+    let raw = url?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(stripped) = raw.strip_prefix("file://") {
+        let path_str = stripped.strip_prefix("localhost").unwrap_or(stripped);
+        return (!path_str.is_empty()).then(|| PathBuf::from(path_str));
+    }
+    if raw.contains("://") {
+        return None;
+    }
+    Some(PathBuf::from(raw))
+}
+
+/// Returns `true` when `rec` has readable audio/media bytes either embedded in memory
+/// (`bytes: Some`) or externalized on local disk (`url` pointing to an existing file).
+pub(crate) fn asset_has_readable_audio_source(rec: &AssetRecord) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rec.bytes.is_some()
+            || local_disk_path_from_asset_url(rec.url.as_deref()).is_some_and(|p| p.is_file())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        rec.bytes.is_some()
+    }
+}
+
+/// Loads raw asset bytes from memory (`rec.bytes`) or, when externalized (`bytes: None`),
+/// from the local filesystem path stored in `rec.url` on native targets.
+pub(crate) fn load_asset_audio_bytes(rec: &AssetRecord) -> Option<Vec<u8>> {
+    if let Some(bytes) = rec.bytes.as_deref() {
+        return Some(bytes.to_vec());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(path) = local_disk_path_from_asset_url(rec.url.as_deref()) {
+        match fs::read(&path) {
+            Ok(data) if !data.is_empty() => return Some(data),
+            Ok(_) => {}
+            Err(err) => {
+                tracing::debug!(
+                    "failed to read externalized audio asset `{}` from `{}`: {err}",
+                    rec.id,
+                    path.display()
+                );
+            }
+        }
+    }
+    None
+}
+
+/// Collects flattened audible clips from `session.active_sequence()` (including active nested
+/// Precomp+ compositions rather than always indexing root `project.sequence`), without cloning
+/// `project.assets`.
+pub(crate) fn collect_active_sequence_audio_clips(
+    session: &Session,
+    range_start: f64,
+    range_end: f64,
+) -> Vec<FlattenedAudioClip> {
+    let precomp_enabled = session.plugins.is_enabled("precomp-plus");
+    let Some(active_comp_id) = session.document().active_composition_id else {
+        return collect_flattened_audio_clips_with_precomp(
+            &session.project,
+            range_start,
+            range_end,
+            precomp_enabled,
+        );
+    };
+    if !session.project.compositions.contains_key(&active_comp_id) {
+        return collect_flattened_audio_clips_with_precomp(
+            &session.project,
+            range_start,
+            range_end,
+            precomp_enabled,
+        );
+    }
+    let mut active_seq = session.active_sequence().clone();
+    for root_ctl in &session.project.sequence.controls {
+        let already_defined = active_seq
+            .controls
+            .iter()
+            .any(|c| c.id == root_ctl.id || c.name == root_ctl.name);
+        if !already_defined {
+            active_seq.controls.push(root_ctl.clone());
+        }
+    }
+    let temp_project = Project {
+        version: session.project.version,
+        name: session.project.name.clone(),
+        assets: BTreeMap::new(),
+        media: Vec::new(),
+        sequence: active_seq,
+        compositions: session.project.compositions.clone(),
+        composition_ids: session.project.composition_ids.clone(),
+        plugin_requirements: BTreeSet::new(),
+        imported_from_pz_version: session.project.imported_from_pz_version,
+        preserved: BTreeMap::new(),
+    };
+    collect_flattened_audio_clips_with_precomp(
+        &temp_project,
+        range_start,
+        range_end,
+        precomp_enabled,
+    )
 }
 
 pub(crate) struct AudioMixJobResult {
@@ -172,12 +284,7 @@ pub(crate) fn collect_audio_mix_inputs(
     range_start: f64,
     range_end: f64,
 ) -> AudioMixInputs {
-    let flattened = collect_flattened_audio_clips_with_precomp(
-        &session.project,
-        range_start,
-        range_end,
-        session.plugins.is_enabled("precomp-plus"),
-    );
+    let flattened = collect_active_sequence_audio_clips(session, range_start, range_end);
     let mut buffers: HashMap<String, Arc<AudioBuffer>> = HashMap::new();
     let mut raw_assets: HashMap<String, AudioMixRawAsset> = HashMap::new();
     let mut active_clips = Vec::with_capacity(flattened.len());
@@ -189,20 +296,40 @@ pub(crate) fn collect_audio_mix_inputs(
                     continue;
                 }
                 buffers.insert(clip.asset_id.clone(), Arc::clone(cached));
-            } else if let Some(rec) = session.project.assets.get(&clip.asset_id)
-                && let Some(bytes) = rec.bytes.as_deref()
-            {
+            } else if let Some(rec) = session.project.assets.get(&clip.asset_id) {
                 let ext = Path::new(&rec.filename)
                     .extension()
                     .and_then(|e| e.to_str())
                     .map(str::to_owned);
-                raw_assets.insert(
-                    clip.asset_id.clone(),
-                    AudioMixRawAsset {
-                        bytes: bytes.to_vec(),
-                        ext,
-                    },
-                );
+                if let Some(bytes) = rec.bytes.as_deref() {
+                    raw_assets.insert(
+                        clip.asset_id.clone(),
+                        AudioMixRawAsset {
+                            bytes: Some(bytes.to_vec()),
+                            #[cfg(not(target_arch = "wasm32"))]
+                            disk_path: None,
+                            ext,
+                        },
+                    );
+                } else {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(path) =
+                        local_disk_path_from_asset_url(rec.url.as_deref()).filter(|p| p.is_file())
+                    {
+                        raw_assets.insert(
+                            clip.asset_id.clone(),
+                            AudioMixRawAsset {
+                                bytes: None,
+                                disk_path: Some(path),
+                                ext,
+                            },
+                        );
+                    } else {
+                        continue;
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    continue;
+                }
             } else {
                 continue;
             }
@@ -225,7 +352,37 @@ pub(crate) fn execute_audio_mix_work(
     }
     let mut silent_assets: HashSet<String> = HashSet::new();
     for (asset_id, raw) in raw_assets {
-        match decode_audio_bytes(&raw.bytes, raw.ext.as_deref()) {
+        let data = match raw.bytes {
+            Some(bytes) => bytes,
+            None => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let Some(path) = raw.disk_path else {
+                        silent_assets.insert(asset_id);
+                        continue;
+                    };
+                    match fs::read(&path) {
+                        Ok(bytes) if !bytes.is_empty() => bytes,
+                        Ok(_) => {
+                            silent_assets.insert(asset_id);
+                            continue;
+                        }
+                        Err(err) => {
+                            return Err(format!(
+                                "failed to read externalized audio asset `{asset_id}` from `{}`: {err}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    silent_assets.insert(asset_id);
+                    continue;
+                }
+            }
+        };
+        match decode_audio_bytes(&data, raw.ext.as_deref()) {
             Ok(decoded) => {
                 if decoded.is_empty() {
                     silent_assets.insert(asset_id);
@@ -297,18 +454,19 @@ pub(crate) fn compute_audio_mix_hash(
     seq_len: f64,
 ) -> u64 {
     let precomp_enabled = session.plugins.is_enabled("precomp-plus");
-    let flattened = collect_flattened_audio_clips_with_precomp(
-        &session.project,
-        0.0,
-        seq_len.max(1.0),
-        precomp_enabled,
-    );
+    let flattened = collect_active_sequence_audio_clips(session, 0.0, seq_len.max(1.0));
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut active_clips = 0_usize;
 
     fnv_mix_f64(&mut hash, fps);
     fnv_mix_f64(&mut hash, seq_len);
     fnv_mix(&mut hash, &session.revision().to_le_bytes());
+    if let Some(active_comp_id) = session.document().active_composition_id {
+        fnv_mix(&mut hash, &[1]);
+        fnv_mix(&mut hash, active_comp_id.as_bytes());
+    } else {
+        fnv_mix(&mut hash, &[0]);
+    }
     fnv_mix(
         &mut hash,
         &[
@@ -323,8 +481,7 @@ pub(crate) fn compute_audio_mix_hash(
                 .project
                 .assets
                 .get(&clip.asset_id)
-                .and_then(|r| r.bytes.as_ref())
-                .is_some();
+                .is_some_and(asset_has_readable_audio_source);
         if !has_audio {
             continue;
         }
@@ -344,10 +501,12 @@ pub(crate) fn compute_audio_mix_hash(
         return 0;
     }
 
-    // Fold audio track properties/keyframes/expressions + sequence controls + nested compositions
-    // so direct mutations (including Bezier handle edits and Precomp+ edits) invalidate immediately.
-    let _ = serde_json::to_writer(FnvWriter(&mut hash), &session.project.sequence.audio_tracks);
-    let _ = serde_json::to_writer(FnvWriter(&mut hash), &session.project.sequence.controls);
+    // Fold active sequence audio track properties/keyframes/expressions + sequence controls +
+    // nested compositions so direct mutations (including Bezier handle edits and Precomp+ edits)
+    // invalidate immediately.
+    let active_seq = session.active_sequence();
+    let _ = serde_json::to_writer(FnvWriter(&mut hash), &active_seq.audio_tracks);
+    let _ = serde_json::to_writer(FnvWriter(&mut hash), &active_seq.controls);
     if !session.project.compositions.is_empty() {
         let mut comp_ids: Vec<Uuid> = session.project.compositions.keys().copied().collect();
         comp_ids.sort();
@@ -399,12 +558,7 @@ pub(crate) fn mix_sequence_audio_stereo(
 ) -> Result<Option<Vec<[f32; 2]>>, String> {
     let range_start = f64::from(start_seq_frame);
     let range_end = f64::from(end_seq_frame);
-    let flattened = collect_flattened_audio_clips_with_precomp(
-        &session.project,
-        range_start,
-        range_end,
-        session.plugins.is_enabled("precomp-plus"),
-    );
+    let flattened = collect_active_sequence_audio_clips(session, range_start, range_end);
     if flattened.is_empty() {
         return Ok(None);
     }
@@ -429,13 +583,13 @@ pub(crate) fn mix_sequence_audio_stereo(
                 let Some(rec) = session.project.assets.get(&clip.asset_id) else {
                     continue;
                 };
-                let Some(bytes) = rec.bytes.as_deref() else {
+                let Some(bytes) = load_asset_audio_bytes(rec) else {
                     continue;
                 };
                 let ext = Path::new(&rec.filename)
                     .extension()
                     .and_then(|e| e.to_str());
-                match decode_audio_bytes(bytes, ext) {
+                match decode_audio_bytes(&bytes, ext) {
                     Ok(decoded) => {
                         if decoded.is_empty() {
                             silent_assets.insert(clip.asset_id.clone());
@@ -528,12 +682,7 @@ pub(crate) fn sample_live_audio_meter(
     }
     let safe_fps = fps.max(1.0);
     let dt_frames = (METER_WINDOW as f64 / f64::from(STANDARD_SAMPLE_RATE)) * safe_fps;
-    let flattened = collect_flattened_audio_clips_with_precomp(
-        &session.project,
-        frame,
-        frame + dt_frames.max(1.0),
-        session.plugins.is_enabled("precomp-plus"),
-    );
+    let flattened = collect_active_sequence_audio_clips(session, frame, frame + dt_frames.max(1.0));
     if flattened.is_empty() {
         return (0.0, 0.0);
     }
@@ -603,6 +752,112 @@ pub(crate) fn sample_live_audio_meter(
     (rms_l, rms_r)
 }
 
+/// Clamps a playback advance from `prev_frame` to `target_frame` so that when frame-dropping
+/// is disabled (`drop_frames == false`) at normal or slow speeds (`|speed| <= 1.0`), playback
+/// never skips over an uncached integer frame bucket in [`PreviewFrameCache`].
+///
+/// Returns `(clamped_frame, was_clamped)`. When every traversed integer bucket is already
+/// cached (e.g., on cached loop replay) or when fast-shuttling (`|speed| > 1.0`), returns
+/// `(target_frame, false)` so playback runs at full real-time speed synchronized with the
+/// master audio clock.
+pub(crate) fn clamp_playback_frame_for_cache(
+    prev_frame: f64,
+    target_frame: f64,
+    speed: f64,
+    seq_len: f64,
+    loop_enabled: bool,
+    mut is_frame_cached: impl FnMut(f64) -> bool,
+) -> (f64, bool) {
+    if !prev_frame.is_finite()
+        || !target_frame.is_finite()
+        || !speed.is_finite()
+        || speed.abs() <= f64::EPSILON
+        || speed.abs() > 1.0 + 1e-6
+        || !seq_len.is_finite()
+        || seq_len <= 1.0
+    {
+        return (target_frame, false);
+    }
+
+    let total = seq_len.max(1.0);
+    let num_buckets = (total.ceil() as i64).max(1);
+    if num_buckets <= 1 {
+        return (target_frame, false);
+    }
+
+    let prev_clamped = prev_frame.clamp(0.0, (total - 1e-9).max(0.0));
+    let target_clamped = target_frame.clamp(0.0, (total - 1e-9).max(0.0));
+    let prev_bucket = (prev_clamped.floor() as i64).clamp(0, num_buckets - 1);
+    let target_bucket = (target_clamped.floor() as i64).clamp(0, num_buckets - 1);
+
+    if speed > 0.0 {
+        let (forward_delta, delta_buckets) = if target_clamped >= prev_clamped {
+            (target_clamped - prev_clamped, target_bucket - prev_bucket)
+        } else if loop_enabled {
+            let wrap_delta = (target_clamped + total) - prev_clamped;
+            if wrap_delta < (prev_clamped - target_clamped) {
+                (
+                    wrap_delta,
+                    (target_bucket - prev_bucket).rem_euclid(num_buckets),
+                )
+            } else {
+                return (target_frame, false);
+            }
+        } else {
+            return (target_frame, false);
+        };
+        if delta_buckets <= 0 {
+            return (target_frame, false);
+        }
+
+        // If we moved at most one bucket at real-time pace (allowing minor vsync jitter),
+        // advance smoothly without re-anchoring the master audio clock.
+        if delta_buckets == 1 && forward_delta <= 1.15 {
+            return (target_frame, false);
+        }
+
+        let steps = delta_buckets.min(num_buckets);
+        for step in 1..=steps {
+            let bucket = (prev_bucket + step).rem_euclid(num_buckets);
+            let bucket_frame = bucket as f64;
+            if !is_frame_cached(bucket_frame) {
+                let was_clamped = (bucket_frame - target_frame).abs() > 1e-9;
+                return (bucket_frame, was_clamped);
+            }
+        }
+        (target_frame, false)
+    } else {
+        let delta_buckets = if target_clamped <= prev_clamped {
+            prev_bucket - target_bucket
+        } else if loop_enabled {
+            let wrap_delta = (prev_clamped + total) - target_clamped;
+            if wrap_delta < (target_clamped - prev_clamped) {
+                (prev_bucket - target_bucket).rem_euclid(num_buckets)
+            } else {
+                return (target_frame, false);
+            }
+        } else {
+            return (target_frame, false);
+        };
+        if delta_buckets <= 1 {
+            return (target_frame, false);
+        }
+
+        // Only clamp strictly intermediate skipped buckets in reverse so we never overshoot
+        // `target_frame` backwards (e.g. target_frame = 9.7 has bucket 9.0 < 9.7).
+        let intermediate_steps = (delta_buckets - 1).min(num_buckets);
+        for step in 1..=intermediate_steps {
+            let bucket = (prev_bucket - step).rem_euclid(num_buckets);
+            let bucket_frame = bucket as f64;
+            if !is_frame_cached(bucket_frame) {
+                let was_clamped = (bucket_frame - target_frame).abs() > 1e-9;
+                return (bucket_frame, was_clamped);
+            }
+        }
+        (target_frame, false)
+    }
+}
+
 impl ZoidCraftApp {
     pub(crate) fn reset_live_audio_output(&mut self) {
         self.audio_clock.pause();
@@ -627,6 +882,7 @@ impl ZoidCraftApp {
             fps.to_bits(),
             seq_len.to_bits(),
             self.session.plugins.is_enabled("precomp-plus"),
+            self.session.document().active_composition_id,
         );
         if let Some((cached_key, hash)) = self.cached_audio_mix_hash
             && cached_key == key
@@ -915,20 +1171,77 @@ impl ZoidCraftApp {
         }
 
         if is_playing {
+            let prev_frame = self.session.playback.current_frame;
+            let should_cache_step = !self.workspace.player_plus.drop_frames
+                && speed.abs() <= 1.0 + 1e-6
+                && self.renderer.is_some()
+                && !(self.session.plugins.is_enabled("player-plus")
+                    && self.workspace.player_plus.drawing_paused);
+
             if self.audio_output.is_some() && self.audio_clock.snapshot().hardware_clock_active {
                 let exact = self.audio_clock.exact_frame();
-                if !self.audio_clock.is_playing() {
+                let clock_stopped = !self.audio_clock.is_playing();
+                let (next_frame, was_clamped) =
+                    if should_cache_step && let Some(renderer) = self.renderer.as_ref() {
+                        clamp_playback_frame_for_cache(
+                            prev_frame,
+                            exact,
+                            speed,
+                            seq_len,
+                            loop_enabled,
+                            |f| renderer.is_frame_cached(f),
+                        )
+                    } else {
+                        (exact, false)
+                    };
+
+                if was_clamped {
+                    self.session.playback.current_frame = next_frame;
+                    self.audio_clock.seek_preserving_playback(next_frame);
+                    if clock_stopped {
+                        self.audio_clock.set_speed(speed);
+                    }
+                } else if clock_stopped {
                     let max_frame = (seq_len - 1.0).max(0.0);
                     self.session.playback.current_frame = exact.round().clamp(0.0, max_frame);
                     self.session.playback.speed = 0.0;
                     self.last_audio_playing = false;
                     self.last_audio_speed = 0.0;
                 } else {
-                    self.session.playback.current_frame = exact;
+                    self.session.playback.current_frame = next_frame;
                 }
             } else {
+                let prev_epoch = self.session.playback.epoch_id;
                 self.session.playback.advance(dt, fps, seq_len);
-                if !self.session.playback.is_playing() {
+                let target_frame = self.session.playback.current_frame;
+                let stopped = !self.session.playback.is_playing();
+                let (next_frame, was_clamped) =
+                    if should_cache_step && let Some(renderer) = self.renderer.as_ref() {
+                        clamp_playback_frame_for_cache(
+                            prev_frame,
+                            target_frame,
+                            speed,
+                            seq_len,
+                            loop_enabled,
+                            |f| renderer.is_frame_cached(f),
+                        )
+                    } else {
+                        (target_frame, false)
+                    };
+
+                if was_clamped {
+                    self.session.playback.current_frame = next_frame;
+                    if stopped {
+                        self.session.playback.speed = speed;
+                    }
+                    if self.session.playback.epoch_id != prev_epoch {
+                        self.last_audio_epoch = self.session.playback.epoch_id;
+                    }
+                    self.audio_clock.seek_preserving_playback(next_frame);
+                    if !self.audio_clock.is_playing() {
+                        self.audio_clock.set_speed(speed);
+                    }
+                } else if stopped {
                     let max_frame = (seq_len - 1.0).max(0.0);
                     self.session.playback.current_frame = self
                         .session
@@ -983,8 +1296,9 @@ impl ZoidCraftApp {
         self.last_audio_peaks_sync_rev = None;
         self.last_audio_peaks_asset_count = 0;
 
-        // Decode embedded audio assets (including those only present in Media/Assets so placing
-        // them later onto the timeline immediately has waveforms and audio playback).
+        // Decode embedded and externalized local-disk audio assets (including those only present
+        // in Media/Assets so placing them later onto the timeline immediately has waveforms and
+        // audio playback, even after reload or autosave recovery).
         let audio_asset_keys: Vec<String> = self
             .session
             .project
@@ -997,17 +1311,17 @@ impl ZoidCraftApp {
                     .map(str::to_ascii_lowercase);
                 let is_audio_ext =
                     matches!(ext.as_deref(), Some("wav" | "mp3" | "ogg" | "flac" | "aac"));
-                (is_audio_ext && rec.bytes.is_some()).then(|| k.clone())
+                (is_audio_ext && asset_has_readable_audio_source(rec)).then(|| k.clone())
             })
             .collect();
         for asset_key in audio_asset_keys {
             if let Some(rec) = self.session.project.assets.get(&asset_key)
-                && let Some(bytes) = rec.bytes.as_deref()
+                && let Some(bytes) = load_asset_audio_bytes(rec)
             {
                 let ext = Path::new(&rec.filename)
                     .extension()
                     .and_then(|e| e.to_str());
-                if let Ok(buf) = decode_audio_bytes(bytes, ext) {
+                if let Ok(buf) = decode_audio_bytes(&bytes, ext) {
                     let peaks = WaveformPeaks::from_audio_buffer(&buf);
                     self.asset_waveform_peaks.insert(
                         asset_key.clone(),
@@ -1038,13 +1352,13 @@ impl ZoidCraftApp {
                     let Some(rec) = self.session.project.assets.get(asset_key) else {
                         continue;
                     };
-                    let Some(bytes) = rec.bytes.as_deref() else {
+                    let Some(bytes) = load_asset_audio_bytes(rec) else {
                         continue;
                     };
                     let ext = Path::new(&rec.filename)
                         .extension()
                         .and_then(|e| e.to_str());
-                    if let Ok(buf) = decode_audio_bytes(bytes, ext) {
+                    if let Ok(buf) = decode_audio_bytes(&bytes, ext) {
                         let peaks = WaveformPeaks::from_audio_buffer(&buf);
                         self.asset_waveform_peaks.insert(
                             asset_key.to_owned(),
@@ -1067,8 +1381,9 @@ impl ZoidCraftApp {
         }
     }
 
-    /// Ensures newly split, duplicated, or undone/redone audio clips inherit waveform peaks
-    /// from their shared content-addressed `asset_id` without re-decoding audio bytes.
+    /// Ensures newly split, duplicated, or undone/redone audio clips (in both Main and nested
+    /// Precomp+ compositions) inherit waveform peaks from their shared content-addressed
+    /// `asset_id` without re-decoding audio bytes.
     pub(crate) fn sync_timeline_audio_peaks(&mut self) {
         let rev = self.session.revision();
         let asset_count = self.asset_waveform_peaks.len();
@@ -1082,7 +1397,14 @@ impl ZoidCraftApp {
         {
             return;
         }
-        for at in &self.session.project.sequence.audio_tracks {
+        let all_audio_tracks = self.session.project.sequence.audio_tracks.iter().chain(
+            self.session
+                .project
+                .compositions
+                .values()
+                .flat_map(|c| c.audio_tracks.iter()),
+        );
+        for at in all_audio_tracks {
             for ac in &at.clips {
                 let cid = ac.id.to_string();
                 if !self.timeline.audio_peaks.contains_key(&cid)
@@ -1095,5 +1417,235 @@ impl ZoidCraftApp {
         }
         self.last_audio_peaks_sync_rev = Some(rev);
         self.last_audio_peaks_asset_count = asset_count;
+    }
+}
+
+#[cfg(test)]
+mod cache_step_tests {
+    use super::*;
+
+    #[test]
+    fn forward_uncached_playback_clamps_to_every_integer_frame_then_runs_realtime_when_cached() {
+        let mut cached: HashSet<i64> = HashSet::new();
+        cached.insert(0);
+
+        // Simulate heavy scene where each uncached render takes 50ms at 60fps (+3.0 frames/tick).
+        let mut frame = 0.0_f64;
+        for expected in 1..=10_i64 {
+            let (next, clamped) =
+                clamp_playback_frame_for_cache(frame, frame + 3.0, 1.0, 60.0, true, |f| {
+                    cached.contains(&(f.floor().max(0.0) as i64))
+                });
+            assert!(clamped, "uncached frame {expected} must clamp advance");
+            assert!(
+                (next - expected as f64).abs() < 1e-9,
+                "expected exact frame {expected}, got {next}"
+            );
+            frame = next;
+            cached.insert(frame.floor() as i64);
+        }
+
+        // Once frames 0..=10 are all cached, advancing by 3.0 frames runs un-clamped at realtime.
+        let (rt_next, rt_clamped) =
+            clamp_playback_frame_for_cache(2.0, 5.25, 1.0, 60.0, true, |f| {
+                cached.contains(&(f.floor().max(0.0) as i64))
+            });
+        assert!(!rt_clamped, "cached span must play at full real-time speed");
+        assert!((rt_next - 5.25).abs() < 1e-9);
+
+        // Minor 60Hz vsync jitter (single bucket step <= 1.15 frames) does not falsely clamp.
+        let (jitter_next, jitter_clamped) =
+            clamp_playback_frame_for_cache(10.0, 11.05, 1.0, 60.0, true, |f| {
+                cached.contains(&(f.floor().max(0.0) as i64))
+            });
+        assert!(!jitter_clamped);
+        assert!((jitter_next - 11.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reverse_loop_wrap_and_shuttle_speeds_behave_cleanly() {
+        let mut cached: HashSet<i64> = HashSet::new();
+        cached.insert(10);
+
+        // Reverse 1x over uncached frames steps 10 -> 9 -> 8 without skipping.
+        let (rev1, clamped1) = clamp_playback_frame_for_cache(10.0, 7.0, -1.0, 60.0, true, |f| {
+            cached.contains(&(f.floor().max(0.0) as i64))
+        });
+        assert!(clamped1);
+        assert!((rev1 - 9.0).abs() < 1e-9);
+        cached.insert(9);
+
+        let (rev2, clamped2) = clamp_playback_frame_for_cache(9.0, 6.0, -1.0, 60.0, true, |f| {
+            cached.contains(&(f.floor().max(0.0) as i64))
+        });
+        assert!(clamped2);
+        assert!((rev2 - 8.0).abs() < 1e-9);
+
+        // Forward and reverse loop wraps clamp to the first uncached wrapped bucket.
+        let (fwd_wrap, fwd_wrap_clamped) =
+            clamp_playback_frame_for_cache(58.0, 1.0, 1.0, 60.0, true, |_| false);
+        assert!(fwd_wrap_clamped);
+        assert!((fwd_wrap - 59.0).abs() < 1e-9);
+
+        let (rev_wrap, rev_wrap_clamped) =
+            clamp_playback_frame_for_cache(1.0, 58.0, -1.0, 60.0, true, |_| false);
+        assert!(rev_wrap_clamped);
+        assert!((rev_wrap - 0.0).abs() < 1e-9);
+
+        // Multi-speed shuttle (2x, 4x, -2x) from J/K/L is never throttled to 1 frame/tick.
+        for (prev, target, spd) in [(0.0, 4.0, 2.0), (0.0, 8.0, 4.0), (20.0, 16.0, -2.0)] {
+            let (next, clamped) =
+                clamp_playback_frame_for_cache(prev, target, spd, 60.0, true, |_| false);
+            assert!(
+                !clamped,
+                "shuttle speed {spd}x must not be clamped to 1 frame/tick"
+            );
+            assert!((next - target).abs() < 1e-9);
+        }
+    }
+
+    fn make_test_wav_pcm16(sample_rate: u32, frames: usize, sample_i16: i16) -> Vec<u8> {
+        let channels: u16 = 2;
+        let bits_per_sample: u16 = 16;
+        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample / 8);
+        let block_align = channels * (bits_per_sample / 8);
+        let data_size = (frames * usize::from(block_align)) as u32;
+        let riff_size = 36 + data_size;
+
+        let mut out = Vec::with_capacity((44 + data_size) as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&riff_size.to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16_u32.to_le_bytes());
+        out.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&channels.to_le_bytes());
+        out.extend_from_slice(&sample_rate.to_le_bytes());
+        out.extend_from_slice(&byte_rate.to_le_bytes());
+        out.extend_from_slice(&block_align.to_le_bytes());
+        out.extend_from_slice(&bits_per_sample.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_size.to_le_bytes());
+        for _ in 0..frames {
+            out.extend_from_slice(&sample_i16.to_le_bytes());
+            out.extend_from_slice(&(-sample_i16).to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn active_precomp_audio_lookup_uses_active_sequence_instead_of_root() {
+        let mut session = Session::new();
+        let created = session
+            .execute(Command::CreateComposition {
+                name: "Audio Precomp".to_owned(),
+                resolution: [1280, 720],
+                fps: 30,
+                length_frames: 120,
+            })
+            .expect("create nested composition");
+        let comp_id = Uuid::parse_str(
+            created
+                .get("comp_id")
+                .and_then(|v| v.as_str())
+                .expect("comp_id"),
+        )
+        .expect("comp_id uuid");
+
+        let asset_id = "precomp-tone-asset".to_owned();
+        let wav_bytes = make_test_wav_pcm16(48_000, 2400, 8192);
+        session.project.assets.insert(
+            asset_id.clone(),
+            AssetRecord {
+                id: asset_id.clone(),
+                kind: AssetKind::Av,
+                source: AssetSource::File,
+                filename: "tone.wav".to_owned(),
+                url: None,
+                external: false,
+                bytes: Some(wav_bytes),
+                missing: false,
+                sha256: String::new(),
+                size: 0,
+                preserved: BTreeMap::new(),
+            },
+        );
+
+        session
+            .execute(Command::SetActiveComposition {
+                comp_id: Some(comp_id),
+            })
+            .expect("enter precomp");
+        let audio_track_id = session.document().audio_tracks[0].id.clone();
+        let added = session
+            .execute(Command::AddClip {
+                track_id: audio_track_id,
+                kind: "audio".to_owned(),
+                name: Some("Precomp Tone".to_owned()),
+                start: 0.0,
+                length: 60.0,
+            })
+            .expect("add precomp audio clip");
+        let clip_id = added
+            .get("clip_id")
+            .and_then(|v| v.as_str())
+            .expect("clip_id")
+            .to_owned();
+        session
+            .execute(Command::SetPropertyValue {
+                target_id: clip_id,
+                property: "assetId".to_owned(),
+                value: json!(asset_id),
+            })
+            .expect("assign assetId on precomp audio clip");
+
+        // While inside the nested precomp, audio lookup must see the precomp's audio clip
+        // even though root sequence has zero audio clips.
+        let active_clips = collect_active_sequence_audio_clips(&session, 0.0, 120.0);
+        assert_eq!(active_clips.len(), 1);
+        assert_eq!(active_clips[0].asset_id, asset_id);
+        let active_hash = compute_audio_mix_hash(&session, &HashMap::new(), 30.0, 120.0);
+        assert_ne!(active_hash, 0);
+
+        // Switching back to root Main composition (which has no audio clips) must return 0 clips.
+        session
+            .execute(Command::SetActiveComposition { comp_id: None })
+            .expect("return to main");
+        assert!(collect_active_sequence_audio_clips(&session, 0.0, 120.0).is_empty());
+        assert_eq!(
+            compute_audio_mix_hash(&session, &HashMap::new(), 30.0, 120.0),
+            0
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn externalized_audio_asset_loads_bytes_from_local_disk_url() {
+        let wav_bytes = make_test_wav_pcm16(48_000, 1200, 16_384);
+        let tmp_path =
+            std::env::temp_dir().join(format!("zoidcraft_ext_audio_test_{}.wav", Uuid::new_v4()));
+        fs::write(&tmp_path, &wav_bytes).expect("write temp wav");
+
+        let rec = AssetRecord {
+            id: "ext-audio-1".to_owned(),
+            kind: AssetKind::Av,
+            source: AssetSource::File,
+            filename: "ext.wav".to_owned(),
+            url: Some(tmp_path.to_string_lossy().into_owned()),
+            external: true,
+            bytes: None,
+            missing: false,
+            sha256: String::new(),
+            size: wav_bytes.len() as u64,
+            preserved: BTreeMap::new(),
+        };
+        assert!(asset_has_readable_audio_source(&rec));
+        let loaded = load_asset_audio_bytes(&rec).expect("must read externalized bytes from url");
+        assert_eq!(loaded, wav_bytes);
+        let decoded = decode_audio_bytes(&loaded, Some("wav")).expect("must decode loaded wav");
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.frame_count(), 1200);
+
+        let _ = fs::remove_file(&tmp_path);
     }
 }

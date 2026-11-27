@@ -18,7 +18,11 @@ use crate::decode::{
     AudioBuffer, MAX_AUDIO_SAMPLE_RATE, MIN_AUDIO_SAMPLE_RATE, decode_audio_bytes,
 };
 
-pub use effects::apply_gain_and_pan;
+pub use effects::{
+    AudioBandEnergy, AudioSpectrum, BiquadFilter, BiquadKind, CompressorConfig, DynamicsCompressor,
+    StereoDelay, StereoReverb, ThreeBandEq, ThreeBandEqConfig, analyze_audio_spectrum,
+    apply_gain_and_pan, compute_audio_band_energy, fft_radix2_in_place,
+};
 pub use resample::effective_playback_rate;
 
 use effects::{
@@ -31,8 +35,12 @@ use resample::{
     mix_static_linear_clip, sanitize_and_clamp,
 };
 
-/// Maximum stereo sample frames produced in one offline mix buffer (32M frames = 256 MiB).
-pub const MAX_OFFLINE_MIX_SAMPLES: usize = 32 * 1024 * 1024;
+/// Maximum stereo sample frames produced in one single-shot offline mix buffer
+/// (`345,600,000` frames = 2.0 hours at 48 kHz).
+///
+/// Timelines longer than this single-buffer cap should use [`mix_flattened_audio_clips_chunked`]
+/// to stream bounded chunks without allocating the entire output buffer at once.
+pub const MAX_OFFLINE_MIX_SAMPLES: usize = 2 * 60 * 60 * 48_000;
 
 /// Maximum nested Precomp+ composition recursion depth when flattening audio tracks.
 pub const MAX_PRECOMP_AUDIO_DEPTH: usize = 8;
@@ -71,7 +79,8 @@ pub struct ClipAudioSampleParams {
 }
 
 /// Computes the exact offline output sample count: `floor((total_frames / fps) * sample_rate)`,
-/// returning `Err` if parameters are invalid or exceed [`MAX_OFFLINE_MIX_SAMPLES`].
+/// returning a descriptive [`AudioError::InvalidFormat`] if parameters are invalid or exceed
+/// [`MAX_OFFLINE_MIX_SAMPLES`].
 pub fn try_offline_total_samples(
     total_frames: f64,
     fps: f64,
@@ -92,8 +101,10 @@ pub fn try_offline_total_samples(
     }
     let raw = ((total_frames * f64::from(sample_rate)) / fps).floor();
     if !raw.is_finite() || raw < 0.0 || raw > MAX_OFFLINE_MIX_SAMPLES as f64 {
+        let req_mins = (total_frames / fps) / 60.0;
+        let max_mins = (MAX_OFFLINE_MIX_SAMPLES as f64 / f64::from(sample_rate)) / 60.0;
         return Err(AudioError::InvalidFormat(format!(
-            "offline mix sample count ({raw}) exceeds memory cap ({MAX_OFFLINE_MIX_SAMPLES})"
+            "offline mix sample count ({raw:.0} frames, {req_mins:.2} min at {sample_rate} Hz) exceeds single-buffer safety cap ({MAX_OFFLINE_MIX_SAMPLES} frames, {max_mins:.2} min); use `mix_flattened_audio_clips_chunked` for longer timelines"
         )));
     }
     Ok(raw as usize)
@@ -101,9 +112,42 @@ pub fn try_offline_total_samples(
 
 /// Computes the exact offline output sample count: `floor((total_frames / fps) * sample_rate)`,
 /// returning `0` if invalid or above [`MAX_OFFLINE_MIX_SAMPLES`].
+///
+/// Prefer [`try_offline_total_samples`] when you need to surface an explicit error instead of
+/// falling back to `0`.
 #[must_use]
 pub fn offline_total_samples(total_frames: f64, fps: f64, sample_rate: u32) -> usize {
-    try_offline_total_samples(total_frames, fps, sample_rate).unwrap_or(0)
+    match try_offline_total_samples(total_frames, fps, sample_rate) {
+        Ok(n) => n,
+        Err(err) => {
+            tracing::warn!("offline_total_samples returning 0: {err}");
+            0
+        }
+    }
+}
+
+/// Fallible version of [`mix_offline_stereo`] that returns a clear [`AudioError::InvalidFormat`]
+/// when the requested duration exceeds [`MAX_OFFLINE_MIX_SAMPLES`] instead of silently returning
+/// an empty buffer.
+pub fn try_mix_offline_stereo(
+    total_frames: f64,
+    fps: f64,
+    sample_rate: u32,
+    clips: &[AudioClipScheduleItem],
+    buffers: &HashMap<String, AudioBuffer>,
+) -> Result<Vec<[f32; 2]>, AudioError> {
+    try_mix_offline_stereo_animated(
+        total_frames,
+        fps,
+        sample_rate,
+        clips,
+        buffers,
+        |_clip_idx, clip, local_frame| ClipAudioSampleParams {
+            media_time_sec: clip.media_start_sec + (local_frame / fps) * clip.playback_rate,
+            volume: clip.volume,
+            pan: clip.pan,
+        },
+    )
 }
 
 /// Mixes static [`AudioClipScheduleItem`] entries into a deterministic stereo output buffer
@@ -111,6 +155,9 @@ pub fn offline_total_samples(total_frames: f64, fps: f64, sample_rate: u32) -> u
 ///
 /// Output length is strictly `floor((total_frames / fps) * sample_rate)`, zero-filled outside
 /// active clip regions, and hard-clamped per channel to `[-1.0, 1.0]`.
+///
+/// Prefer [`try_mix_offline_stereo`] when mixing untrusted or multi-hour timelines so exceeding
+/// [`MAX_OFFLINE_MIX_SAMPLES`] returns an explicit error instead of an empty buffer.
 #[must_use]
 pub fn mix_offline_stereo(
     total_frames: f64,
@@ -761,4 +808,190 @@ pub fn mix_project_audio_with_precomps_filtered(
         &buffers,
     )?;
     Ok(Some(mixed))
+}
+
+/// Streams a deterministic offline stereo mix of `clips` over
+/// `[range_start_frame, range_start_frame + total_frames)` in bounded chunks of at most
+/// `chunk_frames` timeline frames, invoking `on_chunk` for each rendered stereo slice.
+///
+/// Unlike [`mix_flattened_audio_clips`], this supports arbitrarily long timelines (including
+/// timelines exceeding [`MAX_OFFLINE_MIX_SAMPLES`]) with constant peak memory bounded by one
+/// chunk. Returns the total number of stereo sample frames emitted across all chunks.
+#[allow(clippy::too_many_arguments)]
+pub fn mix_flattened_audio_clips_chunked<B, F>(
+    clips: &[FlattenedAudioClip],
+    range_start_frame: f64,
+    total_frames: f64,
+    root_fps: f64,
+    sample_rate: u32,
+    chunk_frames: f64,
+    buffers: &HashMap<String, B>,
+    mut on_chunk: F,
+) -> Result<usize, AudioError>
+where
+    B: Borrow<AudioBuffer>,
+    F: FnMut(&[[f32; 2]]) -> Result<(), AudioError>,
+{
+    if !range_start_frame.is_finite()
+        || !total_frames.is_finite()
+        || !root_fps.is_finite()
+        || !chunk_frames.is_finite()
+        || total_frames < 0.0
+        || root_fps <= 0.0
+        || chunk_frames <= 0.0
+        || !(MIN_AUDIO_SAMPLE_RATE..=MAX_AUDIO_SAMPLE_RATE).contains(&sample_rate)
+    {
+        return Err(AudioError::InvalidFormat(format!(
+            "invalid chunked offline mix parameters: range_start={range_start_frame}, total_frames={total_frames}, fps={root_fps}, sample_rate={sample_rate}, chunk_frames={chunk_frames}"
+        )));
+    }
+    if total_frames == 0.0 {
+        return Ok(0);
+    }
+    // Validate that a single chunk stays within the single-buffer cap.
+    let _ = try_offline_total_samples(chunk_frames.min(total_frames), root_fps, sample_rate)?;
+
+    let mut emitted_total = 0_usize;
+    let mut offset_frames = 0.0_f64;
+    while offset_frames < total_frames {
+        let remaining = total_frames - offset_frames;
+        let this_frames = remaining.min(chunk_frames);
+        let chunk = mix_flattened_audio_clips(
+            clips,
+            range_start_frame + offset_frames,
+            this_frames,
+            root_fps,
+            sample_rate,
+            buffers,
+        )?;
+        emitted_total = emitted_total.checked_add(chunk.len()).ok_or_else(|| {
+            AudioError::InvalidFormat("chunked offline mix sample count overflow".to_owned())
+        })?;
+        on_chunk(&chunk)?;
+        offset_frames += this_frames;
+    }
+
+    Ok(emitted_total)
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+    use crate::decode::STANDARD_SAMPLE_RATE;
+
+    #[test]
+    fn offline_mix_cap_allows_two_hours_and_errors_descriptively_above_cap() {
+        let sr = STANDARD_SAMPLE_RATE;
+        let fps = 30.0_f64;
+
+        // 90 minutes (well above the legacy 11.65-minute 32M-sample cap) succeeds.
+        let ninety_min_frames = 90.0 * 60.0 * fps;
+        let samples_90m =
+            try_offline_total_samples(ninety_min_frames, fps, sr).expect("90 min within 2h cap");
+        assert_eq!(samples_90m, 90 * 60 * sr as usize);
+
+        // Exactly 2.0 hours succeeds.
+        let two_hour_frames = 120.0 * 60.0 * fps;
+        let samples_2h =
+            try_offline_total_samples(two_hour_frames, fps, sr).expect("2 hours at cap");
+        assert_eq!(samples_2h, MAX_OFFLINE_MIX_SAMPLES);
+
+        // 3.0 hours exceeds the 2-hour single-buffer cap and returns a descriptive Err, NOT silent 0.
+        let three_hour_frames = 180.0 * 60.0 * fps;
+        let err = try_offline_total_samples(three_hour_frames, fps, sr)
+            .expect_err("3 hours must error descriptively");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds single-buffer safety cap")
+                && msg.contains("mix_flattened_audio_clips_chunked"),
+            "unexpected error message: {msg}"
+        );
+
+        let buffers: HashMap<String, AudioBuffer> = HashMap::new();
+        let mix_err = try_mix_offline_stereo(three_hour_frames, fps, sr, &[], &buffers)
+            .expect_err("try_mix_offline_stereo must return Err above cap");
+        assert!(matches!(mix_err, AudioError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn chunked_offline_mix_matches_single_shot_mix() {
+        let sr = STANDARD_SAMPLE_RATE;
+        let fps = 30.0_f64;
+        let total_frames = 30.0_f64;
+
+        let mut project = Project::new_cm3_default();
+        project.sequence.fps = 30;
+        project.sequence.length_frames = total_frames;
+
+        let sine: Vec<f32> = (0..(sr * 2) as usize)
+            .map(|i| {
+                (std::f64::consts::TAU * 440.0 * (i as f64) / f64::from(sr)).sin() as f32 * 0.5
+            })
+            .collect();
+        let mut buffers = HashMap::new();
+        buffers.insert(
+            "tone".to_owned(),
+            AudioBuffer {
+                sample_rate: sr,
+                channels: 1,
+                samples_interleaved_f32: sine,
+            },
+        );
+
+        let aclip = zc_project::AudioClip {
+            id: zc_project::Uuid::new_v4(),
+            name: "Tone".to_owned(),
+            start: 0.0,
+            length: total_frames,
+            link: None,
+            media: Some("tone".to_owned()),
+            time_curve: zc_project::PropertyTrack::linear_time_curve(total_frames, 30),
+            audio: zc_project::AudioClipData {
+                name: "Tone".to_owned(),
+                volume: zc_project::PropertyTrack::number(0.8),
+                pan: zc_project::PropertyTrack::number(-0.25),
+                preserved: std::collections::BTreeMap::new(),
+            },
+            preserved: std::collections::BTreeMap::new(),
+        };
+        project.sequence.audio_tracks = vec![zc_project::AudioTrack {
+            id: zc_project::Uuid::new_v4(),
+            name: "Audio".to_owned(),
+            enabled: true,
+            muted: false,
+            solo: false,
+            locked: false,
+            clips: vec![aclip],
+            preserved: std::collections::BTreeMap::new(),
+        }];
+
+        let flattened = collect_flattened_audio_clips(&project, 0.0, total_frames);
+        let full = mix_flattened_audio_clips(&flattened, 0.0, total_frames, fps, sr, &buffers)
+            .expect("single-shot mix succeeds");
+
+        let mut streamed: Vec<[f32; 2]> = Vec::new();
+        let emitted = mix_flattened_audio_clips_chunked(
+            &flattened,
+            0.0,
+            total_frames,
+            fps,
+            sr,
+            10.0,
+            &buffers,
+            |chunk| {
+                streamed.extend_from_slice(chunk);
+                Ok(())
+            },
+        )
+        .expect("chunked mix succeeds");
+
+        assert_eq!(emitted, full.len());
+        assert_eq!(streamed.len(), full.len());
+        for (i, (&s, &f)) in streamed.iter().zip(&full).enumerate() {
+            assert!(
+                (s[0] - f[0]).abs() < 1e-5 && (s[1] - f[1]).abs() < 1e-5,
+                "chunked mismatch at sample {i}: streamed={s:?}, full={f:?}"
+            );
+        }
+    }
 }

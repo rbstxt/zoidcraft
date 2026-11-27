@@ -34,6 +34,9 @@ fn preferences_round_trip_and_flush_pending_changes_on_drop() {
         preview_cache_mib: 768,
         undo_max_entries: 123,
         undo_max_mib: 42,
+        ffmpeg_path: Some("/opt/custom/bin/ffmpeg".to_owned()),
+        ffprobe_path: Some("/opt/custom/bin/ffprobe".to_owned()),
+        ffmpeg_setup_dismissed: true,
     };
     app.workspace.player_plus.preview_quality = PreviewQuality::Quarter;
     app.theme.set_custom_hue_sat(40.0, 125.0);

@@ -1675,13 +1675,116 @@ fn settings_fixed_dropdown(
     changed
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct EditorLayoutPreset {
+    pub(super) name: &'static str,
+    pub(super) description: &'static str,
+    pub(super) inspector_width_ratio: f32,
+    pub(super) viewport_height_ratio: f32,
+    pub(super) objects_split_ratio: f32,
+    pub(super) effects_split_ratio: f32,
+    pub(super) prop_label_ratio: f32,
+    pub(super) objects_list_open: bool,
+}
+
+pub(super) const EDITOR_LAYOUT_PRESETS: [EditorLayoutPreset; 4] = [
+    EditorLayoutPreset {
+        name: "Classic",
+        description: "Balanced inspector, viewport, and timeline proportions.",
+        inspector_width_ratio: 0.31,
+        viewport_height_ratio: 0.65,
+        objects_split_ratio: 0.40,
+        effects_split_ratio: 0.40,
+        prop_label_ratio: 0.44,
+        objects_list_open: true,
+    },
+    EditorLayoutPreset {
+        name: "Compact",
+        description: "Tighter inspector labels with compact object and effects panes.",
+        inspector_width_ratio: 0.26,
+        viewport_height_ratio: 0.62,
+        objects_split_ratio: 0.30,
+        effects_split_ratio: 0.30,
+        prop_label_ratio: 0.38,
+        objects_list_open: true,
+    },
+    EditorLayoutPreset {
+        name: "Wide Viewport",
+        description: "Maximizes canvas space with a slim inspector and collapsed object list.",
+        inspector_width_ratio: 0.24,
+        viewport_height_ratio: 0.74,
+        objects_split_ratio: 0.26,
+        effects_split_ratio: 0.28,
+        prop_label_ratio: 0.40,
+        objects_list_open: false,
+    },
+    EditorLayoutPreset {
+        name: "Color & FX",
+        description: "Expanded inspector and effects proportions for grading and shader work.",
+        inspector_width_ratio: 0.36,
+        viewport_height_ratio: 0.68,
+        objects_split_ratio: 0.34,
+        effects_split_ratio: 0.48,
+        prop_label_ratio: 0.46,
+        objects_list_open: true,
+    },
+];
+
+pub(super) const EDITOR_LAYOUT_LABELS: [&str; 4] = [
+    EDITOR_LAYOUT_PRESETS[0].name,
+    EDITOR_LAYOUT_PRESETS[1].name,
+    EDITOR_LAYOUT_PRESETS[2].name,
+    EDITOR_LAYOUT_PRESETS[3].name,
+];
+
+/// Applies one of the 4 [`EDITOR_LAYOUT_PRESETS`] to `state`, updating concrete split ratios
+/// and panel visibility immediately.
+pub(super) fn apply_editor_layout_preset(
+    index: usize,
+    state: &mut PanelsState,
+) -> &'static EditorLayoutPreset {
+    let clamped = index.min(EDITOR_LAYOUT_PRESETS.len() - 1);
+    let preset = &EDITOR_LAYOUT_PRESETS[clamped];
+    state.settings_editor_layout = clamped;
+    state.objects_split.ratio = preset.objects_split_ratio;
+    state.effects_split.ratio = preset.effects_split_ratio;
+    state.prop_columns.label_ratio = preset.prop_label_ratio;
+    state.objects_list_open = preset.objects_list_open;
+    preset
+}
+
 pub(super) fn show_settings_tab(
     ui: &mut Ui,
     viewport_rect: Rect,
     session: &mut Session,
     theme: &mut Cm3Theme,
     state: &mut PanelsState,
+    actions: &mut Vec<PanelAction>,
 ) {
+    // Hydrate persisted editor layout preset once per egui context lifetime.
+    let layout_persist_id = Id::unique("zc_editor_layout_preset");
+    let layout_ratios_id = Id::unique("zc_editor_layout_ratios");
+    let layout_hydrated_id = Id::unique("zc_editor_layout_hydrated");
+    if !ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(layout_hydrated_id).unwrap_or(false))
+    {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(layout_hydrated_id, true));
+        if let Some(saved_idx) = ui
+            .ctx()
+            .data_mut(|d| d.get_persisted::<usize>(layout_persist_id))
+        {
+            let preset = apply_editor_layout_preset(saved_idx, state);
+            ui.ctx().data_mut(|d| {
+                d.insert_persisted(
+                    layout_ratios_id,
+                    (preset.inspector_width_ratio, preset.viewport_height_ratio),
+                );
+            });
+        }
+    }
+
     ScrollArea::vertical()
         .id_salt("settings_tab_scroll")
         .auto_shrink([false, false])
@@ -1692,6 +1795,7 @@ pub(super) fn show_settings_tab(
             panel_top_header(ui, "Settings", theme);
 
             // 1a. Editor layout control row (single-line ellipsized label + guaranteed gap before dropdown)
+            let mut layout_changed = false;
             settings_flat_row_margin(
                 ui,
                 egui::Margin {
@@ -1721,21 +1825,40 @@ pub(super) fn show_settings_tab(
                             },
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            settings_fixed_dropdown(
+                            if settings_fixed_dropdown(
                                 ui,
                                 Id::unique("settings_editor_layout"),
                                 &mut state.settings_editor_layout,
-                                &["Classic"],
+                                &EDITOR_LAYOUT_LABELS,
                                 dd_w,
                                 viewport_rect,
                                 theme,
-                            );
+                            ) {
+                                layout_changed = true;
+                            }
                         });
                     });
                 },
             );
+            if layout_changed {
+                let preset = apply_editor_layout_preset(state.settings_editor_layout, state);
+                let idx = state.settings_editor_layout;
+                ui.ctx().data_mut(|d| {
+                    d.insert_persisted(layout_persist_id, idx);
+                    d.insert_persisted(
+                        layout_ratios_id,
+                        (preset.inspector_width_ratio, preset.viewport_height_ratio),
+                    );
+                });
+                actions.push(PanelAction::StatusMessage(format!(
+                    "Editor layout applied: {}",
+                    preset.name
+                )));
+            }
 
             // 1b. Editor layout description row
+            let active_layout = &EDITOR_LAYOUT_PRESETS
+                [state.settings_editor_layout.min(EDITOR_LAYOUT_PRESETS.len() - 1)];
             settings_flat_row_margin(
                 ui,
                 egui::Margin {
@@ -1747,11 +1870,9 @@ pub(super) fn show_settings_tab(
                 |ui| {
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(
-                                "Changing the editor layout takes effect after restarting ZoidCraft.",
-                            )
-                            .font(theme.font(FONT_BODY))
-                            .color(TEXT_PRIMARY),
+                            egui::RichText::new(active_layout.description)
+                                .font(theme.font(FONT_BODY))
+                                .color(TEXT_PRIMARY),
                         )
                         .wrap(),
                     );
@@ -1990,6 +2111,12 @@ pub(super) fn show_settings_tab(
                                 theme,
                             );
                         });
+                    });
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(
+                            Id::unique("zc_gradient_editor_style"),
+                            state.settings_gradient_editor,
+                        );
                     });
                 },
             );
@@ -2233,32 +2360,166 @@ pub(super) fn show_settings_tab(
                             theme.set_custom_hue_sat(theme.custom_hue_deg, sat as f32);
                         }
 
+                        let slot_specs = [
+                            (0usize, "Focus", theme.palette.focus),
+                            (1usize, "Link", theme.palette.link),
+                            (2usize, "Clip", theme.palette.clip),
+                            (3usize, "Clip Sel", theme.palette.clip_selected),
+                            (4usize, "Sel Box", theme.palette.clip_selection),
+                        ];
+                        for (slot, label, cur_rgb) in slot_specs {
+                            let mut rgb = cur_rgb;
+                            let changed = cm3_property_row_aligned(
+                                ui,
+                                label,
+                                false,
+                                color_cols,
+                                theme,
+                                |_| {},
+                                |ui| {
+                                    show_theme_color_picker(
+                                        ui,
+                                        Id::unique(("settings_slot_color", slot)),
+                                        &mut rgb,
+                                        viewport_rect,
+                                        theme,
+                                    )
+                                },
+                            );
+                            if changed {
+                                theme.set_slot_override(slot, rgb);
+                            }
+                        }
+
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            let entries = [
-                                ("focus", theme.accent()),
-                                ("link", theme.value()),
-                                ("clip", theme.clip()),
-                                ("sel", theme.clip_selected()),
-                                ("box", theme.clip_selection()),
-                            ];
-                            for (lbl, col) in entries {
-                                let (r, _) = ui
-                                    .allocate_exact_size(Vec2::new(42.0, 22.0), Sense::hover());
-                                ui.painter().rect_filled(r, CornerRadius::ZERO, col);
-                                paint_crisp_panel_border(ui.painter(), r, BORDER_CONTROL);
-                                ui.painter().text(
-                                    r.center(),
-                                    Align2::CENTER_CENTER,
-                                    lbl,
-                                    theme.font(FONT_COMPACT),
-                                    TEXT_BRIGHT,
-                                );
+                            if ui.small_button("Reset Slots").clicked() {
+                                theme.clear_slot_overrides();
+                            }
+                            if ui.small_button("Copy JSON").clicked() {
+                                let json_str = theme.export_theme_json();
+                                write_system_clipboard(ui.ctx(), &json_str);
+                                state.debug_copied_notice =
+                                    Some("Copied theme JSON to clipboard.".to_owned());
+                            }
+                            if ui.small_button("Paste JSON").clicked()
+                                && let Some(clip_txt) = read_system_clipboard()
+                                && theme.import_theme_json(&clip_txt)
+                            {
+                                state.debug_copied_notice =
+                                    Some("Imported theme JSON from clipboard.".to_owned());
                             }
                         });
                     }
                 },
             );
+
+            // 6b. MEDIA TOOLS (FFMPEG): desktop external binary configuration (No FFmpeg Inside)
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let (ff_hdr, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());
+                ui.painter()
+                    .rect_filled(ff_hdr, CornerRadius::ZERO, BG_TITLE);
+                let ff_div_y = (ff_hdr.bottom() - 1.0).round();
+                ui.painter().rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(ff_hdr.left(), ff_div_y),
+                        Pos2::new(ff_hdr.right(), ff_div_y + 1.0),
+                    ),
+                    CornerRadius::ZERO,
+                    BG_SUNKEN,
+                );
+                ui.painter().text(
+                    Pos2::new(ff_hdr.left() + 6.0, ff_hdr.center().y),
+                    Align2::LEFT_CENTER,
+                    "MEDIA TOOLS (FFMPEG)",
+                    theme.font(FONT_BANNER),
+                    TEXT_FAINT,
+                );
+
+                settings_flat_row_margin(
+                    ui,
+                    egui::Margin {
+                        left: 6,
+                        right: 6,
+                        top: 6,
+                        bottom: 8,
+                    },
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 5.0;
+                        let ff_ok = state.export_status.ffmpeg_available;
+                        let status_color = if ff_ok {
+                            Color32::from_rgb(76, 198, 122)
+                        } else {
+                            DANGER_TEXT
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "FFmpeg: {}",
+                                state.export_status.ffmpeg_version
+                            ))
+                            .font(theme.font(FONT_SMALL))
+                            .color(status_color),
+                        );
+                        let path_display = state
+                            .app_settings
+                            .ffmpeg_path
+                            .as_deref()
+                            .map(|p| format!("Custom: {p}"))
+                            .or_else(|| {
+                                state
+                                    .export_status
+                                    .ffmpeg_resolved_path
+                                    .as_deref()
+                                    .map(|p| format!("Auto: {p}"))
+                            })
+                            .unwrap_or_else(|| "Auto-detect (not found)".to_owned());
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(path_display)
+                                    .font(theme.font(FONT_COMPACT))
+                                    .color(TEXT_MUTED),
+                            )
+                            .truncate(),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            if cm3_prop_button(
+                                ui,
+                                if ff_ok { "Setup..." } else { "Install FFmpeg..." },
+                                if ff_ok {
+                                    ButtonVariant::Normal
+                                } else {
+                                    ButtonVariant::Primary
+                                },
+                                false,
+                                theme,
+                            )
+                            .clicked()
+                            {
+                                actions.push(PanelAction::OpenFfmpegSetup);
+                            }
+                            if cm3_prop_button(ui, "Browse...", ButtonVariant::Normal, false, theme)
+                                .clicked()
+                            {
+                                actions.push(PanelAction::BrowseFfmpegBinary);
+                            }
+                            if state.app_settings.ffmpeg_path.is_some()
+                                && cm3_prop_button(ui, "Reset", ButtonVariant::Normal, false, theme)
+                                    .clicked()
+                            {
+                                actions.push(PanelAction::ClearFfmpegBinary);
+                            }
+                            if cm3_prop_button(ui, "Re-check", ButtonVariant::Normal, false, theme)
+                                .clicked()
+                            {
+                                actions.push(PanelAction::ReprobeFfmpeg);
+                            }
+                        });
+                    },
+                );
+            }
 
             // 7. DEBUG INFORMATION: full-width 28px #222222 uppercase banner (27px body + 1px #1d1d1d divider)
             let (dbg_hdr, _) =
@@ -2585,4 +2846,38 @@ pub(super) fn build_debug_info_report(session: &Session, app_settings: &AppSetti
             "off"
         },
     )
+}
+
+#[cfg(test)]
+mod settings_layout_tests {
+    use super::{EDITOR_LAYOUT_LABELS, EDITOR_LAYOUT_PRESETS, apply_editor_layout_preset};
+    use crate::ui::panels::PanelsState;
+
+    #[test]
+    fn editor_layout_presets_apply_distinct_split_ratios_and_visibility() {
+        assert_eq!(
+            EDITOR_LAYOUT_LABELS,
+            ["Classic", "Compact", "Wide Viewport", "Color & FX"]
+        );
+        assert_eq!(EDITOR_LAYOUT_PRESETS.len(), 4);
+
+        let mut state = PanelsState::default();
+        let wide = apply_editor_layout_preset(2, &mut state);
+        assert_eq!(wide.name, "Wide Viewport");
+        assert_eq!(state.settings_editor_layout, 2);
+        assert!(!state.objects_list_open);
+        assert!((state.objects_split.ratio - wide.objects_split_ratio).abs() < 1e-6);
+        assert!((state.effects_split.ratio - wide.effects_split_ratio).abs() < 1e-6);
+        assert!((state.prop_columns.label_ratio - wide.prop_label_ratio).abs() < 1e-6);
+
+        let color_fx = apply_editor_layout_preset(3, &mut state);
+        assert_eq!(color_fx.name, "Color & FX");
+        assert!(state.objects_list_open);
+        assert!(color_fx.effects_split_ratio > wide.effects_split_ratio);
+
+        // Out-of-range index clamps cleanly to last preset
+        let clamped = apply_editor_layout_preset(99, &mut state);
+        assert_eq!(clamped.name, "Color & FX");
+        assert_eq!(state.settings_editor_layout, 3);
+    }
 }

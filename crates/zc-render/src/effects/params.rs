@@ -298,8 +298,10 @@ pub fn should_bypass(effect_id: &str, params: &EffectParams) -> bool {
         "smartmotionblur" => {
             let amt = if params.values.contains_key("amount") {
                 params.float_or("amount", 0.5)
-            } else {
+            } else if params.values.contains_key("blurAmount") {
                 params.float_or("blurAmount", 0.5)
+            } else {
+                params.float_or("strength", 0.5)
             };
             let sens = if params.values.contains_key("sensitivity") {
                 params.float_or("sensitivity", 70.0)
@@ -809,6 +811,13 @@ pub fn pack_effect_uniforms(
             } else {
                 params.float_or("seed", 0.0)
             };
+            let time_mode = params.int_or("timeMode", 1);
+            let manual_time = params.float_or("time", 0.0);
+            u.time = if time_mode == 0 {
+                manual_time
+            } else {
+                params.time + manual_time
+            };
 
             u.flags = u32::from(has_aux);
             u.p0 = [amount, persistence, signal_str, color_stripes];
@@ -828,18 +837,35 @@ pub fn pack_effect_uniforms(
             let q_default = if has_sapphire { 0.1 } else { 25.0 };
             let q = params.float_or("quality", q_default);
             let q_norm = if q > 1.0 { q / 100.0 } else { q }.clamp(0.01, 1.0);
-            let res_factor = params.float_or("resFactor", 1.0).clamp(0.05, 1.0);
-            let res_rel_x = params.float_or("resRelX", 1.0).clamp(0.1, 4.0);
-            let low_w = (u.resolution[0] * res_factor * res_rel_x)
-                .round()
-                .clamp(8.0, u.resolution[0].max(8.0));
-            let low_h = (u.resolution[1] * res_factor)
-                .round()
-                .clamp(8.0, u.resolution[1].max(8.0));
-            let eff_time = if params.values.contains_key("time") {
-                params.float_or("time", params.time)
+            let raw_res_factor = params.float_or("resFactor", 1.0);
+            let res_rel_x = params.float_or("resRelX", 1.0).clamp(0.1, 8.0);
+            // Zoidium `jpegdamage.js`: `resFactor` in `1..=8` is a downsampling divisor (`lowX = W / (resFactor * resRelX)`).
+            // Retain legacy `< 1.0` multiplier compatibility for older saved presets.
+            let (low_w, low_h, res_factor) = if raw_res_factor >= 1.0 {
+                let rf = raw_res_factor.clamp(1.0, 16.0);
+                let lw = (u.resolution[0] / (rf * res_rel_x))
+                    .round()
+                    .clamp(8.0, u.resolution[0].max(8.0));
+                let lh = (u.resolution[1] / rf)
+                    .round()
+                    .clamp(8.0, u.resolution[1].max(8.0));
+                (lw, lh, rf)
             } else {
-                params.time
+                let rf = raw_res_factor.clamp(0.05, 1.0);
+                let lw = (u.resolution[0] * rf * res_rel_x)
+                    .round()
+                    .clamp(8.0, u.resolution[0].max(8.0));
+                let lh = (u.resolution[1] * rf)
+                    .round()
+                    .clamp(8.0, u.resolution[1].max(8.0));
+                (lw, lh, rf)
+            };
+            let time_mode = params.int_or("timeMode", 1);
+            let manual_time = params.float_or("time", 0.0);
+            let eff_time = if time_mode == 0 {
+                manual_time
+            } else {
+                params.time + manual_time
             };
             u.p0 = [
                 q_norm,
@@ -888,13 +914,16 @@ pub fn pack_effect_uniforms(
             };
             let bs = params.float_or("blockSize", 16.0).clamp(2.0, 128.0);
             let spacing = params.float_or("spacing", 4.0).clamp(1.0, 32.0);
-            let interval = params.float_or("interval", 1.0).max(0.05);
-            let eff_time = if params.values.contains_key("time") {
-                params.float_or("time", params.time)
+            // Zoidium `datamosh.js`: `interval` is in frames (`2..240`, default `30`).
+            let interval_frames = params.float_or("interval", 30.0).max(1.0);
+            let time_mode = params.int_or("timeMode", 1);
+            let manual_time = params.float_or("time", 0.0);
+            let eff_time = if time_mode == 0 {
+                manual_time
             } else {
-                params.time
+                params.time + manual_time
             };
-            let segment = (eff_time / interval).floor();
+            let segment = (params.frame / interval_frames).floor();
             u.mode = motion_mode.clamp(0, 8) as u32;
             u.flags = u32::from(has_aux) | (u32::from(has_aux2) << 1);
             u.p0 = [
@@ -912,7 +941,7 @@ pub fn pack_effect_uniforms(
             u.p2 = [
                 params.float_or("blend", 0.85),
                 params.float_or("threshold", 0.08),
-                interval,
+                interval_frames,
                 params.float_or("samples", 4.0),
             ];
             u.p3 = [bs, spacing, segment, eff_time];
@@ -926,10 +955,26 @@ pub fn pack_effect_uniforms(
             };
             let marker_col = params.vec3_or("markerColor", box_col);
             let line_col = params.vec3_or("lineColor", box_col);
-            let soften = if params.values.contains_key("blur") {
-                params.float_or("blur", 0.08)
+            let blur_raw = if params.values.contains_key("blurStrength") {
+                params.float_or("blurStrength", 5.0).max(0.0)
+            } else if params.values.contains_key("blur") {
+                params.float_or("blur", 0.0).max(0.0)
             } else {
-                params.float_or("soften", 0.08)
+                0.0
+            };
+            let blur_px =
+                if blur_raw > 0.0 && blur_raw <= 1.0 && !params.values.contains_key("blurStrength")
+                {
+                    (blur_raw * 24.0).round().clamp(0.0, 64.0) as u32
+                } else {
+                    blur_raw.round().clamp(0.0, 64.0) as u32
+                };
+            let soften = if params.values.contains_key("soften") {
+                params.float_or("soften", 0.08).clamp(0.0, 1.0)
+            } else if blur_raw > 1.0 {
+                (blur_raw / 60.0).clamp(0.0, 1.0)
+            } else {
+                blur_raw.clamp(0.0, 1.0)
             };
             let raw_thresh = params.float_or("threshold", 0.5);
             let norm_thresh = if raw_thresh > 1.0 {
@@ -945,10 +990,47 @@ pub fn pack_effect_uniforms(
             let box_op = params.float_or("boxOpacity", 1.0);
             let marker_op = params.float_or("markerOpacity", 1.0);
             let line_op = params.float_or("lineOpacity", 0.9);
-            u.c0 = [key[0], key[1], key[2], 1.0];
+            let box_line_w = if params.values.contains_key("boxWidth") {
+                params.float_or("boxWidth", 2.0)
+            } else {
+                params.float_or("boxLineWidth", 2.0)
+            };
+            let line_thick = if params.values.contains_key("lineWidth") {
+                params.float_or("lineWidth", 2.0)
+            } else {
+                params.float_or("lineThickness", 2.0)
+            };
+            let has_fill_op_alias = params.values.contains_key("fillOpacity");
+            let box_fill_op = if has_fill_op_alias {
+                params.float_or("fillOpacity", 0.25).clamp(0.0, 1.0)
+            } else {
+                params.float_or("boxFillOpacity", 0.25).clamp(0.0, 1.0)
+            };
+            let box_fill_default = if has_fill_op_alias && box_fill_op > 1e-4 {
+                1
+            } else {
+                0
+            };
+            let box_fill = params.int_or("boxFill", box_fill_default).clamp(0, 3) as f32;
+            let spline_tension = params.float_or("splineTension", 0.0).clamp(-1.0, 1.0);
+            let max_conn = params.int_or("maxConnections", 2).clamp(1, 4) as u32;
+            let corner_style = params.int_or("cornerStyle", 0).clamp(0, 3) as u32;
+            let min_size_px = params.float_or("minSize", 16.0).round().clamp(4.0, 512.0) as u32;
+            let norm_pct = |v: f32| -> f32 {
+                if v > 1.0 {
+                    (v / 100.0).clamp(0.0, 1.0)
+                } else {
+                    v.clamp(0.0, 1.0)
+                }
+            };
+            u.c0 = [key[0], key[1], key[2], spline_tension];
             u.c1 = [box_col[0], box_col[1], box_col[2], box_op];
             u.c2 = [marker_col[0], marker_col[1], marker_col[2], marker_op];
             u.c3 = [line_col[0], line_col[1], line_col[2], line_op];
+            u.extra = (max_conn & 0xFF)
+                | ((corner_style & 0xF) << 8)
+                | ((min_size_px & 0xFFF) << 12)
+                | ((blur_px & 0xFF) << 24);
             u.p0 = [
                 norm_thresh,
                 soften,
@@ -956,13 +1038,13 @@ pub fn pack_effect_uniforms(
                 params.float_or("opacity", 1.0),
             ];
             u.p1 = [
-                params.float_or("boxLineWidth", 2.0),
+                box_line_w,
                 params.float_or("markerSize", 10.0),
                 params.float_or("markerRotation", 0.0).to_radians(),
                 params.float_or("markerSides", 4.0),
             ];
             u.p2 = [
-                params.float_or("lineThickness", 2.0),
+                line_thick,
                 params.float_or("arrowSize", 10.0),
                 params.float_or("arrowPosition", 0.5),
                 params.int_or("boxShape", 0).clamp(0, 3) as f32,
@@ -970,17 +1052,20 @@ pub fn pack_effect_uniforms(
             let p1_xy = params.vec2_or("point1Pos", [0.25, 0.35]);
             let p2_xy = params.vec2_or("point2Pos", [0.75, 0.35]);
             let p3_xy = params.vec2_or("point3Pos", [0.5, 0.7]);
+            let p4_xy = params.vec2_or("point4Pos", [0.25, 0.75]);
+            let p5_xy = params.vec2_or("point5Pos", [0.75, 0.75]);
+            let p6_xy = params.vec2_or("point6Pos", [0.5, 0.25]);
             u.p3 = [
-                params.float_or("point1X", p1_xy[0]),
-                params.float_or("point1Y", p1_xy[1]),
+                norm_pct(params.float_or("point1X", p1_xy[0])),
+                norm_pct(params.float_or("point1Y", p1_xy[1])),
                 params.float_or("point1Size", 28.0),
-                params.float_or("point2X", p2_xy[0]),
+                norm_pct(params.float_or("point2X", p2_xy[0])),
             ];
             u.p4 = [
-                params.float_or("point2Y", p2_xy[1]),
+                norm_pct(params.float_or("point2Y", p2_xy[1])),
                 params.float_or("point2Size", 28.0),
-                params.float_or("point3X", p3_xy[0]),
-                params.float_or("point3Y", p3_xy[1]),
+                norm_pct(params.float_or("point3X", p3_xy[0])),
+                norm_pct(params.float_or("point3Y", p3_xy[1])),
             ];
             u.p5 = [
                 params.float_or("point3Size", 28.0),
@@ -988,17 +1073,54 @@ pub fn pack_effect_uniforms(
                 params.float_or("dashGap", 6.0),
                 params.int_or("lineType", 0).clamp(0, 3) as f32,
             ];
+            let lbl_dx = if params.values.contains_key("point1LabelDX") {
+                params.float_or("point1LabelDX", 140.0)
+            } else {
+                params.float_or("labelOffsetX", 45.0)
+            };
+            let lbl_dy = if params.values.contains_key("point1LabelDY") {
+                params.float_or("point1LabelDY", -80.0)
+            } else {
+                params.float_or("labelOffsetY", 35.0)
+            };
             u.p6 = [
                 params.int_or("markerShape", 0).clamp(0, 3) as f32,
-                params.int_or("boxFill", 0).clamp(0, 3) as f32,
-                params.float_or("labelOffsetX", 45.0),
-                params.float_or("labelOffsetY", 35.0),
+                box_fill,
+                lbl_dx,
+                lbl_dy,
+            ];
+            // Pack manual points P4..P6 + gridMode / boxFillOpacity / arrowFilled in p7, m0, m1.
+            u.p7 = [
+                norm_pct(params.float_or("point4X", p4_xy[0])),
+                norm_pct(params.float_or("point4Y", p4_xy[1])),
+                params.float_or("point4Size", 28.0),
+                norm_pct(params.float_or("point5X", p5_xy[0])),
+            ];
+            u.m0 = [
+                norm_pct(params.float_or("point5Y", p5_xy[1])),
+                params.float_or("point5Size", 28.0),
+                norm_pct(params.float_or("point6X", p6_xy[0])),
+                norm_pct(params.float_or("point6Y", p6_xy[1])),
+            ];
+            u.m1 = [
+                params.float_or("point6Size", 28.0),
+                box_fill_op,
+                params.float_or("gridOpacity", 0.35).clamp(0.0, 1.0),
+                params.int_or("gridMode", 0).clamp(0, 1) as f32,
             ];
             let show_mask = u32::from(params.bool_or("showMask", false));
             let grid_on =
                 u32::from(params.bool_or("gridEnable", params.bool_or("showGrid", false)));
-            let box_on = u32::from(params.bool_or("boxEnable", true));
-            let lines_on = u32::from(params.bool_or("linesEnable", true));
+            let box_on = u32::from(if params.values.contains_key("showBoxes") {
+                params.bool_or("showBoxes", true)
+            } else {
+                params.bool_or("boxEnable", true)
+            });
+            let lines_on = u32::from(if params.values.contains_key("showLines") {
+                params.bool_or("showLines", true)
+            } else {
+                params.bool_or("linesEnable", true)
+            });
             let arrow_on = u32::from(params.bool_or("arrowEnable", false));
             let labels_on = u32::from(params.bool_or("labelsEnable", false));
             let marker_filled = u32::from(params.bool_or("markerFilled", true));
@@ -1007,6 +1129,9 @@ pub fn pack_effect_uniforms(
             let pt1_on = u32::from(params.bool_or("point1Enable", false));
             let pt2_on = u32::from(params.bool_or("point2Enable", false));
             let pt3_on = u32::from(params.bool_or("point3Enable", false));
+            let pt4_on = u32::from(params.bool_or("point4Enable", false));
+            let pt5_on = u32::from(params.bool_or("point5Enable", false));
+            let pt6_on = u32::from(params.bool_or("point6Enable", false));
             u.flags = show_mask
                 | (grid_on << 1)
                 | (box_on << 2)
@@ -1018,13 +1143,16 @@ pub fn pack_effect_uniforms(
                 | (dash_on << 8)
                 | (pt1_on << 9)
                 | (pt2_on << 10)
-                | (pt3_on << 11);
+                | (pt3_on << 11)
+                | (pt4_on << 12)
+                | (pt5_on << 13)
+                | (pt6_on << 14);
         }
         "ascii" => {
             let cell = if params.values.contains_key("blockSize") {
                 let b = params.float_or("blockSize", 23.0).max(4.0);
-                let c = params.float_or("charSize", 18.0).max(4.0);
-                [c, b]
+                // Square `blockSize × blockSize` grid cells.
+                [b, b]
             } else {
                 params.vec2_or("cellSize", [8.0, 12.0])
             };
@@ -1042,7 +1170,9 @@ pub fn pack_effect_uniforms(
             let bg = match color_mode {
                 2 => params.vec3_or("duotoneDark", params.vec3_or("bgColor", [0.05, 0.05, 0.1])),
                 _ => {
-                    if params.values.contains_key("backgroundColor") {
+                    if params.values.contains_key("background") {
+                        params.vec3_or("background", [0.03, 0.03, 0.04])
+                    } else if params.values.contains_key("backgroundColor") {
                         params.vec3_or("backgroundColor", [0.03, 0.03, 0.04])
                     } else {
                         params.vec3_or("bgColor", [0.0, 0.0, 0.0])
@@ -1051,17 +1181,63 @@ pub fn pack_effect_uniforms(
             };
             let black_col = params.vec3_or("blackColor", [0.15, 0.15, 0.18]);
             let grey_col = params.vec3_or("greyColor", [0.6, 0.6, 0.65]);
-            let charset = match params.values.get("charset") {
+            let mut charset = match params.values.get("charset") {
                 Some(EffectParamValue::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
-                    "dense" | "detailed" => 1.0,
+                    "detailed" | "dense" => 1.0,
                     "blocks" | "shade" => 2.0,
-                    "binary" => 3.0,
+                    "minimal" | "binary" => 3.0,
                     "katakana" | "symbols" => 4.0,
+                    "custom" => 5.0,
                     _ => 0.0,
                 },
-                _ => params.int_or("charset", 0).clamp(0, 4) as f32,
+                _ => params.int_or("charset", 0).clamp(0, 5) as f32,
             };
-            let font_family = params.int_or("fontFamily", 0).clamp(0, 4) as f32;
+            let custom_chars = params.string("customChars").unwrap_or("");
+            let has_non_default_custom = !custom_chars.is_empty() && custom_chars != "@%#*+=-:. ";
+            if has_non_default_custom && !params.values.contains_key("charset") {
+                charset = 5.0;
+            }
+            let font_family = match params.values.get("fontFamily") {
+                Some(EffectParamValue::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                    "bold" | "thick" => 1.0,
+                    "block" | "pixel" => 2.0,
+                    "retro" | "thin" | "crt" => 3.0,
+                    "serif" => 4.0,
+                    _ => 0.0,
+                },
+                _ => params.int_or("fontFamily", 0).clamp(0, 4) as f32,
+            };
+            let rand_scale_raw = params.float_or("randomScale", 0.0);
+            let rand_scale = if rand_scale_raw > 1.5 {
+                rand_scale_raw / 100.0
+            } else {
+                rand_scale_raw
+            };
+            let sine_freq = if params.values.contains_key("sineFrequency") {
+                params.float_or("sineFrequency", 0.1)
+            } else {
+                params.float_or("sineFreq", 1.5)
+            };
+            let sine_int_raw = params.float_or("sineIntensity", 1.0);
+            let sine_int = if sine_int_raw > 1.5 {
+                sine_int_raw / 100.0
+            } else {
+                sine_int_raw
+            };
+            let norm_op = |key: &str, def: f32| -> f32 {
+                let raw = params.float_or(key, def);
+                if raw > 1.0 {
+                    (raw / 100.0).clamp(0.0, 1.0)
+                } else {
+                    raw.clamp(0.0, 1.0)
+                }
+            };
+            let master_op = norm_op("opacity", 1.0);
+            let bg_op = if params.values.contains_key("backgroundOpacity") {
+                norm_op("backgroundOpacity", 1.0)
+            } else {
+                norm_op("bgOpacity", 1.0)
+            };
             u.mode = color_mode;
             u.p0 = [
                 (cell[0] * res_scale[0]).max(2.0),
@@ -1072,14 +1248,14 @@ pub fn pack_effect_uniforms(
             u.p1 = [
                 charset,
                 font_family,
-                params.float_or("randomScale", 0.0),
+                rand_scale,
                 params.float_or("noiseIntensity", 0.0),
             ];
             u.p2 = [
                 params.float_or("sineSpeed", 1.0),
-                params.float_or("sineFreq", 1.5),
+                sine_freq,
                 params.float_or("sineSize", 16.0) * res_scale[1],
-                params.float_or("sineIntensity", 1.0),
+                sine_int,
             ];
             u.p3 = [
                 params.float_or("noiseScale", 1.0),
@@ -1094,29 +1270,51 @@ pub fn pack_effect_uniforms(
                 params.float_or("glitchSpeed", 1.0),
             ];
             u.p5 = [
-                params.float_or("blackOpacity", 1.0),
-                params.float_or("whiteOpacity", 1.0),
-                params.float_or("greyOpacity", 1.0),
-                params.float_or("alphaOpacity", 0.0),
+                norm_op("blackOpacity", 1.0),
+                norm_op("whiteOpacity", 1.0),
+                norm_op("greyOpacity", 1.0),
+                norm_op("alphaOpacity", 0.0),
             ];
-            u.c0 = [fg[0], fg[1], fg[2], 1.0];
-            u.c1 = [bg[0], bg[1], bg[2], 1.0];
+            if charset >= 4.5 {
+                let ramp = if custom_chars.is_empty() {
+                    "@%#*+=-:. "
+                } else {
+                    custom_chars
+                };
+                let (p6, p7, m0, m1) = pack_ascii_custom_ramp_lut(ramp);
+                u.p6 = p6;
+                u.p7 = p7;
+                u.m0 = m0;
+                u.m1 = m1;
+            }
+            u.c0 = [fg[0], fg[1], fg[2], master_op];
+            u.c1 = [bg[0], bg[1], bg[2], bg_op];
             u.c2 = [black_col[0], black_col[1], black_col[2], 1.0];
             u.c3 = [grey_col[0], grey_col[1], grey_col[2], 1.0];
-            let rand_chars = u32::from(params.bool_or("randomChars", false));
+            let rand_chars = u32::from(if params.values.contains_key("randomCharacters") {
+                params.bool_or("randomCharacters", false)
+            } else {
+                params.bool_or("randomChars", false)
+            });
             let sine_on = u32::from(params.bool_or("sineEnable", false));
             let sine_rad = u32::from(params.bool_or("sineRadial", false));
             let noise_on = u32::from(params.bool_or("noiseEnable", false));
-            let noise_turb = u32::from(params.bool_or("noiseTurbulent", false));
+            let noise_turb = u32::from(if params.values.contains_key("noiseType") {
+                params.int_or("noiseType", 0) >= 3
+            } else {
+                params.bool_or("noiseTurbulent", false)
+            });
             let scroll_on = u32::from(params.bool_or("scrollEnable", false));
             let glitch_on = u32::from(params.bool_or("glitchEnable", false));
+            let invert_on = u32::from(params.bool_or("invert", false));
             u.flags = rand_chars
                 | (sine_on << 1)
                 | (sine_rad << 2)
                 | (noise_on << 3)
                 | (noise_turb << 4)
                 | (scroll_on << 5)
-                | (glitch_on << 6);
+                | (glitch_on << 6)
+                | (invert_on << 8);
         }
         "magiclooks" => {
             let sh = params.vec3_or("shadowTint", [1.0, 1.0, 1.0]);
@@ -1145,8 +1343,10 @@ pub fn pack_effect_uniforms(
         "smartmotionblur" => {
             let amt = if params.values.contains_key("amount") {
                 params.float_or("amount", 0.5)
-            } else {
+            } else if params.values.contains_key("blurAmount") {
                 params.float_or("blurAmount", 0.5)
+            } else {
+                params.float_or("strength", 0.5)
             };
             let sens = if params.values.contains_key("sensitivity") {
                 params.float_or("sensitivity", 70.0)
@@ -1166,11 +1366,28 @@ pub fn pack_effect_uniforms(
             } else {
                 params.float_or("vectorSmoothness", 50.0)
             };
-            let quality = params.int_or("quality", 1).clamp(0, 2);
-            let taps = match quality {
-                0 => 8u32,
-                2 => 24u32,
-                _ => 16u32,
+            let taps = if let Some(q_str) = params.string("quality") {
+                match q_str.trim().to_ascii_lowercase().as_str() {
+                    "full" | "high" | "ultra" => 24u32,
+                    "1/2" | "half" | "medium" | "med" => 16u32,
+                    "1/4" | "quarter" => 12u32,
+                    "1/8" | "eighth" | "low" => 8u32,
+                    _ => 16u32,
+                }
+            } else if is_lite_sens {
+                // Zoidium `smart-motion-blur-lite`: 0=Full, 1=1/2, 2=1/4, 3=1/8 (0 is highest quality)
+                match params.int_or("quality", 1).clamp(0, 3) {
+                    0 => 24u32,
+                    1 => 16u32,
+                    2 => 12u32,
+                    _ => 8u32,
+                }
+            } else {
+                match params.int_or("quality", 1).clamp(0, 2) {
+                    0 => 8u32,
+                    2 => 24u32,
+                    _ => 16u32,
+                }
             };
             let shutter_angle = params.float_or("shutterAngle", 180.0).clamp(0.0, 720.0);
             let shutter_phase = params.float_or("shutterPhase", -90.0).clamp(-360.0, 360.0);
@@ -1239,8 +1456,17 @@ pub fn pack_effect_uniforms(
         }
         // 16 Zoidium nativeEffects + helpers
         "timedisplacement" => {
-            let max_disp = params.float_or("maxDisplacement", 1.0);
-            let time_res = params.int_or("timeResolution", 30).clamp(2, 120) as f32;
+            let max_disp = if params.values.contains_key("maxTime") {
+                params.float_or("maxTime", 1.0)
+            } else {
+                params.float_or("maxDisplacement", 1.0)
+            };
+            let time_res = if params.values.contains_key("resolution") {
+                params.int_or("resolution", 16)
+            } else {
+                params.int_or("timeResolution", 30)
+            }
+            .clamp(2, 120) as f32;
             let stretch = u32::from(params.bool_or("stretchMap", true)) as f32;
             let map_scale = params.vec2_or("mapScale", [1.0, 1.0]);
             let map_off = params.vec2_or("mapOffset", [0.0, 0.0]);
@@ -1266,17 +1492,21 @@ pub fn pack_effect_uniforms(
             u.p0 = [wt, fwd, bwd, 0.0];
         }
         "timedifference" => {
-            let contrast = params.float_or("contrast", 100.0);
+            let contrast = params.float_or("contrast", 0.0);
             let gain = (1.0 + contrast / 25.0).max(0.0);
             let offset = params.float_or("offset", 0.04);
-            let abs_diff = u32::from(params.bool_or("absoluteDifference", false));
+            let abs_diff = u32::from(params.bool_or("absoluteDifference", true));
             u.mode = params.int_or("alphaChannel", 0).clamp(0, 8) as u32;
             u.flags = u32::from(has_aux) | (abs_diff << 1);
             u.p0 = [gain, offset, contrast, 0.0];
         }
         "colordiffkey" => {
             let key_raw = params.vec3_or("keyColor", [0.0, 1.0, 0.0]);
-            let accurate = params.int_or("matchingMethod", 0) != 0;
+            let accurate = if params.values.contains_key("colorMatchingAccuracy") {
+                params.int_or("colorMatchingAccuracy", 0) != 0
+            } else {
+                params.int_or("matchingMethod", 0) != 0
+            };
             let kc = if accurate {
                 [
                     srgb_to_linear_cpu(key_raw[0]),
@@ -1315,10 +1545,25 @@ pub fn pack_effect_uniforms(
                 params.float_or("partialBOutBlack", 0.0),
                 params.float_or("partialBOutWhite", 255.0),
             ];
+            let matte_black = if params.values.contains_key("blackLevel") {
+                params.float_or("blackLevel", 0.0)
+            } else {
+                params.float_or("matteInBlack", 0.0)
+            };
+            let matte_white = if params.values.contains_key("whiteLevel") {
+                params.float_or("whiteLevel", 255.0)
+            } else {
+                params.float_or("matteInWhite", 255.0)
+            };
+            let matte_gamma = if params.values.contains_key("gamma") {
+                params.float_or("gamma", 1.0)
+            } else {
+                params.float_or("matteGamma", 1.0)
+            };
             u.p4 = [
-                params.float_or("matteInBlack", 0.0),
-                params.float_or("matteInWhite", 255.0),
-                params.float_or("matteGamma", 1.0),
+                matte_black,
+                matte_white,
+                matte_gamma,
                 params.float_or("matchingSoftness", 0.0) / 100.0,
             ];
         }
@@ -1327,24 +1572,30 @@ pub fn pack_effect_uniforms(
             let (pri, o1, o2) = dominant_channel_triple(key);
             let key_hue = rgb_hue_cpu(key);
             let method = params.int_or("method", 0);
-            let tolerance = if method == 0 {
-                1.0
-            } else {
-                (params.float_or("tolerance", 50.0) / 100.0).clamp(0.0, 1.0)
-            };
-            let spill_range = (params.float_or("spillRange", 50.0) / 100.0).clamp(0.0, 1.0);
             let suppression = (params.float_or("suppression", 100.0) / 100.0).clamp(0.0, 2.0);
-            let luma_corr = if params.values.contains_key("preserveLuminance") {
-                if params.bool_or("preserveLuminance", true) {
-                    1.0
-                } else {
-                    0.0
-                }
+            let (tolerance, spill_range, luma_corr, desat, neutral) = if method == 0 {
+                // Zoidium `advspill.js:158-170`: Standard mode fixes tolerance=1 and zeroes Ultra params.
+                (1.0, 0.0, 0.0, 0.0, 0.0)
             } else {
-                (params.float_or("lumaCorrection", 100.0) / 100.0).clamp(0.0, 2.0)
+                let tol = (params.float_or("tolerance", 50.0) / 100.0).clamp(0.0, 1.0);
+                let sr = (params.float_or("spillRange", 50.0) / 100.0).clamp(0.0, 1.0);
+                let lc = if params.values.contains_key("preserveLuminance") {
+                    if params.bool_or("preserveLuminance", true) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    (params.float_or("lumaCorrection", 0.0) / 100.0).clamp(0.0, 2.0)
+                };
+                let ds = (params.float_or("desaturate", 0.0) / 100.0).clamp(0.0, 1.0);
+                let nt = if params.values.contains_key("spillColorCorrection") {
+                    (params.float_or("spillColorCorrection", 0.0) / 100.0).clamp(0.0, 1.0)
+                } else {
+                    (params.float_or("neutral", 0.0) / 100.0).clamp(0.0, 1.0)
+                };
+                (tol, sr, lc, ds, nt)
             };
-            let desat = (params.float_or("desaturate", 0.0) / 100.0).clamp(0.0, 1.0);
-            let neutral = (params.float_or("neutral", 0.0) / 100.0).clamp(0.0, 1.0);
             u.p0 = [pri as f32, o1 as f32, o2 as f32, key_hue];
             u.p1 = [suppression, spill_range, luma_corr, tolerance];
             u.p2 = [desat, neutral, 0.0, 0.0];
@@ -1352,15 +1603,15 @@ pub fn pack_effect_uniforms(
         "keycleaner" => {
             let rad = params
                 .float_or("additionalEdgeRadius", 10.0)
-                .clamp(0.0, 50.0);
+                .clamp(0.0, 100.0);
             let chatter = f32::from(u8::from(params.bool_or("reduceChatter", false)));
-            let alpha_con_raw = if params.values.contains_key("alphaContrast") {
-                params.float_or("alphaContrast", 100.0)
+            // Zoidium `keycleaner.js:48-74`: `alphaContrast` is `100..500` (100 = neutral 1.0).
+            let contrast = if params.values.contains_key("alphaContrast") {
+                (params.float_or("alphaContrast", 100.0) / 100.0).clamp(0.25, 5.0)
             } else {
-                params.float_or("alphaContrastStrength", 0.0)
+                let raw = params.float_or("alphaContrastStrength", 0.0);
+                1.0 + (raw / 100.0).clamp(0.0, 1.0) * 4.0
             };
-            let alpha_con = (alpha_con_raw / 100.0).clamp(0.0, 1.0);
-            let contrast = 1.0 + alpha_con * 4.0;
             let recover_raw = if params.values.contains_key("strength") {
                 params.float_or("strength", 100.0)
             } else {
@@ -1368,16 +1619,31 @@ pub fn pack_effect_uniforms(
             };
             let recover = (recover_raw / 100.0).clamp(0.0, 1.0);
             let est_sigma = (rad * 0.5).max(0.0);
-            let est_step = (rad / 4.0).max(1.0);
+            let est_step = (est_sigma * 0.75).clamp(1.0, 4.0);
             u.p0 = [chatter, contrast, recover, est_sigma];
-            u.p1 = [est_step, 0.0, 0.0, 0.0];
+            u.p1 = [est_step, rad.clamp(0.0, 24.0), 0.0, 0.0];
         }
         "linearcolorkey" => {
             let key = params.vec3_or("keyColor", [0.0, 0.0, 1.0]);
-            let tol = (params.float_or("matchingTolerance", 10.0) / 100.0).clamp(0.0, 1.0);
-            let soft = (params.float_or("matchingSoftness", 10.0) / 100.0).clamp(0.0, 1.0);
+            let tol_raw = if params.values.contains_key("tolerance") {
+                params.float_or("tolerance", 10.0)
+            } else {
+                params.float_or("matchingTolerance", 10.0)
+            };
+            let soft_raw = if params.values.contains_key("softness") {
+                params.float_or("softness", 10.0)
+            } else {
+                params.float_or("matchingSoftness", 10.0)
+            };
+            let tol = (tol_raw / 100.0).clamp(0.0, 1.0);
+            let soft = (soft_raw / 100.0).clamp(0.0, 1.0);
             let keep = f32::from(u8::from(params.int_or("keyOperation", 0) != 0));
-            let match_mode = params.int_or("matchingColors", 0).clamp(0, 2) as f32;
+            let match_mode = if params.values.contains_key("matchColors") {
+                params.int_or("matchColors", 0)
+            } else {
+                params.int_or("matchingColors", 0)
+            }
+            .clamp(0, 2) as f32;
             u.mode = params.int_or("view", 0).clamp(0, 2) as u32;
             u.c0 = [key[0], key[1], key[2], 1.0];
             u.p0 = [match_mode, tol, soft, keep];
@@ -1385,14 +1651,15 @@ pub fn pack_effect_uniforms(
         "radiowaves" => {
             let prod = params.vec2_or("producerPoint", [0.5, 0.5]);
             let col = params.vec4_or("color", [1.0, 1.0, 1.0, 1.0]);
+            let wave_type = params.int_or("waveType", 0);
             let sides_raw = if params.values.contains_key("polygonSides") {
                 params.int_or("polygonSides", 0)
             } else {
                 params.int_or("sides", 0)
             };
             let is_star = params.bool_or("star", false);
-            // Default `sides = 64` without star represents a smooth circle (`0.0` in shader).
-            let sides = if !is_star && sides_raw >= 64 {
+            // Zoidium `radiowaves.js`: `waveType == 1` (Circle) or `sides >= 64` without star -> smooth circle (`0.0`).
+            let sides = if wave_type == 1 || (!is_star && sides_raw >= 64) {
                 0
             } else {
                 sides_raw.clamp(0, 64)
@@ -1477,8 +1744,8 @@ pub fn pack_effect_uniforms(
             } else {
                 soft_raw.clamp(0.0, 1.0)
             };
-            let t0 = (time01 * (1.0 + len01) - len01).clamp(0.0, 1.0);
-            let t1 = (time01 * (1.0 + len01)).clamp(0.0, 1.0);
+            let t0 = (time01 * (1.0 - len01)).clamp(0.0, 1.0);
+            let t1 = (t0 + len01).clamp(0.0, 1.0);
             let in_col = params.vec3_or("insideColor", [1.0, 1.0, 1.0]);
             let out_col = params.vec3_or("outsideColor", [1.0, 0.15, 0.15]);
             let comp_orig = u32::from(if params.values.contains_key("composite") {
@@ -1500,26 +1767,35 @@ pub fn pack_effect_uniforms(
             ];
         }
         "ccpageturn" => {
-            let fp = params.vec2_or("foldPosition", [0.75, 0.75]);
-            let paper = params.vec3_or("paperColor", [0.85, 0.85, 0.85]);
-            let back_op_raw = params.float_or("backOpacity", 70.0);
+            let fp = params.vec2_or("foldPosition", [0.7, 0.7]);
+            let paper = params.vec3_or("paperColor", [1.0, 1.0, 1.0]);
+            let back_op_raw = if params.values.contains_key("backPageOpacity") {
+                params.float_or("backPageOpacity", 75.0)
+            } else {
+                params.float_or("backOpacity", 75.0)
+            };
             let back_op = if back_op_raw > 1.0 {
                 (back_op_raw / 100.0).clamp(0.0, 1.0)
             } else {
                 back_op_raw.clamp(0.0, 1.0)
+            };
+            let back_src = if params.values.contains_key("backSource") {
+                params.int_or("backSource", 0)
+            } else {
+                params.int_or("backPage", 0)
             };
             u.mode = params.int_or("render", 0).clamp(0, 2) as u32;
             u.c0 = [paper[0], paper[1], paper[2], 1.0];
             u.p0 = [
                 fp[0],
                 fp[1],
-                params.float_or("foldDirection", 135.0),
-                params.float_or("foldRadius", 60.0),
+                params.float_or("foldDirection", 315.0),
+                params.float_or("foldRadius", 20.0),
             ];
             u.p1 = [
-                params.float_or("lightDirection", 45.0),
+                params.float_or("lightDirection", -45.0),
                 back_op,
-                params.int_or("backPage", 0).clamp(0, 1) as f32,
+                back_src.clamp(0, 1) as f32,
                 0.0,
             ];
         }
@@ -1542,13 +1818,19 @@ pub fn pack_effect_uniforms(
             }
             .unsigned_abs()
             .max(1);
+            let tr_raw = params.float_or("timingRandomness", 0.0);
+            let tr01 = if tr_raw > 1.0 {
+                (tr_raw / 100.0).clamp(0.0, 1.0)
+            } else {
+                tr_raw.clamp(0.0, 1.0)
+            };
             u.mode = params.int_or("backLayer", 0).clamp(0, 1) as u32;
             u.extra = seed;
             u.c0 = [back_col[0], back_col[1], back_col[2], 1.0];
             u.p0 = [
                 params.int_or("rows", 8).clamp(1, 200) as f32,
                 params.int_or("columns", 8).clamp(1, 200) as f32,
-                params.float_or("cardScale", 1.0).clamp(0.05, 4.0),
+                params.float_or("cardScale", 1.0).clamp(0.05, 10.0),
                 comp01,
             ];
             u.p1 = [
@@ -1558,10 +1840,10 @@ pub fn pack_effect_uniforms(
                 params.int_or("flipOrder", 0).clamp(0, 8) as f32,
             ];
             u.p2 = [
-                (params.float_or("timingRandomness", 0.0) / 100.0).clamp(0.0, 1.0),
+                tr01,
                 params.float_or("cameraDistance", 2.5).max(1.0),
                 params.float_or("lightIntensity", 1.0).max(0.0),
-                params.float_or("ambientLight", 0.3).clamp(0.0, 1.0),
+                params.float_or("ambientLight", 0.25).clamp(0.0, 2.0),
             ];
         }
         "ccpixelpolly" => {
@@ -1593,7 +1875,11 @@ pub fn pack_effect_uniforms(
         }
         "radialshadow" => {
             let ls = params.vec2_or("lightSource", [0.3, 0.3]);
-            let col = params.vec3_or("shadowColor", [0.0, 0.0, 0.0]);
+            let col = if params.values.contains_key("color") {
+                params.vec3_or("color", [0.0, 0.0, 0.0])
+            } else {
+                params.vec3_or("shadowColor", [0.0, 0.0, 0.0])
+            };
             let op_raw = params.float_or("opacity", 75.0);
             let op01 = if op_raw > 1.0 {
                 (op_raw / 100.0).clamp(0.0, 1.0)
@@ -1623,7 +1909,7 @@ pub fn pack_effect_uniforms(
             let sc = params.vec2_or("scale", [1.0, 1.0]);
             let rot = params.float_or("rotation", 0.0);
             let ud = params.vec3_or("uDisplacement", [1.0, 0.0, 0.0]);
-            let vd = params.vec3_or("vDisplacement", [0.0, 1.0, 0.0]);
+            let vd = params.vec3_or("vDisplacement", [1.0, 0.0, 0.0]);
             let (m0, m1) = compute_overlay_uv_transform(off, sc, rot, u.resolution);
             u.mode = params.int_or("wrap", 2).clamp(0, 2) as u32;
             u.flags = u32::from(has_aux);
@@ -1961,6 +2247,119 @@ pub(crate) fn invert_mat3(m: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
         [c01 * inv_det, c11 * inv_det, c21 * inv_det],
         [c02 * inv_det, c12 * inv_det, c22 * inv_det],
     ])
+}
+
+/// 5x7 bitmap (7 rows of 5-bit MSB-left patterns `0..31`) for ASCII `customChars`.
+fn ascii_char_bitmap_5x7(ch: char) -> [u8; 7] {
+    match ch {
+        ' ' => [0, 0, 0, 0, 0, 0, 0],
+        '.' => [0, 0, 0, 0, 0, 12, 12],
+        ',' => [0, 0, 0, 0, 12, 4, 8],
+        ':' => [0, 12, 12, 0, 12, 12, 0],
+        ';' => [0, 12, 12, 0, 12, 4, 8],
+        '\'' | '`' => [4, 4, 0, 0, 0, 0, 0],
+        '"' => [10, 10, 0, 0, 0, 0, 0],
+        '-' => [0, 0, 0, 14, 0, 0, 0],
+        '_' => [0, 0, 0, 0, 0, 0, 31],
+        '=' => [0, 0, 31, 0, 31, 0, 0],
+        '+' => [0, 4, 4, 31, 4, 4, 0],
+        '*' => [0, 21, 14, 31, 14, 21, 0],
+        '/' => [1, 2, 4, 4, 8, 16, 0],
+        '\\' => [16, 8, 4, 4, 2, 1, 0],
+        '|' => [4, 4, 4, 4, 4, 4, 4],
+        '!' => [4, 4, 4, 4, 4, 0, 4],
+        '?' => [14, 17, 1, 6, 4, 0, 4],
+        '~' => [0, 8, 21, 2, 0, 0, 0],
+        '^' => [4, 10, 17, 0, 0, 0, 0],
+        '<' => [2, 4, 8, 16, 8, 4, 2],
+        '>' => [8, 4, 2, 1, 2, 4, 8],
+        '(' => [2, 4, 8, 8, 8, 4, 2],
+        ')' => [8, 4, 2, 2, 2, 4, 8],
+        '[' => [14, 8, 8, 8, 8, 8, 14],
+        ']' => [14, 2, 2, 2, 2, 2, 14],
+        '{' => [6, 8, 8, 16, 8, 8, 6],
+        '}' => [12, 2, 2, 1, 2, 2, 12],
+        '#' => [10, 31, 10, 10, 31, 10, 10],
+        '%' => [25, 26, 4, 4, 11, 19, 0],
+        '$' => [4, 15, 20, 14, 5, 30, 4],
+        '&' => [12, 18, 20, 8, 21, 18, 13],
+        '@' => [14, 17, 23, 21, 23, 16, 14],
+        '0' => [14, 17, 19, 21, 25, 17, 14],
+        '1' => [4, 12, 4, 4, 4, 4, 14],
+        '2' => [14, 17, 1, 6, 8, 16, 31],
+        '3' => [30, 1, 1, 14, 1, 1, 30],
+        '4' => [2, 6, 10, 18, 31, 2, 2],
+        '5' => [31, 16, 30, 1, 1, 17, 14],
+        '6' => [14, 16, 30, 17, 17, 17, 14],
+        '7' => [31, 1, 2, 4, 8, 8, 8],
+        '8' => [14, 17, 17, 14, 17, 17, 14],
+        '9' => [14, 17, 17, 15, 1, 1, 14],
+        'A' | 'a' => [14, 17, 17, 31, 17, 17, 17],
+        'B' | 'b' => [30, 17, 17, 30, 17, 17, 30],
+        'C' | 'c' => [14, 17, 16, 16, 16, 17, 14],
+        'D' | 'd' => [30, 17, 17, 17, 17, 17, 30],
+        'E' | 'e' => [31, 16, 16, 30, 16, 16, 31],
+        'F' | 'f' => [31, 16, 16, 30, 16, 16, 16],
+        'G' | 'g' => [14, 17, 16, 23, 17, 17, 15],
+        'H' | 'h' => [17, 17, 17, 31, 17, 17, 17],
+        'I' | 'i' => [14, 4, 4, 4, 4, 4, 14],
+        'J' | 'j' => [7, 2, 2, 2, 18, 18, 12],
+        'K' | 'k' => [17, 18, 20, 24, 20, 18, 17],
+        'L' | 'l' => [16, 16, 16, 16, 16, 16, 31],
+        'M' | 'm' => [17, 27, 21, 21, 17, 17, 17],
+        'N' | 'n' => [17, 25, 21, 19, 17, 17, 17],
+        'O' | 'o' => [14, 17, 17, 17, 17, 17, 14],
+        'P' | 'p' => [30, 17, 17, 30, 16, 16, 16],
+        'Q' | 'q' => [14, 17, 17, 17, 21, 18, 13],
+        'R' | 'r' => [30, 17, 17, 30, 20, 18, 17],
+        'S' | 's' => [15, 16, 16, 14, 1, 1, 30],
+        'T' | 't' => [31, 4, 4, 4, 4, 4, 4],
+        'U' | 'u' => [17, 17, 17, 17, 17, 17, 14],
+        'V' | 'v' => [17, 17, 17, 17, 17, 10, 4],
+        'W' | 'w' => [17, 17, 17, 21, 21, 27, 17],
+        'X' | 'x' => [17, 17, 10, 4, 10, 17, 17],
+        'Y' | 'y' => [17, 17, 10, 4, 4, 4, 4],
+        'Z' | 'z' => [31, 1, 2, 4, 8, 16, 31],
+        '\u{2591}' => [21, 0, 21, 0, 21, 0, 21],
+        '\u{2592}' => [21, 10, 21, 10, 21, 10, 21],
+        '\u{2593}' => [31, 21, 31, 21, 31, 21, 31],
+        '\u{2588}' => [31, 31, 31, 31, 31, 31, 31],
+        _ => [14, 17, 21, 21, 21, 17, 14],
+    }
+}
+
+/// Packs up to 8 luminance-band 5x7 glyph bitmaps from `custom_chars` into `(p6, p7, m0, m1)`.
+/// Each band uses two exact-integer `f32`s: `lo` (rows 0..3, 20 bits) and `hi` (rows 4..6, 15 bits).
+pub(crate) fn pack_ascii_custom_ramp_lut(
+    custom_chars: &str,
+) -> ([f32; 4], [f32; 4], [f32; 4], [f32; 4]) {
+    let mut chars: Vec<char> = custom_chars.chars().collect();
+    if chars.is_empty() {
+        chars = " .:-=+*#%@".chars().collect();
+    } else if chars.len() >= 2 && *chars.last().unwrap_or(&' ') == ' ' && chars[0] != ' ' {
+        // Dark-to-bright band mapping: reverse ramps authored dense-to-space (e.g. `"@%#*+=-:. "`).
+        chars.reverse();
+    }
+    let n = chars.len();
+    let mut packed = [(0.0_f32, 0.0_f32); 8];
+    for (band, slot) in packed.iter_mut().enumerate() {
+        let idx = if n <= 1 { 0 } else { (band * (n - 1)) / 7 };
+        let rows = ascii_char_bitmap_5x7(chars[idx]);
+        let lo = u32::from(rows[0] & 31)
+            | (u32::from(rows[1] & 31) << 5)
+            | (u32::from(rows[2] & 31) << 10)
+            | (u32::from(rows[3] & 31) << 15);
+        let hi = u32::from(rows[4] & 31)
+            | (u32::from(rows[5] & 31) << 5)
+            | (u32::from(rows[6] & 31) << 10);
+        *slot = (lo as f32, hi as f32);
+    }
+    (
+        [packed[0].0, packed[0].1, packed[1].0, packed[1].1],
+        [packed[2].0, packed[2].1, packed[3].0, packed[3].1],
+        [packed[4].0, packed[4].1, packed[5].0, packed[5].1],
+        [packed[6].0, packed[6].1, packed[7].0, packed[7].1],
+    )
 }
 
 /// FNV-1a 64-bit hash for deterministic custom WGSL shader pipeline caching.

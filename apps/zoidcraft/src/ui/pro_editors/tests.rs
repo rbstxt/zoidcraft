@@ -420,3 +420,229 @@ fn escape_closes_only_topmost_floating_editor_and_respects_popover_flag() {
     out3.textures_delta.clear();
     assert!(!fw.is_open("pro_node_graph_editor"));
 }
+
+#[test]
+fn effect_setup_prng_presets_and_atomic_undo() {
+    // Exact Zoidium `nextSeed` and deterministic `legacyHash01`.
+    assert_eq!(next_seed(0.0), 7919.0);
+    assert_eq!(next_seed(7919.0), 5838.0);
+    assert_eq!(legacy_hash01(42, 3), legacy_hash01(42, 3));
+    let h = legacy_hash01(7919, 0);
+    assert!((0.0..1.0).contains(&h));
+
+    // Exact preset & enum item counts matching Zoidium.
+    assert_eq!(VHS_PRESETS.len(), 15);
+    assert_eq!(DATAMOSH_PRESETS.len(), 10);
+    assert_eq!(DATAMOSH_ALGORITHM_ITEMS.len(), 81);
+    assert_eq!(DATAMOSH_MOTION_ITEMS.len(), 9);
+
+    let (seed1, vhs_burst1) = compute_vhs_glitch_burst(0.0);
+    let (seed1_b, vhs_burst1_b) = compute_vhs_glitch_burst(0.0);
+    assert_eq!(seed1, 7919.0);
+    assert_eq!(seed1, seed1_b);
+    assert_eq!(vhs_burst1, vhs_burst1_b);
+    assert!(
+        vhs_burst1
+            .iter()
+            .any(|(k, v)| *k == "glitchSeed" && (*v - 7919.0).abs() < 1e-6)
+    );
+
+    let (mosh_seed, mosh_burst) = compute_datamosh_burst(100.0);
+    assert_eq!(mosh_seed, 8019.0);
+    assert_eq!(
+        compute_datamosh_burst(100.0),
+        (mosh_seed, mosh_burst.clone())
+    );
+    assert!(mosh_burst.iter().any(|(k, _)| *k == "algorithm"));
+
+    // Apply VHS preset & Glitch! inside atomic undo steps on a real Session.
+    let mut session = Session::new();
+    let track_id = session.document().video_tracks[0].id.clone();
+    session
+        .execute(zc_session::Command::AddClip {
+            track_id,
+            kind: "scene".into(),
+            start: 0.0,
+            length: 120.0,
+            name: Some("Clip".into()),
+        })
+        .expect("add clip");
+    let clip_id = session.document().video_tracks[0]
+        .clips
+        .last()
+        .expect("clip")
+        .id
+        .clone();
+    session
+        .execute(zc_session::Command::AddEffect {
+            clip_id: clip_id.clone(),
+            kind: "vhs".into(),
+            name: Some("VHS".into()),
+        })
+        .expect("add vhs");
+    let fx_id = session.document().video_tracks[0]
+        .clips
+        .last()
+        .expect("clip")
+        .effects
+        .last()
+        .expect("vhs")
+        .id
+        .clone();
+
+    let broadcast = &VHS_PRESETS[1];
+    let batch: Vec<(String, serde_json::Value)> = broadcast
+        .values
+        .iter()
+        .map(|&(k, v)| (k.to_owned(), serde_json::json!(v)))
+        .collect();
+    apply_effect_batch_tx(&mut session, &fx_id, "Apply VHS preset", &batch, 0.0);
+    let fx = session.document().video_tracks[0]
+        .clips
+        .last()
+        .expect("clip")
+        .effects
+        .last()
+        .expect("vhs");
+    assert_eq!(match_scalar_preset(fx, VHS_PRESETS, 0.0), broadcast.id);
+
+    // Single undo step reverts the entire preset batch.
+    session
+        .execute(zc_session::Command::Undo)
+        .expect("undo vhs preset");
+    let fx_after_undo = session.document().video_tracks[0]
+        .clips
+        .last()
+        .expect("clip")
+        .effects
+        .last()
+        .expect("vhs");
+    assert_ne!(
+        match_scalar_preset(fx_after_undo, VHS_PRESETS, 0.0),
+        broadcast.id
+    );
+}
+
+#[test]
+fn setup_and_scene_designer_windows_render_headlessly_without_panics() {
+    let mut session = Session::new();
+    let track_id = session.document().video_tracks[0].id.clone();
+    session
+        .execute(zc_session::Command::AddClip {
+            track_id,
+            kind: "scene".into(),
+            start: 0.0,
+            length: 120.0,
+            name: Some("Scene".into()),
+        })
+        .expect("add scene clip");
+    let clip_id = session.document().video_tracks[0]
+        .clips
+        .last()
+        .expect("scene clip")
+        .id
+        .clone();
+
+    let mut fx_ids = Vec::new();
+    for (fx_kind, setup_kind) in [
+        ("vhs", EffectSetupKind::Vhs),
+        ("datamosh", EffectSetupKind::Datamosh),
+        ("ascii", EffectSetupKind::Ascii),
+        ("tracery", EffectSetupKind::Tracery),
+    ] {
+        session
+            .execute(zc_session::Command::AddEffect {
+                clip_id: clip_id.clone(),
+                kind: fx_kind.into(),
+                name: Some(fx_kind.into()),
+            })
+            .expect("add effect");
+        let id = session.document().video_tracks[0]
+            .clips
+            .last()
+            .expect("clip")
+            .effects
+            .last()
+            .expect("fx")
+            .id
+            .clone();
+        fx_ids.push((id, setup_kind));
+    }
+
+    let mut obj_ids = Vec::new();
+    for kind in [
+        "zoidium:optical-flares/flare",
+        "zoidium:trapcode-suite/particular",
+        "zoidium:trapcode-suite/form",
+        "zoidium:trapcode-suite/plexus",
+    ] {
+        session
+            .execute(zc_session::Command::AddObject3D {
+                clip_id: clip_id.clone(),
+                kind: kind.into(),
+                name: Some(kind.into()),
+                parent_id: None,
+            })
+            .expect("add object3d");
+        let id = session.document().video_tracks[0]
+            .clips
+            .last()
+            .expect("clip")
+            .objects_3d
+            .last()
+            .expect("obj")
+            .id
+            .clone();
+        obj_ids.push((kind, id));
+    }
+
+    let theme = Cm3Theme::default();
+    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0));
+    let mut fw = FloatingWindowManager::default();
+    let ctx = egui::Context::default();
+
+    // Render all 4 effect setup windows headlessly.
+    for (fx_id, kind) in &fx_ids {
+        let mut st = EffectSetupState::default();
+        st.open_for_effect(*kind, fx_id.clone(), kind.title());
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            show_effect_setup_window(ui.ctx(), viewport, &mut fw, &mut st, &mut session, &theme);
+        });
+        out.textures_delta.clear();
+        assert!(st.open);
+        assert!(fw.is_open(kind.window_id()));
+    }
+
+    // Render Lens Flares Options window headlessly.
+    let mut lf = LensFlareOptionsState::default();
+    lf.open_for_object(obj_ids[0].1.clone(), "Lens Flare");
+    let mut out_lf = ctx.run_ui(egui::RawInput::default(), |ui| {
+        show_lens_flare_options_window(ui.ctx(), viewport, &mut fw, &mut lf, &mut session, &theme);
+    });
+    out_lf.textures_delta.clear();
+    assert!(lf.open);
+    assert!(fw.is_open("pro_lens_flare_options"));
+
+    // Render Particle & Light Designer for Particular, Form, and Plexus.
+    for (idx, pkind) in [
+        (1usize, ParticleDesignerKind::Particular),
+        (2usize, ParticleDesignerKind::Form),
+        (3usize, ParticleDesignerKind::Plexus),
+    ] {
+        let mut pd = ParticleDesignerState::default();
+        pd.open_for_object(pkind, obj_ids[idx].1.clone(), pkind.title());
+        let mut out_pd = ctx.run_ui(egui::RawInput::default(), |ui| {
+            show_particle_designer_window(
+                ui.ctx(),
+                viewport,
+                &mut fw,
+                &mut pd,
+                &mut session,
+                &theme,
+            );
+        });
+        out_pd.textures_delta.clear();
+        assert!(pd.open);
+        assert!(fw.is_open("pro_particle_designer"));
+    }
+}

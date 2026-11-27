@@ -1104,7 +1104,7 @@ fn shape_plus_smart_add_and_property_ordering() {
     );
     assert_eq!(
         shape_plus_string_enum_options("fill", "fillRule"),
-        Some(&["nonzero", "evenodd"][..])
+        Some(&["nonzero", "even-odd"][..])
     );
     assert_eq!(
         shape_plus_string_enum_options("polystar", "mode"),
@@ -1112,11 +1112,11 @@ fn shape_plus_smart_add_and_property_ordering() {
     );
     assert_eq!(
         shape_plus_string_enum_options("trim", "mode"),
-        Some(&["simultaneous", "individually"][..])
+        Some(&["simultaneous", "individual"][..])
     );
     assert_eq!(
         shape_plus_string_enum_options("mergePaths", "mode"),
-        Some(&["add", "subtract", "intersect", "exclude"][..])
+        Some(&["merge", "add", "subtract", "intersect", "exclude"][..])
     );
 
     // Adding a shape at root wraps it in a Group with a default Fill so it is visible
@@ -1441,7 +1441,8 @@ fn default_fps_edit_commits_on_enter_and_when_leaving_settings() {
                     ctx.memory_mut(|m| m.request_focus(PanelsState::default_fps_input_id()));
                 }
                 if visible {
-                    show_settings_tab(ui, rect, &mut session, &mut theme, &mut state);
+                    let mut actions = Vec::new();
+                    show_settings_tab(ui, rect, &mut session, &mut theme, &mut state, &mut actions);
                 }
                 state.commit_default_fps_on_blur(&ctx, &mut session, visible);
             },
@@ -1745,7 +1746,7 @@ fn zoidium_plugin_option_labels_and_opacity_0_100_range() {
     );
     assert_eq!(
         template_option_labels("timecode", "timeSource"),
-        &["Sequence", "Clip", "Custom"]
+        &["Layer Source", "Composition", "Custom"]
     );
     assert_eq!(
         template_option_labels("ccpixelpolly", "object"),
@@ -1760,7 +1761,8 @@ fn zoidium_plugin_option_labels_and_opacity_0_100_range() {
         template_option_labels("echo", "composite"),
         &["over", "behind", "add", "screen", "maximum"]
     );
-    assert_eq!(template_option_labels("datamosh", "algorithm").len(), 13);
+    assert_eq!(template_option_labels("datamosh", "algorithm").len(), 81);
+    assert_eq!(template_option_labels("datamosh", "motion").len(), 9);
 
     // 0..100 opacity / percentage params must NOT clamp to 1.0
     for (fx, key, def) in [

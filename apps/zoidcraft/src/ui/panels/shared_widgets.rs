@@ -1432,13 +1432,17 @@ pub(super) fn show_inspector_floating_windows(
         }
     }
 
-    // 3. Pro Interactive Editor Windows (Node Graph Editor & Color Looks Setup)
+    // 3. Pro Interactive Editor Windows (Node Graph, Color Looks, VHS/Datamosh/ASCII/Tracery,
+    //    Lens Flares Options, Particle & Light Designer)
     show_pro_editor_windows(
         ctx,
         viewport_rect,
         &mut state.floating_windows,
         &mut state.node_graph_editor,
         &mut state.looks_editor,
+        &mut state.effect_setup_editor,
+        &mut state.lens_flare_options,
+        &mut state.particle_designer,
         session,
         theme,
     );

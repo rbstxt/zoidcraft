@@ -2637,7 +2637,7 @@ pub(super) fn clear_property_expression(
     }
 }
 
-fn open_expression_window(
+pub(super) fn open_expression_window(
     target_id: &str,
     prop_key: &str,
     code: String,
@@ -2670,6 +2670,7 @@ pub(super) fn show_stopwatch_context_menu(
     session: &mut Session,
     theme: &Cm3Theme,
     state: &mut PanelsState,
+    actions: &mut Vec<PanelAction>,
 ) {
     let Some(menu) = state.stopwatch_ctx_menu.clone() else {
         return;
@@ -2682,12 +2683,20 @@ pub(super) fn show_stopwatch_context_menu(
             viewport_rect
         }
     };
-    let menu_w = 156.0_f32;
-    let menu_h = if menu.existing_expr.is_some() {
-        84.0
+    let controls: Vec<(String, String)> = session
+        .active_sequence()
+        .controls
+        .iter()
+        .map(|c| (c.name.clone(), c.id.clone()))
+        .collect();
+    let menu_w = 186.0_f32;
+    let base_rows = if menu.existing_expr.is_some() { 4 } else { 3 };
+    let ctl_rows = if controls.is_empty() {
+        0
     } else {
-        58.0
+        controls.len().min(6) + 1
     };
+    let menu_h = 12.0 + (base_rows + ctl_rows) as f32 * 24.0;
     let pos = Pos2::new(
         menu.pos.x.clamp(
             screen.left() + 4.0,
@@ -2702,6 +2711,8 @@ pub(super) fn show_stopwatch_context_menu(
     let mut action_edit_expr = false;
     let mut action_clear_expr = false;
     let mut action_toggle_kf = false;
+    let mut action_show_graph = false;
+    let mut action_link_control: Option<String> = None;
 
     let area_resp = Area::new(Id::unique("stopwatch_ctx_menu"))
         .order(Order::Foreground)
@@ -2763,6 +2774,48 @@ pub(super) fn show_stopwatch_context_menu(
                         action_toggle_kf = true;
                         close_menu = true;
                     }
+                    if ui
+                        .add_sized(
+                            Vec2::new(menu_w - 8.0, 22.0),
+                            egui::Button::new(
+                                egui::RichText::new("Show in Graph Editor")
+                                    .font(theme.font(FONT_SMALL))
+                                    .color(TEXT_PRIMARY),
+                            )
+                            .fill(BG_BUTTON)
+                            .stroke(Stroke::NONE),
+                        )
+                        .clicked()
+                    {
+                        action_show_graph = true;
+                        close_menu = true;
+                    }
+                    if !controls.is_empty() {
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("Link to Control")
+                                .font(theme.font(FONT_COMPACT))
+                                .color(TEXT_MUTED),
+                        );
+                        for (ctl_name, _ctl_id) in controls.iter().take(6) {
+                            if ui
+                                .add_sized(
+                                    Vec2::new(menu_w - 8.0, 20.0),
+                                    egui::Button::new(
+                                        egui::RichText::new(ctl_name)
+                                            .font(theme.font(FONT_COMPACT))
+                                            .color(TEXT_PRIMARY),
+                                    )
+                                    .fill(BG_BUTTON)
+                                    .stroke(Stroke::NONE),
+                                )
+                                .clicked()
+                            {
+                                action_link_control = Some(ctl_name.clone());
+                                close_menu = true;
+                            }
+                        }
+                    }
                 });
         });
 
@@ -2805,6 +2858,19 @@ pub(super) fn show_stopwatch_context_menu(
             target_id: menu.target_id.clone(),
             property: menu.property.clone(),
             frame: normalized_kf_frame(session, menu.local_frame),
+        });
+    } else if action_show_graph {
+        actions.push(PanelAction::OpenGraphForProperty {
+            target_id: menu.target_id.clone(),
+            property: menu.property.clone(),
+        });
+    } else if let Some(ctl_name) = action_link_control {
+        let escaped = ctl_name.replace('\\', "\\\\").replace('"', "\\\"");
+        let expr = format!("control(\"{escaped}\")");
+        let _ = session.execute(Command::SetExpression {
+            target_id: menu.target_id.clone(),
+            property: menu.property.clone(),
+            expression: Some(expr),
         });
     }
 

@@ -1194,3 +1194,256 @@ fn handles_external_missing_assets_effect_groups_shake_and_geometry_plus() {
         PropertyValue::Vec3([1.0, 2.0, 3.0])
     );
 }
+
+#[test]
+fn roundtrips_custom_shader_material_model_torus_knot_light_shadow_and_animated_tracks() {
+    use crate::model::{ModelData, StaticBehavior};
+
+    let mut project = Project::new_cm3_default();
+    let mesh_bytes = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    let mesh_sha = sha256_hex(mesh_bytes);
+    project.assets.insert(
+        mesh_sha.clone(),
+        AssetRecord {
+            id: mesh_sha.clone(),
+            kind: AssetKind::Geometry,
+            source: AssetSource::File,
+            filename: "tri.obj".to_owned(),
+            url: None,
+            external: false,
+            bytes: Some(mesh_bytes.to_vec()),
+            missing: false,
+            sha256: mesh_sha.clone(),
+            size: mesh_bytes.len() as u64,
+            preserved: BTreeMap::new(),
+        },
+    );
+
+    let anim_scalar = |a: f64, b: f64| PropertyTrack {
+        animated: true,
+        expression: None,
+        static_behavior: StaticBehavior::Constant,
+        value: PropertyValue::Number(a),
+        keyframes: vec![
+            PropertyKeyframe::linear(0.0, PropertyValue::Number(a)),
+            PropertyKeyframe::linear(60.0, PropertyValue::Number(b)),
+        ],
+        channels: Vec::new(),
+    };
+
+    let mut shader_box = Object3D::new_shape_3d(
+        "ShaderBox",
+        Shape3DKind::Box {
+            size: [10.0, 10.0, 10.0],
+        },
+    );
+    shader_box.material = Some(MaterialSpec::CustomShader {
+        frag_shader: "void main() { gl_FragColor = vec4(1.0, 0.5, 0.0, 1.0); }".to_owned(),
+        custom_properties: vec![CustomProperty {
+            name: "uMix".to_owned(),
+            prop_type: Some(0),
+            track: anim_scalar(0.2, 0.8),
+            metadata: BTreeMap::new(),
+        }],
+    });
+
+    let mut pbr_box = Object3D::new_shape_3d(
+        "AnimPbrBox",
+        Shape3DKind::Box {
+            size: [8.0, 8.0, 8.0],
+        },
+    );
+    pbr_box.material = Some(MaterialSpec::CustomPbr(Box::new(CustomPbrMaterial {
+        roughness: anim_scalar(0.1, 0.9),
+        metalness: anim_scalar(0.2, 0.85),
+        ..CustomPbrMaterial::default()
+    })));
+
+    let model_obj = Object3D::new(
+        "CustomMesh",
+        Object3DKind::Model(Box::new(ModelData {
+            preset_type: None,
+            asset_id: Some(mesh_sha.clone()),
+            model_properties: BTreeMap::new(),
+        })),
+    );
+
+    let torus_knot = Object3D::new_shape_3d(
+        "Knot",
+        Shape3DKind::TorusKnot {
+            radius: 7.0,
+            tube: 1.8,
+            tubular_segments: 80,
+            radial_segments: 14,
+            p: 3,
+            q: 4,
+        },
+    );
+
+    let mut light_data = LightData::for_kind(LightKind::Spot);
+    light_data.shadow_map_size = 2048;
+    light_data.shadow_bias = 0.0045;
+    let light_obj = Object3D::new("KeyLight", Object3DKind::Light(Box::new(light_data)));
+
+    let cam_obj = Object3D::new(
+        "AnimVibCam",
+        Object3DKind::Camera(Box::new(CameraData {
+            vibrate: Some(CameraVibrateParams {
+                enabled: true,
+                seed: 5,
+                position_amplitude: PropertyTrack::vec3([1.0, 2.0, 3.0]),
+                rotation_amplitude: PropertyTrack::vec3([0.1, 0.2, 0.3]),
+                frequency: anim_scalar(1.5, 4.5),
+                regular_pulse: false,
+                relative: false,
+                enable_position: true,
+                enable_rotation: true,
+                position_frequency: anim_scalar(2.0, 6.0),
+                rotation_frequency: anim_scalar(1.0, 3.0),
+            }),
+            ..CameraData::default()
+        })),
+    );
+
+    let scene_layer = Layer::new_scene_3d(
+        [1920, 1080],
+        vec![
+            shader_box, pbr_box, model_obj, torus_knot, light_obj, cam_obj,
+        ],
+    );
+    let scene_id = scene_layer.id;
+    project.sequence.scene_backdrops.insert(
+        scene_id,
+        SceneBackdrop {
+            mode: 1,
+            color: [0.1, 0.2, 0.3],
+            opacity: anim_scalar(0.25, 0.95),
+        },
+    );
+    project.sequence.layer_masks.insert(
+        scene_id,
+        vec![LayerMask {
+            id: "mask-anim".to_owned(),
+            name: "Animated Mask".to_owned(),
+            enabled: true,
+            mode: MaskMode::Add,
+            invert: false,
+            feather: 8.0,
+            expansion: 0.0,
+            opacity: 1.0,
+            closed: true,
+            locked: false,
+            outline_color: String::new(),
+            vertex_ids: Vec::new(),
+            vertex_modes: BTreeMap::new(),
+            path: PropertyTrack {
+                animated: true,
+                expression: None,
+                static_behavior: StaticBehavior::Constant,
+                value: PropertyValue::Json(json!([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
+                keyframes: vec![
+                    PropertyKeyframe::linear(
+                        0.0,
+                        PropertyValue::Json(json!([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
+                    ),
+                    PropertyKeyframe::linear(
+                        30.0,
+                        PropertyValue::Json(json!([100.0, 50.0, 0.0, 0.0, 0.0, 0.0])),
+                    ),
+                ],
+                channels: Vec::new(),
+            },
+            preserved: BTreeMap::new(),
+        }],
+    );
+    project.sequence.video_tracks[0].clips[0].layer = scene_layer;
+
+    let pz_bytes = export_pz_to_bytes(&project).expect("export roundtrip");
+    let imported = import_pz_from_bytes(&pz_bytes).expect("reimport roundtrip");
+    assert!(
+        imported.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        imported.warnings
+    );
+
+    let rlayer = &imported.project.sequence.video_tracks[0].clips[0].layer;
+    let LayerKind::Scene3D { ref objects, .. } = rlayer.kind else {
+        panic!("expected Scene3D");
+    };
+
+    // 1. CustomShader material round-trip
+    assert!(matches!(
+        objects[0].material,
+        Some(MaterialSpec::CustomShader {
+            ref frag_shader,
+            ref custom_properties,
+        }) if frag_shader.contains("gl_FragColor")
+            && custom_properties.len() == 1
+            && custom_properties[0].name == "uMix"
+            && custom_properties[0].track.keyframes.len() == 2
+    ));
+
+    // 2. Animated CustomPbr roughness & metalness round-trip
+    let Some(MaterialSpec::CustomPbr(ref pbr)) = objects[1].material else {
+        panic!("expected CustomPbr");
+    };
+    assert!(pbr.roughness.animated && pbr.roughness.keyframes.len() == 2);
+    assert_eq!(pbr.roughness.keyframes[1].value, PropertyValue::Number(0.9));
+    assert!(pbr.metalness.animated && pbr.metalness.keyframes.len() == 2);
+    assert_eq!(
+        pbr.metalness.keyframes[1].value,
+        PropertyValue::Number(0.85)
+    );
+
+    // 3. ModelData.asset_id round-trip (remapped back to full SHA-256)
+    let Object3DKind::Model(ref rm) = objects[2].kind else {
+        panic!("expected Model");
+    };
+    assert_eq!(rm.asset_id.as_deref(), Some(mesh_sha.as_str()));
+    assert_eq!(rm.preset_type, None);
+
+    // 4. TorusKnot round-trip
+    assert!(matches!(
+        objects[3].kind,
+        Object3DKind::Shape3D(Shape3DKind::TorusKnot {
+            radius,
+            tube,
+            tubular_segments: 80,
+            radial_segments: 14,
+            p: 3,
+            q: 4,
+        }) if (radius - 7.0).abs() < 1e-9 && (tube - 1.8).abs() < 1e-9
+    ));
+
+    // 5. LightData shadow_map_size & shadow_bias round-trip
+    let Object3DKind::Light(ref rl) = objects[4].kind else {
+        panic!("expected Light");
+    };
+    assert_eq!(rl.shadow_map_size, 2048);
+    assert!((rl.shadow_bias - 0.0045).abs() < 1e-9);
+
+    // 6. CameraVibrateParams animated frequency tracks
+    let Object3DKind::Camera(ref rc) = objects[5].kind else {
+        panic!("expected Camera");
+    };
+    let rvib = rc.vibrate.as_ref().expect("vibrate");
+    assert!(rvib.frequency.animated && rvib.frequency.keyframes.len() == 2);
+    assert_eq!(
+        rvib.frequency.keyframes[1].value,
+        PropertyValue::Number(4.5)
+    );
+    assert!(rvib.position_frequency.animated && rvib.position_frequency.keyframes.len() == 2);
+    assert_eq!(
+        rvib.position_frequency.keyframes[1].value,
+        PropertyValue::Number(6.0)
+    );
+
+    // 7. Animated SceneBackdrop.opacity & LayerMask.path keyframes
+    let rbd = &imported.project.sequence.scene_backdrops[&rlayer.id];
+    assert!(rbd.opacity.animated && rbd.opacity.keyframes.len() == 2);
+    assert_eq!(rbd.opacity.keyframes[1].value, PropertyValue::Number(0.95));
+
+    let rmasks = &imported.project.sequence.layer_masks[&rlayer.id];
+    assert_eq!(rmasks.len(), 1);
+    assert!(rmasks[0].path.animated && rmasks[0].path.keyframes.len() == 2);
+}

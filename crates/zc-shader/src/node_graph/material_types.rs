@@ -1,5 +1,11 @@
 use super::*;
 
+/// Minimum bake resolution (in pixels per side) for `NodeMaterial` procedural maps.
+pub const MIN_NODE_MATERIAL_RES: u32 = 32;
+
+/// Maximum bake resolution (in pixels per side) for `NodeMaterial` procedural maps.
+pub const MAX_NODE_MATERIAL_RES: u32 = 2048;
+
 /// One baked square RGBA8 texture map (`width * height * 4` bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BakedMap {
@@ -20,11 +26,13 @@ pub struct BakedNodeMaterialMaps {
     pub normal: Option<BakedMap>,
     pub bump: Option<BakedMap>,
     pub opacity: Option<BakedMap>,
+    pub fresnel: Option<BakedMap>,
     pub base_color_factor: [f32; 4],
     pub emissive_factor: [f32; 3],
     pub roughness_factor: f32,
     pub metalness_factor: f32,
     pub opacity_factor: f32,
+    pub fresnel_factor: [f32; 3],
     pub normal_strength: f32,
 }
 
@@ -39,11 +47,13 @@ impl Default for BakedNodeMaterialMaps {
             normal: None,
             bump: None,
             opacity: None,
+            fresnel: None,
             base_color_factor: [0.8, 0.8, 0.8, 1.0],
             emissive_factor: [0.0, 0.0, 0.0],
             roughness_factor: 0.5,
             metalness_factor: 0.0,
             opacity_factor: 1.0,
+            fresnel_factor: [0.0, 0.0, 0.0],
             normal_strength: 1.0,
         }
     }

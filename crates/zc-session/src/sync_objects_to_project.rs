@@ -144,7 +144,9 @@ fn sync_material_from_session_with_prefix(
                 pbr.normal_map =
                     prop_str_static(props, kbuf.key("normalMap")).filter(|s| !s.is_empty());
             }
-            if let Some(ns) = prop_f64_static(props, kbuf.key("normalScale")) {
+            if let Some(ns) = prop_f64_static(props, kbuf.key("normalScale"))
+                .or_else(|| prop_vec2_static(props, kbuf.key("normalScale")).map(|v| v[0]))
+            {
                 pbr.normal_scale = ns;
             }
             if let Some(w) = prop_f64_static(props, kbuf.key("wrap")) {
@@ -498,11 +500,65 @@ fn parse_gradient_stops_from_session(
     props: &BTreeMap<String, SessionProperty>,
     key: &str,
 ) -> Option<Vec<zc_project::GradientStop>> {
-    let val = &props.get(key)?.keyframes.first()?.value;
-    if let Some(s) = val.as_str() {
-        return serde_json::from_str::<Vec<zc_project::GradientStop>>(s).ok();
+    let raw_val = &props.get(key)?.keyframes.first()?.value;
+    let parsed: Value = if let Some(s) = raw_val.as_str() {
+        serde_json::from_str::<Value>(s).ok()?
+    } else {
+        raw_val.clone()
+    };
+    let arr = parsed.as_array()?;
+    let mut stops = Vec::with_capacity(arr.len());
+    for item in arr {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let Some(position) = obj
+            .get("position")
+            .or_else(|| obj.get("t"))
+            .or_else(|| obj.get("pos"))
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite())
+        else {
+            continue;
+        };
+        let color_str = if let Some(s) = obj.get("color").and_then(Value::as_str) {
+            Some(s.to_owned())
+        } else if let Some(c) = obj.get("color").and_then(Value::as_array)
+            && c.len() >= 3
+            && let (Some(r), Some(g), Some(b)) = (
+                c[0].as_f64().filter(|v| v.is_finite()),
+                c[1].as_f64().filter(|v| v.is_finite()),
+                c[2].as_f64().filter(|v| v.is_finite()),
+            )
+        {
+            let to_u8 = |ch: f64| -> u8 {
+                if ch > 1.0 {
+                    ch.round().clamp(0.0, 255.0) as u8
+                } else {
+                    (ch * 255.0).round().clamp(0.0, 255.0) as u8
+                }
+            };
+            let a = c
+                .get(3)
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+            Some(format!("rgba({},{},{},{a})", to_u8(r), to_u8(g), to_u8(b)))
+        } else if let Some(v) = obj.get("size").or_else(|| obj.get("value")) {
+            if let Some(n) = v.as_f64().filter(|n| n.is_finite()) {
+                Some(format!("{}", n.max(0.0)))
+            } else {
+                v.as_str().map(ToOwned::to_owned)
+            }
+        } else {
+            None
+        };
+        if let Some(color) = color_str {
+            stops.push(zc_project::GradientStop { position, color });
+        }
     }
-    serde_json::from_value::<Vec<zc_project::GradientStop>>(val.clone()).ok()
+    (!stops.is_empty()).then_some(stops)
 }
 
 pub(crate) fn unique_object_3d_name(existing: &[SessionObject3D], base: &str) -> String {
@@ -898,7 +954,7 @@ fn build_object_3d_from_session(
                 t.spacing = sp.clamp(-200.0, 200.0);
             }
             if let Some(bs) = prop_f64_static(&sobj.properties, "bevelSide") {
-                t.bevel_side = bs.round().clamp(0.0, 1.0) as u32;
+                t.bevel_side = bs.round().clamp(0.0, 2.0) as u32;
             }
             if let Some(bd) = prop_f64_static(&sobj.properties, "bevelDetail") {
                 let raw = bd.round().max(0.0) as u32;
@@ -907,7 +963,7 @@ fn build_object_3d_from_session(
                 }
             }
             if let Some(bp) = prop_f64_static(&sobj.properties, "bevelProfile") {
-                t.bevel_profile = bp.round().clamp(0.0, 1.0) as u32;
+                t.bevel_profile = bp.round().clamp(0.0, 3.0) as u32;
             }
             if let Some(p) = sobj.properties.get("characterIndexOffset") {
                 t.character_index_offset =
@@ -1041,6 +1097,23 @@ fn build_object_3d_from_session(
                 }
                 if let Some(d) = prop_f64_static(&sobj.properties, "path_innerDetail") {
                     *inner_segments = d.round().max(1.0) as u32;
+                }
+                if let Some(raw_closed) = sobj
+                    .properties
+                    .get("path_closed")
+                    .and_then(|p| p.keyframes.first())
+                    .map(|kf| &kf.value)
+                {
+                    let is_closed = raw_closed
+                        .as_bool()
+                        .or_else(|| raw_closed.as_f64().map(|n| n.round() as i64 != 0))
+                        .unwrap_or(false);
+                    if is_closed || obj.preserved.contains_key("property.path_closed") {
+                        obj.preserved.insert(
+                            "property.path_closed".to_owned(),
+                            json!(u32::from(is_closed)),
+                        );
+                    }
                 }
             }
             zc_project::Shape3DKind::CustomGeometry { asset_id } => {
@@ -1451,6 +1524,16 @@ fn build_object_3d_from_session(
             {
                 l.shadow_bias = v.clamp(-1.0, 1.0);
             }
+            if sobj.properties.contains_key("iesProfile") {
+                if let Some(profile) =
+                    prop_str_static(&sobj.properties, "iesProfile").filter(|s| !s.is_empty())
+                {
+                    obj.preserved
+                        .insert("property.iesProfile".to_owned(), Value::String(profile));
+                } else {
+                    obj.preserved.remove("property.iesProfile");
+                }
+            }
         }
         zc_project::Object3DKind::Camera(c) => {
             if let Some(ck) = prop_f64_static(&sobj.properties, "camera.kind") {
@@ -1653,7 +1736,7 @@ fn build_object_3d_from_session(
                 pt.rspread = v;
             }
             if let Some(v) = prop_f64_static(&sobj.properties, "particles.vdist") {
-                pt.vdist = v.round().clamp(0.0, 1.0) as u32;
+                pt.vdist = v.round().clamp(0.0, 2.0) as u32;
             }
             if let Some(v) = prop_vec3_static(&sobj.properties, "particles.ivel") {
                 pt.ivel = v;
@@ -1683,7 +1766,7 @@ fn build_object_3d_from_session(
                 pt.avspread = v;
             }
             if let Some(v) = prop_f64_static(&sobj.properties, "particles.blending") {
-                pt.blending = v.round().clamp(0.0, 1.0) as u32;
+                pt.blending = v.round().clamp(0.0, 3.0) as u32;
             }
             if sobj.properties.contains_key("particles.texture") {
                 pt.texture = prop_str_static(&sobj.properties, "particles.texture")
@@ -1696,11 +1779,17 @@ fn build_object_3d_from_session(
         }
         zc_project::Object3DKind::Group {
             reflection_visibility,
+            custom_properties,
             children: slot,
             ..
         } => {
             if let Some(rv) = prop_f64_static(&sobj.properties, "reflectionVisibility") {
                 *reflection_visibility = rv.round().clamp(0.0, 2.0) as u32;
+            }
+            for cp in custom_properties.iter_mut() {
+                if let Some(prop) = sobj.properties.get(&cp.name) {
+                    cp.track = session_property_to_track(prop, Some(&cp.track));
+                }
             }
             *slot = children;
         }
@@ -1744,6 +1833,22 @@ fn build_object_3d_from_session(
             if pk == "fieldNoiseEvolution" && !sobj.properties.contains_key("fieldEvolution") {
                 obj.preserved
                     .insert("property.fieldEvolution".to_owned(), val);
+            }
+        }
+    } else {
+        // Round-trip edits to any imported legacy custom properties stored under
+        // `obj.preserved["property.<name>"]` on non-plugin 3D objects as well.
+        for (pk, prop) in &sobj.properties {
+            if is_core_object_3d_property(pk) || matches!(pk.as_str(), "path_closed" | "iesProfile")
+            {
+                continue;
+            }
+            let preserved_key = format!("property.{pk}");
+            if obj.preserved.contains_key(&preserved_key) {
+                let val = session_property_to_preserved_value(prop, |p| {
+                    session_property_to_track(p, None)
+                });
+                obj.preserved.insert(preserved_key, val);
             }
         }
     }
@@ -1923,4 +2028,107 @@ fn rebuild_object_tree_node(
         out.push(build_object_3d_from_session(sobj, prev, children));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_session_obj(kind: &str, props: Vec<(&str, Value)>) -> SessionObject3D {
+        let mut properties = BTreeMap::new();
+        for (k, v) in props {
+            properties.insert(k.to_owned(), SessionProperty::static_value(v));
+        }
+        SessionObject3D {
+            id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            parent_id: None,
+            source_id: None,
+            name: format!("Test {kind}"),
+            kind: kind.to_owned(),
+            properties,
+        }
+    }
+
+    #[test]
+    fn particles_color_and_size_over_life_accept_ui_and_legacy_schemas() {
+        // 1. UI schema: {"t", "color": [r,g,b,a]} and {"t", "size": s}
+        let ui_color = json!([
+            { "t": 0.0, "color": [1.0, 0.5, 0.0, 1.0] },
+            { "t": 1.0, "color": [0.0, 0.2, 1.0, 0.25] }
+        ])
+        .to_string();
+        let ui_size = json!([
+            { "t": 0.0, "size": 2.5 },
+            { "t": 0.5, "size": 4.0 },
+            { "t": 1.0, "size": 0.0 }
+        ])
+        .to_string();
+        let sobj = make_session_obj(
+            "particles",
+            vec![
+                ("particles.color", json!(ui_color)),
+                ("particles.size", json!(ui_size)),
+            ],
+        );
+        let obj = build_object_3d_from_session(&sobj, None, Vec::new());
+        let zc_project::Object3DKind::Particles(pt) = obj.kind else {
+            panic!("expected Particles");
+        };
+        assert_eq!(pt.color.len(), 2);
+        assert!((pt.color[0].position - 0.0).abs() < 1e-9);
+        assert_eq!(pt.color[0].color, "rgba(255,128,0,1)");
+        assert!((pt.color[1].position - 1.0).abs() < 1e-9);
+        assert_eq!(pt.color[1].color, "rgba(0,51,255,0.25)");
+
+        assert_eq!(pt.size.len(), 3);
+        assert!((pt.size[1].position - 0.5).abs() < 1e-9);
+        assert_eq!(pt.size[1].color, "4");
+        assert_eq!(pt.size[2].color, "0");
+
+        // 2. Legacy schema: {"position", "color": "#rrggbb"} and {"position", "value": s}
+        let legacy_color = json!([
+            { "position": 0.0, "color": "#ff0000" },
+            { "position": 1.0, "color": "#00ff00" }
+        ])
+        .to_string();
+        let legacy_size = json!([
+            { "position": 0.0, "value": 1.25 },
+            { "position": 1.0, "value": 0.5 }
+        ])
+        .to_string();
+        let sobj_legacy = make_session_obj(
+            "particles",
+            vec![
+                ("particles.color", json!(legacy_color)),
+                ("particles.size", json!(legacy_size)),
+            ],
+        );
+        let obj_legacy = build_object_3d_from_session(&sobj_legacy, None, Vec::new());
+        let zc_project::Object3DKind::Particles(pt2) = obj_legacy.kind else {
+            panic!("expected Particles");
+        };
+        assert_eq!(pt2.color.len(), 2);
+        assert_eq!(pt2.color[0].color, "#ff0000");
+        assert_eq!(pt2.color[1].color, "#00ff00");
+        assert_eq!(pt2.size.len(), 2);
+        assert_eq!(pt2.size[0].color, "1.25");
+        assert_eq!(pt2.size[1].color, "0.5");
+    }
+
+    #[test]
+    fn wire_path_closed_and_light_ies_profile_sync_into_preserved() {
+        let wire_sobj = make_session_obj("wire", vec![("path_closed", json!(1))]);
+        let wire = build_object_3d_from_session(&wire_sobj, None, Vec::new());
+        assert_eq!(wire.preserved.get("property.path_closed"), Some(&json!(1)));
+
+        let light_sobj = make_session_obj(
+            "zoidium:light-plus/ies-light",
+            vec![("iesProfile", json!("ies_asset_sha256"))],
+        );
+        let light = build_object_3d_from_session(&light_sobj, None, Vec::new());
+        assert_eq!(
+            light.preserved.get("property.iesProfile"),
+            Some(&json!("ies_asset_sha256"))
+        );
+    }
 }

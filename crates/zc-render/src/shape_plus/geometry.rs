@@ -1183,6 +1183,15 @@ impl StrokeStyle {
         eval_expr: ExprEval<'_>,
     ) -> Self {
         let get = |k: &str| props.and_then(|p| p.get(k));
+        let get_any = |keys: &[&str]| -> Option<&Value> {
+            let map = props?;
+            for &k in keys {
+                if let Some(v) = map.get(k) {
+                    return Some(v);
+                }
+            }
+            None
+        };
         let cap = match eval_prop_str(get("cap"), frame, "butt")
             .to_ascii_lowercase()
             .as_str()
@@ -1199,41 +1208,130 @@ impl StrokeStyle {
             "bevel" => StrokeJoin::Bevel,
             _ => StrokeJoin::Miter,
         };
-        let dash_pairs = eval_prop_f64(get("dashPairs"), frame, 0.0, eval_expr)
+        let mut dash_pairs = eval_prop_f64(get("dashPairs"), frame, 0.0, eval_expr)
             .round()
             .clamp(0.0, 3.0) as usize;
+        let mut dashes = [
+            eval_prop_f64(get("dash1"), frame, 20.0, eval_expr).max(0.0),
+            eval_prop_f64(get("dash2"), frame, 20.0, eval_expr).max(0.0),
+            eval_prop_f64(get("dash3"), frame, 20.0, eval_expr).max(0.0),
+        ];
+        let mut gaps = [
+            eval_prop_f64(get("gap1"), frame, 10.0, eval_expr).max(0.0),
+            eval_prop_f64(get("gap2"), frame, 10.0, eval_expr).max(0.0),
+            eval_prop_f64(get("gap3"), frame, 10.0, eval_expr).max(0.0),
+        ];
+        if dash_pairs == 0
+            && let Some(dashes_val) = get("dashes")
+        {
+            let mut pattern = eval_dash_array(dashes_val, frame, eval_expr);
+            if !pattern.is_empty() && pattern.iter().any(|&v| v > 0.0) {
+                if !pattern.len().is_multiple_of(2) {
+                    let dup = pattern.clone();
+                    pattern.extend(dup);
+                }
+                let pairs = (pattern.len() / 2).min(3);
+                dash_pairs = pairs;
+                for i in 0..pairs {
+                    dashes[i] = pattern[i * 2].max(0.0);
+                    gaps[i] = pattern[i * 2 + 1].max(0.0);
+                }
+            }
+        }
+        if dash_pairs == 0 {
+            let dash_len = eval_prop_f64(get("dashLength"), frame, 0.0, eval_expr).max(0.0);
+            let dash_gap = eval_prop_f64(get("dashGap"), frame, 0.0, eval_expr).max(0.0);
+            if dash_len > 0.0 {
+                dash_pairs = 1;
+                dashes[0] = dash_len;
+                gaps[0] = if dash_gap > 0.0 { dash_gap } else { dash_len };
+            }
+        }
+
+        let wave_units = eval_prop_str(get("waveUnits"), frame, "cycles");
+        let wave_units_length = wave_units.eq_ignore_ascii_case("length")
+            || wave_units.eq_ignore_ascii_case("pixels")
+            || wave_units.eq_ignore_ascii_case("px");
+        let wavelength_prop = get_any(&["wavelength", "waveLength"]).or_else(|| {
+            props.and_then(|map| {
+                map.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("wavelength"))
+                    .map(|(_, v)| v)
+            })
+        });
+
         Self {
             width: eval_prop_f64(get("width"), frame, 10.0, eval_expr).max(0.0),
             cap,
             join,
             miter_limit: eval_prop_f64(get("miterLimit"), frame, 4.0, eval_expr).max(1.0),
             dash_pairs,
-            dashes: [
-                eval_prop_f64(get("dash1"), frame, 20.0, eval_expr).max(0.0),
-                eval_prop_f64(get("dash2"), frame, 20.0, eval_expr).max(0.0),
-                eval_prop_f64(get("dash3"), frame, 20.0, eval_expr).max(0.0),
-            ],
-            gaps: [
-                eval_prop_f64(get("gap1"), frame, 10.0, eval_expr).max(0.0),
-                eval_prop_f64(get("gap2"), frame, 10.0, eval_expr).max(0.0),
-                eval_prop_f64(get("gap3"), frame, 10.0, eval_expr).max(0.0),
-            ],
+            dashes,
+            gaps,
             dash_offset: eval_prop_f64(get("dashOffset"), frame, 0.0, eval_expr),
-            start_length: eval_prop_f64(get("startLength"), frame, 0.0, eval_expr)
-                .clamp(0.0, 100.0),
-            end_length: eval_prop_f64(get("endLength"), frame, 0.0, eval_expr).clamp(0.0, 100.0),
-            start_width: eval_prop_f64(get("startWidth"), frame, 0.0, eval_expr).max(0.0),
-            end_width: eval_prop_f64(get("endWidth"), frame, 0.0, eval_expr).max(0.0),
-            start_ease: eval_prop_f64(get("startEase"), frame, 0.0, eval_expr).clamp(-100.0, 100.0),
-            end_ease: eval_prop_f64(get("endEase"), frame, 0.0, eval_expr).clamp(-100.0, 100.0),
+            start_length: eval_prop_f64(
+                get_any(&["startLength", "taperStartLength"]),
+                frame,
+                0.0,
+                eval_expr,
+            )
+            .clamp(0.0, 100.0),
+            end_length: eval_prop_f64(
+                get_any(&["endLength", "taperEndLength"]),
+                frame,
+                0.0,
+                eval_expr,
+            )
+            .clamp(0.0, 100.0),
+            start_width: eval_prop_f64(
+                get_any(&["startWidth", "taperStartWidth"]),
+                frame,
+                0.0,
+                eval_expr,
+            )
+            .max(0.0),
+            end_width: eval_prop_f64(
+                get_any(&["endWidth", "taperEndWidth"]),
+                frame,
+                0.0,
+                eval_expr,
+            )
+            .max(0.0),
+            start_ease: eval_prop_f64(
+                get_any(&["startEase", "taperStartEase"]),
+                frame,
+                0.0,
+                eval_expr,
+            )
+            .clamp(-100.0, 100.0),
+            end_ease: eval_prop_f64(get_any(&["endEase", "taperEndEase"]), frame, 0.0, eval_expr)
+                .clamp(-100.0, 100.0),
             wave_amount: eval_prop_f64(get("waveAmount"), frame, 0.0, eval_expr).clamp(0.0, 100.0),
-            wave_units_length: eval_prop_str(get("waveUnits"), frame, "cycles")
-                .eq_ignore_ascii_case("length"),
-            wavelength: eval_prop_f64(get("wavelength"), frame, 100.0, eval_expr).max(0.01),
+            wave_units_length,
+            wavelength: eval_prop_f64(wavelength_prop, frame, 100.0, eval_expr).max(0.01),
             wave_cycles: eval_prop_f64(get("waveCycles"), frame, 3.0, eval_expr).max(0.0),
             wave_phase: eval_prop_f64(get("wavePhase"), frame, 0.0, eval_expr),
         }
     }
+}
+
+fn eval_dash_array(val: &Value, frame: f64, eval_expr: ExprEval<'_>) -> Vec<f64> {
+    if let Some(arr) = val.as_array() {
+        return arr
+            .iter()
+            .map(|item| eval_prop_f64(Some(item), frame, 0.0, eval_expr).max(0.0))
+            .collect();
+    }
+    if let Some(objs) = val.get("objects").and_then(Value::as_array) {
+        return objs
+            .iter()
+            .map(|item| eval_prop_f64(Some(item), frame, 0.0, eval_expr).max(0.0))
+            .collect();
+    }
+    if let Some(inner) = val.get("value") {
+        return eval_dash_array(inner, frame, eval_expr);
+    }
+    Vec::new()
 }
 
 pub(crate) fn stroke_width_at(s: f64, total: f64, style: &StrokeStyle) -> f64 {

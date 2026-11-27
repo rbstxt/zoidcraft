@@ -3905,7 +3905,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -3913,14 +3913,14 @@ dependencies = [
 
 [[package]]
 name = "zc-anim"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "zc-audio"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "cpal",
  "js-sys",
@@ -3929,12 +3929,13 @@ dependencies = [
  "tracing",
  "wasm-bindgen",
  "web-time",
+ "zc-expr",
  "zc-project",
 ]
 
 [[package]]
 name = "zc-color"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "bytemuck",
  "serde",
@@ -3942,7 +3943,7 @@ dependencies = [
 
 [[package]]
 name = "zc-export"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "image",
  "thiserror 2.0.21",
@@ -3953,7 +3954,7 @@ dependencies = [
 
 [[package]]
 name = "zc-expr"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -3962,7 +3963,7 @@ dependencies = [
 
 [[package]]
 name = "zc-geom"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "glam",
  "serde",
@@ -3970,7 +3971,7 @@ dependencies = [
 
 [[package]]
 name = "zc-plugin"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -3979,7 +3980,7 @@ dependencies = [
 
 [[package]]
 name = "zc-project"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "flate2",
  "serde",
@@ -3992,7 +3993,7 @@ dependencies = [
 
 [[package]]
 name = "zc-render"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "bytemuck",
  "image",
@@ -4017,7 +4018,7 @@ dependencies = [
 
 [[package]]
 name = "zc-scene"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "bytemuck",
  "lyon_tessellation",
@@ -4028,7 +4029,7 @@ dependencies = [
 
 [[package]]
 name = "zc-session"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -4042,7 +4043,7 @@ dependencies = [
 
 [[package]]
 name = "zc-shader"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "naga",
  "serde",
@@ -4052,7 +4053,7 @@ dependencies = [
 
 [[package]]
 name = "zc-time"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -4092,7 +4093,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zoidcraft"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "eframe",
  "egui",
@@ -4123,7 +4124,7 @@ dependencies = [
 
 [[package]]
 name = "zoidcraft-cli"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "clap",
  "image",

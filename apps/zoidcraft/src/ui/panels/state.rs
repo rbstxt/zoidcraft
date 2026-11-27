@@ -298,6 +298,7 @@ pub struct RecoverySnapshotInfo {
 pub struct ExportStatus {
     pub ffmpeg_available: bool,
     pub ffmpeg_version: String,
+    pub ffmpeg_resolved_path: Option<String>,
     pub exporting: bool,
     /// Progress fraction in `0.0..=1.0`.
     pub progress: f32,
@@ -315,6 +316,7 @@ impl Default for ExportStatus {
         Self {
             ffmpeg_available: true,
             ffmpeg_version: "ready (probe on export)".to_owned(),
+            ffmpeg_resolved_path: None,
             exporting: false,
             progress: 0.0,
             status_message: String::new(),
@@ -333,6 +335,12 @@ pub struct AppSettings {
     pub undo_max_entries: usize,
     pub undo_max_mib: usize,
     pub show_fps_overlay: bool,
+    /// Optional user-selected `ffmpeg` executable path (`None` = auto-detect).
+    pub ffmpeg_path: Option<String>,
+    /// Optional user-selected `ffprobe` executable path (`None` = auto-detect / sibling).
+    pub ffprobe_path: Option<String>,
+    /// Suppresses the non-blocking startup FFmpeg setup banner when `true`.
+    pub ffmpeg_setup_dismissed: bool,
 }
 
 impl Default for AppSettings {
@@ -343,6 +351,9 @@ impl Default for AppSettings {
             undo_max_entries: 200,
             undo_max_mib: 64,
             show_fps_overlay: true,
+            ffmpeg_path: None,
+            ffprobe_path: None,
+            ffmpeg_setup_dismissed: false,
         }
     }
 }
@@ -379,6 +390,14 @@ pub enum PanelAction {
     CancelExport,
     #[cfg(not(target_arch = "wasm32"))]
     OpenOutputFolder(PathBuf),
+    #[cfg(not(target_arch = "wasm32"))]
+    OpenFfmpegSetup,
+    #[cfg(not(target_arch = "wasm32"))]
+    BrowseFfmpegBinary,
+    #[cfg(not(target_arch = "wasm32"))]
+    ClearFfmpegBinary,
+    #[cfg(not(target_arch = "wasm32"))]
+    ReprobeFfmpeg,
     #[cfg(not(target_arch = "wasm32"))]
     SaveRecoverySnapshotNow,
     #[cfg(not(target_arch = "wasm32"))]
@@ -471,6 +490,14 @@ pub struct PanelsState {
     pub export_queue: Vec<ExportQueueJob>,
     pub export_queue_running: bool,
     pub export_view_mode: Option<ExportMode>,
+    /// Single-frame image format: `0 = PNG`, `1 = JPG`, `2 = WebP`.
+    pub export_frame_format: usize,
+    /// Aspect-ratio mismatch fit mode: `0 = Stretch`, `1 = Crop`, `2 = Black fill`.
+    pub export_aspect_mode: usize,
+    /// Latest live export preview thumbnail `(width, height, straight RGBA8)` updated during export.
+    pub export_preview_rgba: Option<(u32, u32, Vec<u8>)>,
+    /// Asset Manager sort mode: `0 = Name`, `1 = Size`, `2 = Usage`, `3 = Type`.
+    pub assets_sort_mode: usize,
     pub recovery_snapshots: Vec<RecoverySnapshotInfo>,
     pub app_settings: AppSettings,
     pub plugin_notice: Option<String>,
@@ -481,6 +508,9 @@ pub struct PanelsState {
     pub pending_project_actions: Vec<ProjectAction>,
     pub node_graph_editor: NodeGraphEditorState,
     pub looks_editor: LooksEditorState,
+    pub effect_setup_editor: EffectSetupState,
+    pub lens_flare_options: LensFlareOptionsState,
+    pub particle_designer: ParticleDesignerState,
     pub(super) object_drag: Option<TreeDragState>,
     pub(super) effect_drag: Option<TreeDragState>,
     pub(super) rename_state: Option<InlineRenameState>,
@@ -560,6 +590,10 @@ impl Default for PanelsState {
             export_queue: Vec::new(),
             export_queue_running: false,
             export_view_mode: None,
+            export_frame_format: 0,
+            export_aspect_mode: 0,
+            export_preview_rgba: None,
+            assets_sort_mode: 0,
             recovery_snapshots: Vec::new(),
             app_settings: AppSettings::default(),
             plugin_notice: None,
@@ -570,6 +604,9 @@ impl Default for PanelsState {
             pending_project_actions: Vec::new(),
             node_graph_editor: NodeGraphEditorState::default(),
             looks_editor: LooksEditorState::default(),
+            effect_setup_editor: EffectSetupState::default(),
+            lens_flare_options: LensFlareOptionsState::default(),
+            particle_designer: ParticleDesignerState::default(),
             object_drag: None,
             effect_drag: None,
             rename_state: None,

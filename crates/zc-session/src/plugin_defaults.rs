@@ -90,6 +90,20 @@ pub(crate) fn is_3d_container_kind(kind: &str) -> bool {
         || is_3d_expresstext_plus_kind(kind)
 }
 
+/// Returns `true` for Geometry+ custom procedural shapes stored via preserved plugin properties
+/// (`lathe`, `superquadric`).
+#[must_use]
+pub(crate) fn is_3d_geometry_plus_custom_kind(kind: &str) -> bool {
+    let low = kind.trim().to_ascii_lowercase().replace('_', "-");
+    matches!(
+        low.as_str(),
+        "zoidium:geometry-plus/lathe"
+            | "zoidcraft:geometry-plus/lathe"
+            | "zoidium:geometry-plus/superquadric"
+            | "zoidcraft:geometry-plus/superquadric"
+    )
+}
+
 /// Returns `true` for plugin 3D objects whose custom parameters live in `Object3D.preserved["property.*"]`.
 #[must_use]
 pub(crate) fn uses_preserved_plugin_properties(kind: &str) -> bool {
@@ -98,6 +112,7 @@ pub(crate) fn uses_preserved_plugin_properties(kind: &str) -> bool {
         || is_3d_expresstext_plus_kind(kind)
         || is_3d_optical_flare_kind(kind)
         || is_3d_trapcode_kind(kind)
+        || is_3d_geometry_plus_custom_kind(kind)
 }
 
 /// Normalizes a 3D plugin object kind to its canonical hyphenated Zoidium ID while
@@ -128,6 +143,7 @@ pub(crate) fn canonicalize_object_3d_kind(raw: &str) -> (String, Option<u32>) {
                     "grid" | "grid-repeater" => "grid",
                     "twist" => "twist",
                     "warp" => "warp",
+                    "shear" => "shear",
                     "voronoi-fracture" | "fracture" => "voronoi-fracture",
                     "plain" | "plain-effector" => "plain",
                     "delay" | "delay-effector" => "delay",
@@ -149,6 +165,8 @@ pub(crate) fn canonicalize_object_3d_kind(raw: &str) -> (String, Option<u32>) {
                 "helix" => return ("zoidium:geometry-plus/helix".to_owned(), None),
                 "spline" => return ("zoidium:geometry-plus/spline".to_owned(), None),
                 "torus-knot" => return ("zoidium:geometry-plus/torus-knot".to_owned(), None),
+                "lathe" => return ("zoidium:geometry-plus/lathe".to_owned(), None),
+                "superquadric" => return ("zoidium:geometry-plus/superquadric".to_owned(), None),
                 other => return (format!("zoidium:geometry-plus/{other}"), None),
             },
             "camera-plus" => match sub.as_str() {
@@ -366,6 +384,10 @@ pub(crate) fn insert_default_field_properties(props: &mut BTreeMap<String, Sessi
         "fieldNoiseEvolution".to_owned(),
         SessionProperty::static_value(json!(0.0)),
     );
+    props.insert(
+        "fieldNoiseSpeed".to_owned(),
+        SessionProperty::static_value(json!(0.0)),
+    );
 }
 
 /// Inserts default properties for all 9 Repeater & Effector+ classes (never adding PBR material).
@@ -531,7 +553,7 @@ pub(crate) fn insert_default_repeater_properties(
         }
         "zoidium:repeater/warp" => {
             props.insert(
-                "strength".to_owned(),
+                "amount".to_owned(),
                 SessionProperty::static_value(json!(0.0)),
             );
             props.insert(
@@ -544,11 +566,49 @@ pub(crate) fn insert_default_repeater_properties(
             );
             props.insert(
                 "subdivision".to_owned(),
-                SessionProperty::static_value(json!(1)),
+                SessionProperty::static_value(json!(4)),
+            );
+            insert_default_field_properties(props);
+        }
+        "zoidium:repeater/shear" => {
+            props.insert(
+                "axis".to_owned(),
+                SessionProperty::static_value_with_kind(json!(1), SessionValueKind::Option),
+            );
+            props.insert(
+                "direction".to_owned(),
+                SessionProperty::static_value_with_kind(json!(0), SessionValueKind::Option),
+            );
+            props.insert(
+                "subdivision".to_owned(),
+                SessionProperty::static_value(json!(4)),
+            );
+            props.insert(
+                "amount".to_owned(),
+                SessionProperty::static_value(json!(0.0)),
+            );
+            props.insert(
+                "pivot".to_owned(),
+                SessionProperty::static_value_with_kind(
+                    json!([0.0, 0.0, 0.0]),
+                    SessionValueKind::Vec3,
+                ),
             );
             insert_default_field_properties(props);
         }
         "zoidium:repeater/voronoi-fracture" => {
+            props.insert(
+                "fractureMode".to_owned(),
+                SessionProperty::static_value_with_kind(json!(0), SessionValueKind::Option),
+            );
+            props.insert(
+                "characters".to_owned(),
+                SessionProperty::static_value_with_kind(json!(""), SessionValueKind::Text),
+            );
+            props.insert(
+                "invertCharacters".to_owned(),
+                SessionProperty::static_value_with_kind(json!(0), SessionValueKind::Option),
+            );
             props.insert("cells".to_owned(), SessionProperty::static_value(json!(24)));
             props.insert("seed".to_owned(), SessionProperty::static_value(json!(1)));
             props.insert(
@@ -580,7 +640,7 @@ pub(crate) fn insert_default_repeater_properties(
             );
             props.insert("spin".to_owned(), SessionProperty::static_value(json!(0.0)));
             props.insert(
-                "direction".to_owned(),
+                "fragmentDirection".to_owned(),
                 SessionProperty::static_value_with_kind(
                     json!([0.0, 0.0, 0.0]),
                     SessionValueKind::Vec3,
@@ -607,7 +667,7 @@ pub(crate) fn insert_default_repeater_properties(
             );
             props.insert(
                 "colors".to_owned(),
-                SessionProperty::static_value_with_kind(json!(0), SessionValueKind::Option),
+                SessionProperty::static_value_with_kind(json!(1), SessionValueKind::Option),
             );
             insert_default_field_properties(props);
         }
@@ -654,11 +714,11 @@ pub(crate) fn insert_default_repeater_properties(
             );
             props.insert(
                 "springDamping".to_owned(),
-                SessionProperty::static_value(json!(0.25)),
+                SessionProperty::static_value(json!(3.0)),
             );
             props.insert(
                 "springCycles".to_owned(),
-                SessionProperty::static_value(json!(2.0)),
+                SessionProperty::static_value(json!(1.0)),
             );
         }
         _ => {}
@@ -752,37 +812,32 @@ pub(crate) fn insert_default_text_plus_properties(
         }
         "zoidium:text-plus/character-shake" => {
             props.insert(
-                "strength".to_owned(),
-                SessionProperty::static_value(json!(1.0)),
+                "shakeAmplitude".to_owned(),
+                SessionProperty::static_value(json!(0.25)),
             );
             props.insert(
-                "frequency".to_owned(),
-                SessionProperty::static_value(json!(4.0)),
+                "shakePeriod".to_owned(),
+                SessionProperty::static_value(json!(24.0)),
             );
             props.insert(
-                "stagger".to_owned(),
-                SessionProperty::static_value(json!(0.35)),
+                "shakePhase".to_owned(),
+                SessionProperty::static_value(json!(0.0)),
             );
             props.insert(
-                "positionAmplitude".to_owned(),
-                SessionProperty::static_value_with_kind(
-                    json!([0.0, 0.0, 0.0]),
-                    SessionValueKind::Vec3,
-                ),
+                "shakeAxis".to_owned(),
+                SessionProperty::static_value(json!(2)),
             );
             props.insert(
-                "rotationAmplitude".to_owned(),
-                SessionProperty::static_value_with_kind(
-                    json!([0.0, 0.0, 0.0]),
-                    SessionValueKind::Vec3,
-                ),
+                "shakeDelayPerCharacter".to_owned(),
+                SessionProperty::static_value(json!(0.0)),
             );
             props.insert(
-                "scaleAmplitude".to_owned(),
-                SessionProperty::static_value_with_kind(
-                    json!([0.0, 0.0, 0.0]),
-                    SessionValueKind::Vec3,
-                ),
+                "shakeDelayOrder".to_owned(),
+                SessionProperty::static_value(json!(0)),
+            );
+            props.insert(
+                "shakeRandomSeed".to_owned(),
+                SessionProperty::static_value(json!(1)),
             );
         }
         "zoidium:text-plus/selected-transform" => {
@@ -818,41 +873,36 @@ pub(crate) fn insert_default_text_plus_properties(
         }
         "zoidium:text-plus/selected-shake" => {
             props.insert(
-                "strength".to_owned(),
-                SessionProperty::static_value(json!(1.0)),
-            );
-            props.insert(
                 "characterNumbers".to_owned(),
                 SessionProperty::static_value_with_kind(json!("1"), SessionValueKind::Text),
             );
             props.insert(
-                "frequency".to_owned(),
-                SessionProperty::static_value(json!(4.0)),
+                "shakeAmplitude".to_owned(),
+                SessionProperty::static_value(json!(0.25)),
             );
             props.insert(
-                "stagger".to_owned(),
-                SessionProperty::static_value(json!(0.35)),
+                "shakePeriod".to_owned(),
+                SessionProperty::static_value(json!(24.0)),
             );
             props.insert(
-                "positionAmplitude".to_owned(),
-                SessionProperty::static_value_with_kind(
-                    json!([0.0, 0.0, 0.0]),
-                    SessionValueKind::Vec3,
-                ),
+                "shakePhase".to_owned(),
+                SessionProperty::static_value(json!(0.0)),
             );
             props.insert(
-                "rotationAmplitude".to_owned(),
-                SessionProperty::static_value_with_kind(
-                    json!([0.0, 0.0, 0.0]),
-                    SessionValueKind::Vec3,
-                ),
+                "shakeAxis".to_owned(),
+                SessionProperty::static_value(json!(2)),
             );
             props.insert(
-                "scaleAmplitude".to_owned(),
-                SessionProperty::static_value_with_kind(
-                    json!([0.0, 0.0, 0.0]),
-                    SessionValueKind::Vec3,
-                ),
+                "shakeDelayPerCharacter".to_owned(),
+                SessionProperty::static_value(json!(0.0)),
+            );
+            props.insert(
+                "shakeDelayOrder".to_owned(),
+                SessionProperty::static_value(json!(0)),
+            );
+            props.insert(
+                "shakeRandomSeed".to_owned(),
+                SessionProperty::static_value(json!(1)),
             );
         }
         "zoidium:text-plus/random-scatter" => {
@@ -1329,6 +1379,8 @@ pub(crate) const PBR_PLUS_SURFACE_KEYS: &[&str] = &[
     "rampFactor",
     "rampSource",
     "ramp",
+    "rampColorA",
+    "rampColorB",
     "bumpNoise",
     "bumpStrength",
     "bumpNoiseScale",
@@ -1378,15 +1430,136 @@ pub(crate) fn session_property_to_preserved_value(
     }
 }
 
+/// Inserts default properties for Geometry+ Lathe and Superquadric procedural shapes
+/// without overwriting any already-loaded property values.
+pub(crate) fn insert_default_geometry_plus_properties(
+    canonical_kind: &str,
+    props: &mut BTreeMap<String, SessionProperty>,
+) {
+    match canonical_kind {
+        "zoidium:geometry-plus/lathe" => {
+            props.entry("lathe.points".to_owned()).or_insert_with(|| {
+                SessionProperty::static_value_with_kind(
+                    json!([
+                        [0.0, -10.0],
+                        [6.0, -10.0],
+                        [8.0, -4.0],
+                        [4.0, 2.0],
+                        [7.0, 10.0],
+                        [0.0, 10.0]
+                    ]),
+                    SessionValueKind::Json,
+                )
+            });
+            props
+                .entry("lathe.segments".to_owned())
+                .or_insert_with(|| SessionProperty::static_value(json!(24)));
+            props
+                .entry("lathe.phiStart".to_owned())
+                .or_insert_with(|| SessionProperty::static_value(json!(0.0)));
+            props
+                .entry("lathe.phiLength".to_owned())
+                .or_insert_with(|| SessionProperty::static_value(json!(360.0)));
+            props.entry("lathe.shading".to_owned()).or_insert_with(|| {
+                SessionProperty::static_value_with_kind(json!(0), SessionValueKind::Option)
+            });
+        }
+        "zoidium:geometry-plus/superquadric" => {
+            props
+                .entry("superquadric.radius".to_owned())
+                .or_insert_with(|| {
+                    SessionProperty::static_value_with_kind(
+                        json!([10.0, 10.0, 10.0]),
+                        SessionValueKind::Vec3,
+                    )
+                });
+            props
+                .entry("superquadric.eastWest".to_owned())
+                .or_insert_with(|| SessionProperty::static_value(json!(1.0)));
+            props
+                .entry("superquadric.northSouth".to_owned())
+                .or_insert_with(|| SessionProperty::static_value(json!(1.0)));
+            props
+                .entry("superquadric.uSegments".to_owned())
+                .or_insert_with(|| SessionProperty::static_value(json!(32)));
+            props
+                .entry("superquadric.vSegments".to_owned())
+                .or_insert_with(|| SessionProperty::static_value(json!(24)));
+            props
+                .entry("superquadric.shading".to_owned())
+                .or_insert_with(|| {
+                    SessionProperty::static_value_with_kind(json!(0), SessionValueKind::Option)
+                });
+        }
+        _ => {}
+    }
+}
+
 /// Returns `true` if a `SessionObject3D.properties` key is a built-in core/material/constraint
 /// key rather than a plugin `preserved["property.*"]` key.
 #[must_use]
 pub(crate) fn is_core_object_3d_property(key: &str) -> bool {
     matches!(
         key,
-        "enabled" | "position" | "rotation" | "scale" | "eulerOrder" | "reflectionVisibility"
+        "enabled"
+            | "position"
+            | "rotation"
+            | "scale"
+            | "eulerOrder"
+            | "reflectionVisibility"
+            | "zoidiumShadowMode"
+            | "shadowMode"
     ) || key.starts_with("material.")
         || key.starts_with("frontMaterial.")
         || key.starts_with("sideMaterial.")
         || key.starts_with("constraint.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn geometry_plus_lathe_superquadric_and_voronoi_defaults_are_populated() {
+        assert_eq!(
+            canonicalize_object_3d_kind("zoidcraft:geometry-plus/lathe"),
+            ("zoidium:geometry-plus/lathe".to_owned(), None)
+        );
+        assert_eq!(
+            canonicalize_object_3d_kind("zoidium:geometry_plus/superquadric"),
+            ("zoidium:geometry-plus/superquadric".to_owned(), None)
+        );
+        assert!(uses_preserved_plugin_properties(
+            "zoidium:geometry-plus/lathe"
+        ));
+        assert!(uses_preserved_plugin_properties(
+            "zoidium:geometry-plus/superquadric"
+        ));
+
+        let mut lathe_props = BTreeMap::new();
+        insert_default_geometry_plus_properties("zoidium:geometry-plus/lathe", &mut lathe_props);
+        assert!(lathe_props.contains_key("lathe.points"));
+        assert_eq!(lathe_props["lathe.segments"].default_value, json!(24));
+        assert_eq!(lathe_props["lathe.phiLength"].default_value, json!(360.0));
+
+        let mut sq_props = BTreeMap::new();
+        insert_default_geometry_plus_properties(
+            "zoidium:geometry-plus/superquadric",
+            &mut sq_props,
+        );
+        assert_eq!(
+            sq_props["superquadric.radius"].default_value,
+            json!([10.0, 10.0, 10.0])
+        );
+        assert_eq!(sq_props["superquadric.eastWest"].default_value, json!(1.0));
+        assert_eq!(
+            sq_props["superquadric.northSouth"].default_value,
+            json!(1.0)
+        );
+
+        let mut voronoi_props = BTreeMap::new();
+        insert_default_repeater_properties("zoidium:repeater/voronoi-fracture", &mut voronoi_props);
+        assert_eq!(voronoi_props["fractureMode"].default_value, json!(0));
+        assert_eq!(voronoi_props["fieldNoiseSpeed"].default_value, json!(0.0));
+    }
 }

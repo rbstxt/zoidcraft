@@ -989,15 +989,16 @@ fn dm_tex_coord(p: vec2<f32>, res: vec2<f32>) -> vec2<f32> {
 
 fn dm_block_cost(blk: vec2<f32>, off: vec2<f32>, bs: f32, res: vec2<f32>) -> f32 {
     var sum = 0.0;
-    for (var gy: i32 = 0; gy < 2; gy = gy + 1) {
-        for (var gx: i32 = 0; gx < 2; gx = gx + 1) {
-            let p = blk * bs + (vec2<f32>(f32(gx), f32(gy)) + vec2<f32>(0.5)) * (bs * 0.5);
-            let a = luma601(unpremultiply(sample_diffuse(dm_tex_coord(p, res))));
-            let b = luma601(unpremultiply(sample_aux(dm_tex_coord(p - off, res))));
-            sum = sum + abs(a - b);
+    for (var gy: i32 = 0; gy < 3; gy = gy + 1) {
+        for (var gx: i32 = 0; gx < 3; gx = gx + 1) {
+            let p = blk * bs + (vec2<f32>(f32(gx), f32(gy)) + vec2<f32>(0.5)) * (bs / 3.0);
+            let ca = sample_diffuse(dm_tex_coord(p, res));
+            let cb = sample_aux(dm_tex_coord(p - off, res));
+            let d = abs(ca - cb);
+            sum = sum + dot(d.rgb, vec3<f32>(0.299, 0.587, 0.114)) + d.a * 0.4;
         }
     }
-    return sum;
+    return sum / 9.0;
 }
 
 fn dm_transform_motion(total: vec2<f32>, blk: vec2<f32>, p: vec2<f32>, res: vec2<f32>) -> vec2<f32> {
@@ -1045,25 +1046,63 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let has_aux = (u.flags & 1u) != 0u;
     let has_motion = (u.flags & 2u) != 0u;
 
-    // Pass 0: Macroblock SAD motion estimation into coarse Rgba16Float grid
+    // Pass 0: Multi-scale coarse-to-fine macroblock SAD motion estimation (up to +-32px)
+    // into macroblock-aligned 8x8 / 16x16 Rgba16Float motion field.
     if (u.pass_idx == 0u) {
         let grid_dims = max(vec2<f32>(u.p3.x, u.p3.y), vec2<f32>(1.0));
         let blk = floor(in_v.v_uv * grid_dims);
-        let search_bs = max(u.p0.z, 2.0);
-        let spacing = max(u.p3.z, 1.0);
-        var best = 1e9;
+        let search_bs = max(u.p3.z, 4.0);
+        let zero_cost = dm_block_cost(blk, vec2<f32>(0.0), search_bs, res);
+        if (zero_cost < 0.02) {
+            return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        }
+
+        let reg_pen = 0.003;
         var best_off = vec2<f32>(0.0);
+        var best_cost = zero_cost;
+        var best_score = zero_cost;
+
+        // Coarse search at 16px step across [-32, 32]
         for (var j: i32 = -2; j <= 2; j = j + 1) {
             for (var i: i32 = -2; i <= 2; i = i + 1) {
-                let off = vec2<f32>(f32(i), f32(j)) * spacing;
-                let cost = dm_block_cost(blk, off, search_bs, res) + 0.05 * length(off);
-                if (cost < best) {
-                    best = cost;
+                if (i == 0 && j == 0) {
+                    continue;
+                }
+                let off = clamp(vec2<f32>(f32(i), f32(j)) * 16.0, vec2<f32>(-32.0), vec2<f32>(32.0));
+                let cost = dm_block_cost(blk, off, search_bs, res);
+                let score = cost + reg_pen * length(off);
+                if (score < best_score) {
+                    best_score = score;
+                    best_cost = cost;
                     best_off = off;
                 }
             }
         }
-        return vec4<f32>(best_off.x, best_off.y, 0.0, 1.0);
+
+        // Hierarchical refinement: 8px -> 4px -> 2px -> 1px
+        var step_px = 8.0;
+        for (var lv: i32 = 0; lv < 4; lv = lv + 1) {
+            let center = best_off;
+            for (var j: i32 = -1; j <= 1; j = j + 1) {
+                for (var i: i32 = -1; i <= 1; i = i + 1) {
+                    if (i == 0 && j == 0) {
+                        continue;
+                    }
+                    let off = clamp(center + vec2<f32>(f32(i), f32(j)) * step_px, vec2<f32>(-32.0), vec2<f32>(32.0));
+                    let cost = dm_block_cost(blk, off, search_bs, res);
+                    let score = cost + reg_pen * length(off);
+                    if (score < best_score) {
+                        best_score = score;
+                        best_cost = cost;
+                        best_off = off;
+                    }
+                }
+            }
+            step_px = step_px * 0.5;
+        }
+
+        let conf = clamp((zero_cost - best_cost) / max(zero_cost, 1e-4), 0.0, 1.0);
+        return vec4<f32>(best_off.x, best_off.y, conf, 1.0);
     }
 
     let orig = sample_diffuse(in_v.v_uv);
@@ -1171,12 +1210,45 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     } else if (a < 16.5) {
         v = vec2<f32>(sin(bid.y * 0.35 + eff_t), cos(bid.x * 0.35 - eff_t * 1.2)) * 1.6 * inten;
     } else if (a < 28.5) {
+        // 17..28: 12 distinct X/Y/inverse axis-weighted multiply modes (Zoidium datamosh.js:187-230)
+        let ai = i32(round(a));
         let base_v = vec2<f32>(bh1 - 0.5, bh2 - 0.5) * 4.0 * inten;
         let mx = in_v.v_uv.x;
         let my = in_v.v_uv.y;
-        v = base_v * vec2<f32>(select(1.0 - mx, mx, a < 21.5) * 2.0, select(1.0 - my, my, a < 23.5) * 2.0);
+        let ix = 1.0 - mx;
+        let iy = 1.0 - my;
+        switch (ai) {
+            case 17: { v = vec2<f32>(base_v.x * mx * 2.0, base_v.y); }
+            case 18: { v = vec2<f32>(base_v.x * ix * 2.0, base_v.y); }
+            case 19: { v = vec2<f32>(base_v.x, base_v.y * my * 2.0); }
+            case 20: { v = vec2<f32>(base_v.x, base_v.y * iy * 2.0); }
+            case 21: { v = base_v * vec2<f32>(mx * 2.0, my * 2.0); }
+            case 22: { v = base_v * vec2<f32>(ix * 2.0, iy * 2.0); }
+            case 23: { v = base_v * vec2<f32>(mx * 2.0, iy * 2.0); }
+            case 24: { v = base_v * vec2<f32>(ix * 2.0, my * 2.0); }
+            case 25: { v = vec2<f32>(base_v.x * abs(mx - 0.5) * 4.0, base_v.y * 0.5); }
+            case 26: { v = vec2<f32>(base_v.x * 0.5, base_v.y * abs(my - 0.5) * 4.0); }
+            case 27: { v = base_v * (1.0 - r * 1.4) * 1.8; }
+            default: { v = base_v * (r * 2.2); }
+        }
     } else if (a < 41.5) {
-        v = vec2<f32>(bh1 - 0.5, (bh2 - 0.5) * 0.5) * 2.8 * inten;
+        // 29..41: 13 distinct neighbor-averaged / blurred / additive history vector fields
+        let ai = i32(round(a));
+        let step_b = f32(clamp((ai - 28) % 4 + 1, 1, 4));
+        let h_l = hash12(bid - vec2<f32>(step_b, 0.0) + vec2<f32>(cadence * 0.37, 0.0)) - 0.5;
+        let h_r = hash12(bid + vec2<f32>(step_b, 0.0) + vec2<f32>(cadence * 0.37, 0.0)) - 0.5;
+        let h_u = hash12(bid + vec2<f32>(0.0, step_b) + vec2<f32>(0.0, cadence * 0.23)) - 0.5;
+        let h_d = hash12(bid - vec2<f32>(0.0, step_b) + vec2<f32>(0.0, cadence * 0.23)) - 0.5;
+        let avg_x = ((bh1 - 0.5) + h_l + h_r) / 3.0;
+        let avg_y = ((bh2 - 0.5) + h_u + h_d) / 3.0;
+        if (ai <= 32) {
+            v = vec2<f32>(avg_x, avg_y) * (2.2 + 0.45 * step_b) * inten;
+        } else if (ai <= 36) {
+            v = vec2<f32>((bh1 - 0.5) + h_l + h_r, (bh2 - 0.5) + h_u + h_d) * (1.4 + 0.3 * step_b) * inten;
+        } else {
+            let diag = vec2<f32>(h_r - h_l, h_u - h_d);
+            v = (vec2<f32>(avg_x, avg_y) * 2.4 + diag * (1.2 + 0.35 * f32(ai - 36))) * inten;
+        }
     } else if (a < 47.5) {
         var m_uv = in_v.v_uv;
         if (a < 42.5) {
@@ -1204,7 +1276,11 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     } else if (a < 52.5) {
         let sp = fract(eff_t * (0.1 + speed * 0.25));
         var s_uv = in_v.v_uv;
-        if (a < 49.5) {
+        if (a < 48.5) {
+            // 48: Jittered horizontal sweep
+            let jit = (hash12(vec2<f32>(bid.y, cadence)) - 0.5) * 0.35;
+            s_uv.x = fract(in_v.v_uv.x + (sp + jit) * inten * 2.0);
+        } else if (a < 49.5) {
             s_uv.x = fract(in_v.v_uv.x + sp * inten * 2.0);
         } else if (a < 50.5) {
             s_uv.x = fract(in_v.v_uv.x - sp * inten * 2.0);
@@ -1222,14 +1298,71 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         let sa = clamp(out_s.a, 0.0, 1.0);
         return vec4<f32>(clamp(out_s.rgb, vec3<f32>(0.0), vec3<f32>(sa)), sa);
     } else {
-        let sx = sin(bid.y * 0.45 + eff_t * (2.0 + speed * 2.0));
-        let cy = cos(bid.x * 0.4 + eff_t * 2.5);
-        let taper = select(sin(in_v.v_uv.x * PI), 1.0, a < 70.5);
-        v = vec2<f32>(sx * taper, cy * 0.5) * 2.0 * inten;
+        // 53..80: 28 distinct Sin/Cos/Middle/Outside/Oscillate/Tapered V1/V2/V3 wave modes
+        let ai = i32(round(a)) - 53;
+        let variant = ai % 7;
+        let family = ai / 7; // 0=Sin/Cos, 1=Middle/Outside, 2=Oscillate V1/V2, 3=Tapered V1/V2/V3
+        let freq = 0.25 + 0.14 * f32(variant + 1);
+        let phase = eff_t * (1.8 + speed * 1.6);
+        let wx = sin(bid.y * freq + phase);
+        let wy = cos(bid.x * freq - phase * 1.15);
+        let env_mid = 1.0 - abs(in_v.v_uv.x * 2.0 - 1.0);
+        let env_out = abs(in_v.v_uv.x * 2.0 - 1.0);
+        let env_taper = sin(in_v.v_uv.x * PI) * sin(in_v.v_uv.y * PI);
+        switch (family) {
+            case 0: {
+                let sgn = select(1.0, -1.0, (variant & 1) != 0);
+                v = vec2<f32>(wx * sgn, wy * select(0.0, 1.0, variant >= 3)) * (1.8 + 0.25 * f32(variant)) * inten;
+            }
+            case 1: {
+                let mask = select(env_mid, env_out, variant >= 3);
+                v = vec2<f32>(wx, wy * 0.65) * mask * (2.6 + 0.3 * f32(variant % 3)) * inten;
+            }
+            case 2: {
+                let osc = sin(phase * (1.5 + 0.4 * f32(variant)));
+                let axis_x = select(wx, (bh1 - 0.5) * 2.0, (variant & 1) != 0);
+                let axis_y = select(wy, (bh2 - 0.5) * 2.0, (variant & 2) != 0);
+                v = vec2<f32>(axis_x, axis_y) * osc * 2.4 * inten;
+            }
+            default: {
+                let pow_k = 1.0 + 0.5 * f32(variant % 3);
+                let taper = pow(max(env_taper, 0.0), pow_k);
+                v = vec2<f32>(wx * taper, wy * taper * select(0.5, 1.2, variant >= 3)) * 2.8 * inten;
+            }
+        }
     }
 
     v = v * speed;
-    let suv = clamp(in_v.v_uv - v * act * 0.05, vec2<f32>(0.0), vec2<f32>(1.0));
+    let adv_uv = in_v.v_uv - v * act * 0.05;
+    if (has_aux && has_motion) {
+        // Real macroblock-aligned scene motion advection for default & analytic datamosh modes!
+        let p = in_v.v_uv * res;
+        let search_bs = max(u.p3.x, 4.0);
+        let mv_blk = floor(p / search_bs);
+        let mv_dims = max(vec2<f32>(textureDimensions(t_aux2, 0)), vec2<f32>(1.0));
+        let mv_sample = sample_aux2(clamp((mv_blk + vec2<f32>(0.5)) / mv_dims, vec2<f32>(0.0), vec2<f32>(1.0)));
+        let real_mv = dm_transform_motion(mv_sample.rg, mv_blk, p, res) * speed * (1.0 + accel * 0.75);
+        let mv_mag = length(mv_sample.rg);
+        act = max(act, smoothstep(0.35, 3.0, mv_mag) * (0.65 + 0.35 * mv_sample.b));
+        // Advect anchor frame along real macroblock scene motion, accented by stylized look vector.
+        let p_adv = p - real_mv - v * (bs * 0.25 * act);
+        let p_blk = floor(p_adv / bs) * bs + vec2<f32>(bs * 0.5);
+        let q_real = dm_tex_coord(mix(p_adv, p_blk, 0.65), res);
+        let q_str_real = dm_tex_coord(p_adv - real_mv * (accel * 0.5), res);
+        let s1 = sample_aux(q_real);
+        let s2 = sample_aux(q_str_real);
+        let mosh_rgba = mix(s1, s2, clamp(accel * 0.45, 0.0, 0.8));
+        let mosh = unpremultiply(mosh_rgba);
+        let c_delta = abs(orig_rgb - mosh);
+        act = max(act, smoothstep(threshold, threshold + 0.22, max(max(c_delta.r, max(c_delta.g, c_delta.b)), abs(orig.a - mosh_rgba.a))));
+        let m = clamp(act * blend_w * 1.4 * amount, 0.0, 1.0);
+        let out_rgba = mix(orig, mosh_rgba, m);
+        let out_a = clamp(out_rgba.a, 0.0, 1.0);
+        let grain = (hash12(floor(p) + vec2<f32>(cadence, cadence * 1.7)) - 0.5) * 0.02 * m * out_a;
+        return vec4<f32>(clamp(out_rgba.rgb + vec3<f32>(grain), vec3<f32>(0.0), vec3<f32>(out_a)), out_a);
+    }
+
+    let suv = clamp(adv_uv, vec2<f32>(0.0), vec2<f32>(1.0));
     let q = clamp(floor(suv * res / bs) * bs / res + (vec2<f32>(bs * 0.5) / res), vec2<f32>(0.0), vec2<f32>(1.0));
     let s1 = select(sample_diffuse(q), sample_aux(q), has_aux);
     let q_str = clamp(q - v * act * 0.05 * accel, vec2<f32>(0.0), vec2<f32>(1.0));
@@ -1312,7 +1445,14 @@ fn tr_marker_cov(p: vec2<f32>, center: vec2<f32>, sz: f32, shape: u32, rot: f32,
     return cov;
 }
 
-fn tr_box_and_brackets(p: vec2<f32>, center: vec2<f32>, half_sz: vec2<f32>, line_w: f32, shape: u32) -> vec2<f32> {
+fn tr_box_and_brackets(
+    p: vec2<f32>,
+    center: vec2<f32>,
+    half_sz: vec2<f32>,
+    line_w: f32,
+    shape: u32,
+    corner_style: u32,
+) -> vec2<f32> {
     let dp = abs(p - center);
     let lw = max(line_w * 0.5, 0.75);
     var border_cov = 0.0;
@@ -1325,22 +1465,85 @@ fn tr_box_and_brackets(p: vec2<f32>, center: vec2<f32>, half_sz: vec2<f32>, line
         inside_cov = clamp(0.5 - d, 0.0, 1.0);
     } else {
         let hs = select(half_sz, vec2<f32>(min(half_sz.x, half_sz.y)), shape == 1u);
-        let d_box = max(dp.x - hs.x, dp.y - hs.y);
-        let full_border = clamp(lw + 0.5 - abs(d_box), 0.0, 1.0);
-        // Emphasize crisp corner brackets near corners.
-        let corner_len = min(hs.x, hs.y) * 0.35;
-        let near_corner = (dp.x >= hs.x - corner_len) || (dp.y >= hs.y - corner_len);
-        let bracket_boost = select(0.55, 1.0, near_corner);
-        border_cov = full_border * bracket_boost;
-        inside_cov = clamp(0.5 - d_box, 0.0, 1.0);
+        if (corner_style == 3u) {
+            // Rounded rectangle SDF
+            let cr = min(hs.x, hs.y) * 0.28;
+            let q = dp - (hs - vec2<f32>(cr));
+            let d_round = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - cr;
+            border_cov = clamp(lw + 0.5 - abs(d_round), 0.0, 1.0);
+            inside_cov = clamp(0.5 - d_round, 0.0, 1.0);
+        } else {
+            let d_box = max(dp.x - hs.x, dp.y - hs.y);
+            let full_border = clamp(lw + 0.5 - abs(d_box), 0.0, 1.0);
+            let corner_len = min(hs.x, hs.y) * 0.35;
+            let near_corner = (dp.x >= hs.x - corner_len) || (dp.y >= hs.y - corner_len);
+            if (corner_style == 1u) {
+                // Corners-only L-brackets
+                border_cov = select(0.0, full_border, near_corner);
+            } else if (corner_style == 2u) {
+                // Full solid uniform box
+                border_cov = full_border;
+            } else {
+                // Emphasized corner brackets over subtle full frame
+                border_cov = full_border * select(0.55, 1.0, near_corner);
+            }
+            inside_cov = clamp(0.5 - d_box, 0.0, 1.0);
+        }
     }
     return vec2<f32>(border_cov, inside_cov);
 }
 
-fn tr_connection_cov(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, thick: f32, line_type: u32, dash_on: bool, dash_len: f32, dash_gap: f32) -> f32 {
+fn tr_connection_cov(
+    p: vec2<f32>,
+    a: vec2<f32>,
+    b: vec2<f32>,
+    prev_pt: vec2<f32>,
+    next_pt: vec2<f32>,
+    has_guides: vec2<f32>,
+    thick: f32,
+    line_type: u32,
+    tension: f32,
+    dash_on: bool,
+    dash_len: f32,
+    dash_gap: f32,
+) -> f32 {
     let hw = max(thick * 0.5, 0.6);
     var dist_arc = vec2<f32>(1e6, 0.0);
-    if (line_type == 1u) {
+    if (line_type == 0u) {
+        // True curved cubic Catmull-Rom / quadratic spline arc (8 segments)
+        let chord = b - a;
+        let perp = vec2<f32>(-chord.y, chord.x);
+        let tens_scale = clamp(1.0 - tension * 0.5, 0.2, 1.8);
+        let arc_tan_a = chord * 0.5 + perp * (0.26 * tens_scale);
+        let arc_tan_b = chord * 0.5 - perp * (0.26 * tens_scale);
+        let cr_tan_a = (b - prev_pt) * (0.5 * tens_scale);
+        let cr_tan_b = (next_pt - a) * (0.5 * tens_scale);
+        let tan_a = mix(arc_tan_a, cr_tan_a, has_guides.x);
+        let tan_b = mix(arc_tan_b, cr_tan_b, has_guides.y);
+
+        var best_d = 1e6;
+        var best_s = 0.0;
+        var prev_q = a;
+        var acc_s = 0.0;
+        for (var i: i32 = 1; i <= 8; i = i + 1) {
+            let t = f32(i) / 8.0;
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+            let h10 = t3 - 2.0 * t2 + t;
+            let h01 = -2.0 * t3 + 3.0 * t2;
+            let h11 = t3 - t2;
+            let q = a * h00 + tan_a * h10 + b * h01 + tan_b * h11;
+            let seg = tr_seg_dist(p, prev_q, q);
+            if (seg.x < best_d) {
+                best_d = seg.x;
+                best_s = acc_s + seg.y;
+            }
+            acc_s = acc_s + length(q - prev_q);
+            prev_q = q;
+        }
+        dist_arc = vec2<f32>(best_d, best_s);
+    } else if (line_type == 1u) {
         // PCB 45-degree routed trace
         let diff = b - a;
         let diag = min(abs(diff.x), abs(diff.y));
@@ -1348,7 +1551,7 @@ fn tr_connection_cov(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, thick: f32, line_
         let d1 = tr_seg_dist(p, a, mid);
         let d2 = tr_seg_dist(p, mid, b);
         dist_arc = select(vec2<f32>(d2.x, length(mid - a) + d2.y), d1, d1.x <= d2.x);
-    } else if (line_type == 3u) {
+    } else if (line_type == 2u) {
         // Orthogonal step bend
         let mid = vec2<f32>(mix(a.x, b.x, 0.5), a.y);
         let mid2 = vec2<f32>(mid.x, b.y);
@@ -1362,28 +1565,8 @@ fn tr_connection_cov(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, thick: f32, line_
         if (d3.x < dist_arc.x) {
             dist_arc = vec2<f32>(d3.x, length(mid - a) + length(mid2 - mid) + d3.y);
         }
-    } else if (line_type == 2u) {
-        // Smooth quadratic bend through curved midpoint
-        let ctrl = vec2<f32>((a.x + b.x) * 0.5, a.y);
-        var best_d = 1e6;
-        var best_s = 0.0;
-        var prev_q = a;
-        var acc_s = 0.0;
-        for (var i: i32 = 1; i <= 6; i = i + 1) {
-            let t = f32(i) / 6.0;
-            let inv = 1.0 - t;
-            let q = inv * inv * a + 2.0 * inv * t * ctrl + t * t * b;
-            let seg = tr_seg_dist(p, prev_q, q);
-            if (seg.x < best_d) {
-                best_d = seg.x;
-                best_s = acc_s + seg.y;
-            }
-            acc_s = acc_s + length(q - prev_q);
-            prev_q = q;
-        }
-        dist_arc = vec2<f32>(best_d, best_s);
     } else {
-        // Straight / spline
+        // Straight connector
         dist_arc = tr_seg_dist(p, a, b);
     }
     var cov = clamp(hw + 0.5 - dist_arc.x, 0.0, 1.0);
@@ -1411,29 +1594,78 @@ fn tr_arrow_cov(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, pos_t: f32, sz: f32) -
     return clamp(1.5 - min(d1, d2), 0.0, 1.0);
 }
 
+fn tr_digit_row(d: i32, gy: i32) -> u32 {
+    if (d == 0) { var b = array<u32, 5>(7u, 5u, 5u, 5u, 7u); return b[gy]; }
+    if (d == 1) { var b = array<u32, 5>(2u, 6u, 2u, 2u, 7u); return b[gy]; }
+    if (d == 2) { var b = array<u32, 5>(7u, 1u, 7u, 4u, 7u); return b[gy]; }
+    if (d == 3) { var b = array<u32, 5>(7u, 1u, 7u, 1u, 7u); return b[gy]; }
+    if (d == 4) { var b = array<u32, 5>(5u, 5u, 7u, 1u, 1u); return b[gy]; }
+    if (d == 5) { var b = array<u32, 5>(7u, 4u, 7u, 1u, 7u); return b[gy]; }
+    if (d == 6) { var b = array<u32, 5>(7u, 4u, 7u, 5u, 7u); return b[gy]; }
+    if (d == 7) { var b = array<u32, 5>(7u, 1u, 2u, 2u, 2u); return b[gy]; }
+    if (d == 8) { var b = array<u32, 5>(7u, 5u, 7u, 5u, 7u); return b[gy]; }
+    var b = array<u32, 5>(7u, 5u, 7u, 1u, 7u);
+    return b[gy];
+}
+
 @fragment
 fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
+    let res = max(u.resolution, vec2<f32>(1.0));
+    let inv_res = vec2<f32>(1.0) / res;
+
+    // Pass 2 / Pass 3: Real separable 9-tap Gaussian pre-detection blur when blurStrength > 0.
+    if (u.pass_idx == 2u || u.pass_idx == 3u) {
+        let blur_px = max(f32((u.extra >> 24u) & 255u), 1.0);
+        let dir = select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), u.pass_idx == 2u);
+        let step_uv = dir * (blur_px * 0.25) * inv_res;
+        var acc = vec4<f32>(0.0);
+        var wsum = 0.0;
+        for (var i: i32 = -4; i <= 4; i = i + 1) {
+            let fi = f32(i);
+            let w = exp(-(fi * fi) / 7.5);
+            let suv = clamp(in_v.v_uv + step_uv * fi, vec2<f32>(0.0), vec2<f32>(1.0));
+            acc = acc + sample_diffuse(suv) * w;
+            wsum = wsum + w;
+        }
+        return acc / max(wsum, EPS);
+    }
+
     let texel = sample_diffuse(in_v.v_uv);
     let rgb = unpremultiply(texel);
     let lo = u.p0.x;
     let hi = max(u.p0.x + u.p0.y, lo + 1e-4);
 
-    // Pass 0: Key mask extraction into t_aux
+    // Pass 0: Key mask (r) + luminance (g) + Sobel edge magnitude (b) extraction into t_aux
     if (u.pass_idx == 0u) {
         let dist = length(rgb - u.c0.xyz);
         let key_m = 1.0 - smoothstep(lo, hi, dist);
-        return vec4<f32>(key_m, key_m, key_m, 1.0);
+        let lum = luma601(rgb);
+        let l_tl = luma601(unpremultiply(sample_diffuse(clamp(in_v.v_uv + vec2<f32>(-inv_res.x, -inv_res.y), vec2<f32>(0.0), vec2<f32>(1.0)))));
+        let l_tc = luma601(unpremultiply(sample_diffuse(clamp(in_v.v_uv + vec2<f32>(0.0, -inv_res.y), vec2<f32>(0.0), vec2<f32>(1.0)))));
+        let l_tr = luma601(unpremultiply(sample_diffuse(clamp(in_v.v_uv + vec2<f32>(inv_res.x, -inv_res.y), vec2<f32>(0.0), vec2<f32>(1.0)))));
+        let l_ml = luma601(unpremultiply(sample_diffuse(clamp(in_v.v_uv + vec2<f32>(-inv_res.x, 0.0), vec2<f32>(0.0), vec2<f32>(1.0)))));
+        let l_mr = luma601(unpremultiply(sample_diffuse(clamp(in_v.v_uv + vec2<f32>(inv_res.x, 0.0), vec2<f32>(0.0), vec2<f32>(1.0)))));
+        let l_bl = luma601(unpremultiply(sample_diffuse(clamp(in_v.v_uv + vec2<f32>(-inv_res.x, inv_res.y), vec2<f32>(0.0), vec2<f32>(1.0)))));
+        let l_bc = luma601(unpremultiply(sample_diffuse(clamp(in_v.v_uv + vec2<f32>(0.0, inv_res.y), vec2<f32>(0.0), vec2<f32>(1.0)))));
+        let l_br = luma601(unpremultiply(sample_diffuse(clamp(in_v.v_uv + vec2<f32>(inv_res.x, inv_res.y), vec2<f32>(0.0), vec2<f32>(1.0)))));
+        let gx = -l_tl - 2.0 * l_ml - l_bl + l_tr + 2.0 * l_mr + l_br;
+        let gy = -l_tl - 2.0 * l_tc - l_tr + l_bl + 2.0 * l_bc + l_br;
+        let edge_mag = clamp(sqrt(gx * gx + gy * gy) * 0.75, 0.0, 1.0);
+        return vec4<f32>(key_m, lum, edge_mag, 1.0);
     }
 
-    let key_m = sample_aux(in_v.v_uv).r;
+    let aux_feat = sample_aux(in_v.v_uv);
+    let key_m = aux_feat.r;
     if ((u.flags & 1u) != 0u) {
         return vec4<f32>(key_m, key_m, key_m, 1.0);
     }
 
-    let res = max(u.resolution, vec2<f32>(1.0));
     let px_pos = in_v.v_uv * res;
-    let inv_res = vec2<f32>(1.0) / res;
     let master_op = clamp(u.p0.w, 0.0, 1.0);
+    let max_conn = clamp(i32(u.extra & 255u), 1, 4);
+    let corner_style = (u.extra >> 8u) & 15u;
+    let min_size = max(f32((u.extra >> 12u) & 4095u), 4.0);
+    let spline_tension = u.c0.w;
 
     var out_c = texel;
 
@@ -1442,7 +1674,11 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         let divs = max(u.p0.z, 2.0);
         let cell_px = max(min(res.x, res.y) / divs, 8.0);
         let g = fract(px_pos / cell_px);
-        let grid_line = select(0.0, 0.35, g.x < (1.0 / cell_px) || g.y < (1.0 / cell_px));
+        let grid_op = clamp(u.m1.z, 0.0, 1.0);
+        let is_edge_mode = u.m1.w > 0.5;
+        let on_line = g.x < (1.0 / cell_px) || g.y < (1.0 / cell_px);
+        let edge_mask = select(1.0, smoothstep(0.05, 0.35, key_m), is_edge_mode);
+        let grid_line = select(0.0, grid_op * edge_mask, on_line);
         if (grid_line > 0.0) {
             out_c = source_over(out_c, u.c1.xyz, grid_line * master_op);
         }
@@ -1456,50 +1692,99 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         out_c = source_over(out_c, u.c1.xyz, sil_edge * 0.45 * master_op);
     }
 
-    // Collect up to 4 feature nodes (auto-detected quadrants + manual points 1..3)
-    var nodes = array<vec4<f32>, 4>(
-        vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0)
+    // Collect up to 16 feature nodes (manual points P1..P6 + 4x4 adaptive luminance/edge peak detector)
+    var nodes = array<vec4<f32>, 16>(
+        vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0),
+        vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0),
+        vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0),
+        vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0),
     ); // xy = center px, z = box half-size px, w = active (1/0)
+    var scores = array<f32, 16>(
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    );
     var node_count: i32 = 0;
 
     if ((u.flags & 512u) != 0u) {
-        nodes[node_count] = vec4<f32>(u.p3.x * res.x, (1.0 - u.p3.y) * res.y, max(u.p3.z * 0.5, 8.0), 1.0);
+        nodes[node_count] = vec4<f32>(u.p3.x * res.x, (1.0 - u.p3.y) * res.y, max(u.p3.z * 0.5, min_size * 0.5), 1.0);
+        scores[node_count] = 1e6;
         node_count = node_count + 1;
     }
-    if ((u.flags & 1024u) != 0u && node_count < 4) {
-        nodes[node_count] = vec4<f32>(u.p3.w * res.x, (1.0 - u.p4.x) * res.y, max(u.p4.y * 0.5, 8.0), 1.0);
+    if ((u.flags & 1024u) != 0u && node_count < 16) {
+        nodes[node_count] = vec4<f32>(u.p3.w * res.x, (1.0 - u.p4.x) * res.y, max(u.p4.y * 0.5, min_size * 0.5), 1.0);
+        scores[node_count] = 1e6;
         node_count = node_count + 1;
     }
-    if ((u.flags & 2048u) != 0u && node_count < 4) {
-        nodes[node_count] = vec4<f32>(u.p4.z * res.x, (1.0 - u.p4.w) * res.y, max(u.p5.x * 0.5, 8.0), 1.0);
+    if ((u.flags & 2048u) != 0u && node_count < 16) {
+        nodes[node_count] = vec4<f32>(u.p4.z * res.x, (1.0 - u.p4.w) * res.y, max(u.p5.x * 0.5, min_size * 0.5), 1.0);
+        scores[node_count] = 1e6;
+        node_count = node_count + 1;
+    }
+    if ((u.flags & 4096u) != 0u && node_count < 16) {
+        nodes[node_count] = vec4<f32>(u.p7.x * res.x, (1.0 - u.p7.y) * res.y, max(u.p7.z * 0.5, min_size * 0.5), 1.0);
+        scores[node_count] = 1e6;
+        node_count = node_count + 1;
+    }
+    if ((u.flags & 8192u) != 0u && node_count < 16) {
+        nodes[node_count] = vec4<f32>(u.p7.w * res.x, (1.0 - u.m0.x) * res.y, max(u.m0.y * 0.5, min_size * 0.5), 1.0);
+        scores[node_count] = 1e6;
+        node_count = node_count + 1;
+    }
+    if ((u.flags & 16384u) != 0u && node_count < 16) {
+        nodes[node_count] = vec4<f32>(u.m0.z * res.x, (1.0 - u.m0.w) * res.y, max(u.m1.x * 0.5, min_size * 0.5), 1.0);
+        scores[node_count] = 1e6;
         node_count = node_count + 1;
     }
 
-    // Auto-detect keyed blobs across 2x2 coarse frame quadrants when detection is enabled
+    // 4x4 (16-cell) adaptive luminance/edge peak detector across the full frame
     if ((u.flags & 128u) != 0u) {
-        for (var qy: i32 = 0; qy < 2; qy = qy + 1) {
-            for (var qx: i32 = 0; qx < 2; qx = qx + 1) {
-                if (node_count >= 4) {
-                    break;
-                }
+        for (var cy: i32 = 0; cy < 4; cy = cy + 1) {
+            for (var cx: i32 = 0; cx < 4; cx = cx + 1) {
                 var w_sum = 0.0;
                 var pos_sum = vec2<f32>(0.0);
+                var peak_val = 0.0;
+                var peak_uv = vec2<f32>((f32(cx) + 0.5) * 0.25, (f32(cy) + 0.5) * 0.25);
                 for (var sy: i32 = 0; sy < 3; sy = sy + 1) {
                     for (var sx: i32 = 0; sx < 3; sx = sx + 1) {
                         let suv = vec2<f32>(
-                            (f32(qx) + (f32(sx) + 0.5) / 3.0) * 0.5,
-                            (f32(qy) + (f32(sy) + 0.5) / 3.0) * 0.5,
+                            (f32(cx) + (f32(sx) + 0.5) / 3.0) * 0.25,
+                            (f32(cy) + (f32(sy) + 0.5) / 3.0) * 0.25,
                         );
-                        let mv = sample_aux(suv).r;
-                        w_sum = w_sum + mv;
-                        pos_sum = pos_sum + suv * mv;
+                        let ft = sample_aux(suv);
+                        // Adaptive feature energy combining keyed mask + edge/luminance peaks.
+                        let feat = ft.r * (0.55 + 0.35 * ft.b + 0.20 * ft.g) + ft.b * ft.g * 0.12;
+                        w_sum = w_sum + feat;
+                        pos_sum = pos_sum + suv * feat;
+                        if (feat > peak_val) {
+                            peak_val = feat;
+                            peak_uv = suv;
+                        }
                     }
                 }
-                if (w_sum > 0.25) {
-                    let centroid = (pos_sum / w_sum) * res;
-                    let half_box = max(min(res.x, res.y) * (0.06 + 0.04 * min(w_sum / 9.0, 1.0)), 10.0);
-                    nodes[node_count] = vec4<f32>(centroid, half_box, 1.0);
-                    node_count = node_count + 1;
+                if (w_sum > 0.22 && peak_val > 0.08) {
+                    let centroid_uv = mix(pos_sum / max(w_sum, EPS), peak_uv, 0.35);
+                    let centroid = centroid_uv * res;
+                    let energy01 = clamp(w_sum / 6.0, 0.0, 1.0);
+                    let half_box = max(min(res.x, res.y) * (0.04 + 0.045 * energy01), min_size * 0.5);
+                    let cand = vec4<f32>(centroid, half_box, 1.0);
+                    if (node_count < 16) {
+                        nodes[node_count] = cand;
+                        scores[node_count] = w_sum;
+                        node_count = node_count + 1;
+                    } else {
+                        var worst_idx: i32 = -1;
+                        var worst_sc = w_sum;
+                        for (var k: i32 = 0; k < 16; k = k + 1) {
+                            if (scores[k] < worst_sc) {
+                                worst_sc = scores[k];
+                                worst_idx = k;
+                            }
+                        }
+                        if (worst_idx >= 0) {
+                            nodes[worst_idx] = cand;
+                            scores[worst_idx] = w_sum;
+                        }
+                    }
                 }
             }
         }
@@ -1516,30 +1801,69 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let line_type = u32(round(u.p5.w));
     let marker_shape = u32(round(u.p6.x));
     let box_fill = u32(round(u.p6.y));
+    let box_fill_op = clamp(u.m1.y, 0.0, 1.0);
 
-    // Draw connecting lines & arrows between consecutive nodes
+    // Proximity graph connections: connect each node to up to `max_conn` nearest neighbors.
     if (lines_enable && node_count >= 2) {
-        for (var i: i32 = 0; i < 3; i = i + 1) {
-            if (i + 1 >= node_count) {
+        var max_lcov = 0.0;
+        var max_acov = 0.0;
+        for (var i: i32 = 0; i < 16; i = i + 1) {
+            if (i >= node_count) {
                 break;
             }
             let a = nodes[i].xy;
-            let b = nodes[i + 1].xy;
-            let lcov = tr_connection_cov(px_pos, a, b, u.p2.x, line_type, dash_enable, u.p5.y, u.p5.z);
-            if (lcov > 0.0) {
-                out_c = source_over(out_c, u.c3.xyz, lcov * u.c3.a * master_op);
-            }
-            if (arrow_enable) {
-                let acov = tr_arrow_cov(px_pos, a, b, u.p2.z, max(u.p2.y, 6.0));
-                if (acov > 0.0) {
-                    out_c = source_over(out_c, u.c2.xyz, acov * u.c2.a * master_op);
+            var prev_best_d = -1.0;
+            for (var c_idx: i32 = 0; c_idx < 4; c_idx = c_idx + 1) {
+                if (c_idx >= max_conn) {
+                    break;
+                }
+                var best_j: i32 = -1;
+                var best_d = 1e12;
+                for (var j: i32 = 0; j < 16; j = j + 1) {
+                    if (j >= node_count) {
+                        break;
+                    }
+                    if (j == i) {
+                        continue;
+                    }
+                    let d = length(nodes[j].xy - a);
+                    if (d > prev_best_d + 1e-3 && d < best_d) {
+                        best_d = d;
+                        best_j = j;
+                    }
+                }
+                if (best_j < 0) {
+                    break;
+                }
+                prev_best_d = best_d;
+                let b = nodes[best_j].xy;
+                let prev_idx = select(i - 1, -1, i == 0 || i - 1 == best_j);
+                let next_idx = select(best_j + 1, -1, best_j + 1 >= node_count || best_j + 1 == i);
+                let prev_pt = select(a, nodes[max(prev_idx, 0)].xy, prev_idx >= 0);
+                let next_pt = select(b, nodes[max(next_idx, 0)].xy, next_idx >= 0);
+                let has_guides = vec2<f32>(select(0.0, 1.0, prev_idx >= 0), select(0.0, 1.0, next_idx >= 0));
+
+                let lcov = tr_connection_cov(
+                    px_pos, a, b, prev_pt, next_pt, has_guides,
+                    u.p2.x, line_type, spline_tension, dash_enable, u.p5.y, u.p5.z,
+                );
+                max_lcov = max(max_lcov, lcov);
+                if (arrow_enable) {
+                    let acov = tr_arrow_cov(px_pos, a, b, u.p2.z, max(u.p2.y, 6.0));
+                    max_acov = max(max_acov, acov);
                 }
             }
         }
+        if (max_lcov > 0.0) {
+            out_c = source_over(out_c, u.c3.xyz, max_lcov * u.c3.a * master_op);
+        }
+        if (max_acov > 0.0) {
+            out_c = source_over(out_c, u.c2.xyz, max_acov * u.c2.a * master_op);
+        }
     }
 
-    // Draw boxes, corner brackets, markers, and callout tags per node
-    for (var i: i32 = 0; i < 4; i = i + 1) {
+    // Draw boxes, corner brackets, markers, and callout tags with node ID glyphs per node
+    for (var i: i32 = 0; i < 16; i = i + 1) {
         if (i >= node_count) {
             break;
         }
@@ -1548,13 +1872,13 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         let hs = vec2<f32>(nd.z, nd.z);
 
         if (box_enable) {
-            let bb = tr_box_and_brackets(px_pos, ctr, hs, u.p1.x, box_shape);
+            let bb = tr_box_and_brackets(px_pos, ctr, hs, u.p1.x, box_shape, corner_style);
             if (bb.y > 0.0 && box_fill > 0u) {
                 if (box_fill == 1u) {
-                    out_c = source_over(out_c, u.c1.xyz, bb.y * 0.22 * u.c1.a * master_op);
+                    out_c = source_over(out_c, u.c1.xyz, bb.y * box_fill_op * u.c1.a * master_op);
                 } else if (box_fill == 2u) {
                     let hatch = step(0.5, fract((px_pos.x + px_pos.y) / 8.0));
-                    out_c = source_over(out_c, u.c1.xyz, bb.y * hatch * 0.25 * u.c1.a * master_op);
+                    out_c = source_over(out_c, u.c1.xyz, bb.y * hatch * box_fill_op * u.c1.a * master_op);
                 } else {
                     let inv_rgb = vec3<f32>(1.0) - unpremultiply(out_c);
                     out_c = source_over(out_c, inv_rgb, bb.y * 0.6 * master_op);
@@ -1571,14 +1895,38 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
             out_c = source_over(out_c, u.c2.xyz, mcov * u.c2.a * master_op);
         }
 
-        // Callout leader line + tag box
+        // Callout leader line + tag box + 3x5 bitmap "P1".."P16" glyph
         if (labels_enable) {
-            let tag_ctr = clamp(ctr + vec2<f32>(u.p6.z * 0.35, -u.p6.w * 0.35), vec2<f32>(16.0), res - vec2<f32>(16.0));
-            let leader = tr_seg_dist(px_pos, ctr + vec2<f32>(hs.x * 0.5, hs.y * 0.5), tag_ctr - vec2<f32>(14.0, 0.0)).x;
+            let tag_ctr = clamp(ctr + vec2<f32>(u.p6.z * 0.35, -u.p6.w * 0.35), vec2<f32>(20.0), res - vec2<f32>(20.0));
+            let leader = tr_seg_dist(px_pos, ctr + vec2<f32>(hs.x * 0.5, hs.y * 0.5), tag_ctr - vec2<f32>(16.0, 0.0)).x;
             let lead_cov = clamp(1.2 - leader, 0.0, 1.0);
-            let tag_bb = tr_box_and_brackets(px_pos, tag_ctr, vec2<f32>(16.0, 7.0), 1.5, 0u);
+            let tag_bb = tr_box_and_brackets(px_pos, tag_ctr, vec2<f32>(18.0, 8.0), 1.5, 0u, 2u);
             if (tag_bb.y > 0.0) {
-                out_c = source_over(out_c, vec3<f32>(0.05, 0.07, 0.1), tag_bb.y * 0.7 * master_op);
+                out_c = source_over(out_c, vec3<f32>(0.05, 0.07, 0.1), tag_bb.y * 0.78 * master_op);
+                let rel = px_pos - (tag_ctr - vec2<f32>(11.0, -5.0));
+                let gx = i32(floor(rel.x * 0.5));
+                let gy = i32(floor(-rel.y * 0.5));
+                if (gy >= 0 && gy < 5) {
+                    var lit = false;
+                    let num = i + 1;
+                    // 'P' at gx in 0..3
+                    if (gx >= 0 && gx < 3) {
+                        var p_bits = array<u32, 5>(7u, 5u, 7u, 4u, 4u);
+                        lit = ((p_bits[gy] >> u32(2 - gx)) & 1u) != 0u;
+                    } else if (num < 10 && gx >= 4 && gx < 7) {
+                        let row = tr_digit_row(num, gy);
+                        lit = ((row >> u32(6 - gx)) & 1u) != 0u;
+                    } else if (num >= 10 && gx >= 4 && gx < 7) {
+                        let row = tr_digit_row(num / 10, gy);
+                        lit = ((row >> u32(6 - gx)) & 1u) != 0u;
+                    } else if (num >= 10 && gx >= 8 && gx < 11) {
+                        let row = tr_digit_row(num % 10, gy);
+                        lit = ((row >> u32(10 - gx)) & 1u) != 0u;
+                    }
+                    if (lit) {
+                        out_c = source_over(out_c, vec3<f32>(1.0), 0.95 * master_op);
+                    }
+                }
             }
             let tag_line = max(lead_cov * 0.75, tag_bb.x);
             if (tag_line > 0.0) {
@@ -1643,9 +1991,33 @@ fn ascii_fbm(p_in: vec2<f32>, octaves: i32, pers: f32, turb: bool) -> f32 {
     return total / max(norm, 1e-4);
 }
 
-fn ascii_glyph_bit(charset: u32, band: u32, gx: u32, gy: u32, font_style: u32) -> f32 {
+fn ascii_custom_bit(band: u32, gx: u32, gy: u32) -> f32 {
+    var lo_f = 0.0;
+    var hi_f = 0.0;
+    switch (band) {
+        case 0u: { lo_f = u.p6.x; hi_f = u.p6.y; }
+        case 1u: { lo_f = u.p6.z; hi_f = u.p6.w; }
+        case 2u: { lo_f = u.p7.x; hi_f = u.p7.y; }
+        case 3u: { lo_f = u.p7.z; hi_f = u.p7.w; }
+        case 4u: { lo_f = u.m0.x; hi_f = u.m0.y; }
+        case 5u: { lo_f = u.m0.z; hi_f = u.m0.w; }
+        case 6u: { lo_f = u.m1.x; hi_f = u.m1.y; }
+        default: { lo_f = u.m1.z; hi_f = u.m1.w; }
+    }
+    let packed = select(u32(round(max(hi_f, 0.0))), u32(round(max(lo_f, 0.0))), gy < 4u);
+    let shift = select((gy - 4u) * 5u, gy * 5u, gy < 4u);
+    let row = (packed >> shift) & 31u;
+    return f32((row >> (4u - gx)) & 1u);
+}
+
+fn ascii_raw_bit(charset: u32, band: u32, gx: u32, gy: u32) -> f32 {
     if (gx >= 5u || gy >= 7u) {
         return 0.0;
+    }
+
+    // Charset 5: Custom character ramp LUT packed into p6/p7/m0/m1 (5x7 bitmaps per band)
+    if (charset == 5u) {
+        return ascii_custom_bit(band, gx, gy);
     }
 
     // Charset 2: Unicode shade blocks (space, 25%, 50%, 75%, full)
@@ -1672,12 +2044,10 @@ fn ascii_glyph_bit(charset: u32, band: u32, gx: u32, gy: u32, font_style: u32) -
             return 0.0;
         }
         if (band < 5u) {
-            // '0'
-            let rows0 = array<u32, 7>(14u, 17u, 19u, 21u, 25u, 17u, 14u);
+            var rows0 = array<u32, 7>(14u, 17u, 19u, 21u, 25u, 17u, 14u);
             return f32((rows0[gy] >> gx) & 1u);
         }
-        // '1'
-        let rows1 = array<u32, 7>(4u, 6u, 4u, 4u, 4u, 4u, 14u);
+        var rows1 = array<u32, 7>(4u, 6u, 4u, 4u, 4u, 4u, 14u);
         return f32((rows1[gy] >> gx) & 1u);
     }
 
@@ -1686,18 +2056,34 @@ fn ascii_glyph_bit(charset: u32, band: u32, gx: u32, gy: u32, font_style: u32) -
         var bits: u32 = 0u;
         switch (band) {
             case 0u: { bits = 0u; }
-            case 1u: { let r = array<u32, 7>(0u, 0u, 0u, 4u, 0u, 0u, 0u); bits = r[gy]; }
-            case 2u: { let r = array<u32, 7>(0u, 0u, 31u, 0u, 0u, 0u, 0u); bits = r[gy]; }
-            case 3u: { let r = array<u32, 7>(0u, 14u, 0u, 31u, 0u, 0u, 0u); bits = r[gy]; }
-            case 4u: { let r = array<u32, 7>(31u, 16u, 8u, 4u, 4u, 2u, 1u); bits = r[gy]; }
-            case 5u: { let r = array<u32, 7>(31u, 4u, 4u, 31u, 4u, 8u, 16u); bits = r[gy]; }
-            case 6u: { let r = array<u32, 7>(17u, 31u, 17u, 17u, 31u, 17u, 17u); bits = r[gy]; }
-            default: { let r = array<u32, 7>(31u, 21u, 31u, 21u, 31u, 21u, 31u); bits = r[gy]; }
+            case 1u: { var r = array<u32, 7>(0u, 0u, 0u, 4u, 0u, 0u, 0u); bits = r[gy]; }
+            case 2u: { var r = array<u32, 7>(0u, 0u, 31u, 0u, 0u, 0u, 0u); bits = r[gy]; }
+            case 3u: { var r = array<u32, 7>(0u, 14u, 0u, 31u, 0u, 0u, 0u); bits = r[gy]; }
+            case 4u: { var r = array<u32, 7>(31u, 16u, 8u, 4u, 4u, 2u, 1u); bits = r[gy]; }
+            case 5u: { var r = array<u32, 7>(31u, 4u, 4u, 31u, 4u, 8u, 16u); bits = r[gy]; }
+            case 6u: { var r = array<u32, 7>(17u, 31u, 17u, 17u, 31u, 17u, 17u); bits = r[gy]; }
+            default: { var r = array<u32, 7>(31u, 21u, 31u, 21u, 31u, 21u, 31u); bits = r[gy]; }
         }
         return f32((bits >> gx) & 1u);
     }
 
-    // Charset 0 (standard) and 1 (dense / detailed): 5x7 ASCII density ramp
+    // Charset 1 (dense / detailed): high-density 5x7 ASCII characters (' ', '.', ':', '=', 'x', '%', '#', '@')
+    if (charset == 1u) {
+        var bits: u32 = 0u;
+        switch (band) {
+            case 0u: { bits = 0u; }
+            case 1u: { var r = array<u32, 7>(0u, 0u, 0u, 0u, 0u, 12u, 12u); bits = r[gy]; }
+            case 2u: { var r = array<u32, 7>(0u, 12u, 12u, 0u, 12u, 12u, 0u); bits = r[gy]; }
+            case 3u: { var r = array<u32, 7>(0u, 0u, 31u, 0u, 31u, 0u, 0u); bits = r[gy]; }
+            case 4u: { var r = array<u32, 7>(0u, 17u, 10u, 4u, 10u, 17u, 0u); bits = r[gy]; }
+            case 5u: { var r = array<u32, 7>(25u, 26u, 4u, 4u, 11u, 19u, 0u); bits = r[gy]; }
+            case 6u: { var r = array<u32, 7>(10u, 31u, 10u, 10u, 31u, 10u, 10u); bits = r[gy]; }
+            default: { var r = array<u32, 7>(14u, 17u, 23u, 21u, 23u, 16u, 14u); bits = r[gy]; }
+        }
+        return f32((bits >> (4u - gx)) & 1u);
+    }
+
+    // Charset 0 (standard): crisp 5x7 ASCII density ramp (' ', '.', ':', '-', '+', '*', '#', '@')
     var row_bits: u32 = 0u;
     switch (band) {
         case 0u: {
@@ -1725,17 +2111,59 @@ fn ascii_glyph_bit(charset: u32, band: u32, gx: u32, gy: u32, font_style: u32) -
         default: {
             let border = (gy == 1u || gy == 5u) && gx >= 1u && gx <= 3u;
             let sides = (gx == 0u || gx == 4u) && gy >= 2u && gy <= 4u;
-            let core = (gx == 2u && gy == 3u) || (charset == 1u && gx == 2u && gy >= 1u && gy <= 5u);
+            let core = gx == 2u && gy == 3u;
             row_bits = select(0u, 1u, border || sides || core);
         }
     }
-    // Font family subtle styling (bold monospace adds horizontal body, serif adds top/bottom feet)
-    if (font_style == 2u && row_bits == 0u && band >= 3u && gx > 0u && gx < 4u && gy >= 2u && gy <= 4u) {
-        row_bits = select(0u, 1u, (gx == 2u && gy == 3u));
-    } else if (font_style == 4u && band >= 4u && (gy == 1u || gy == 5u) && (gx == 1u || gx == 3u)) {
-        row_bits = 1u;
-    }
     return f32(row_bits);
+}
+
+fn ascii_glyph_bit(charset: u32, band: u32, gx: u32, gy: u32, font_style: u32) -> f32 {
+    if (gx >= 5u || gy >= 7u) {
+        return 0.0;
+    }
+    let base = ascii_raw_bit(charset, band, gx, gy);
+
+    // fontFamily 0: Sans / clean monospace
+    if (font_style == 0u) {
+        return base;
+    }
+    // fontFamily 1: Bold / thick (horizontal stroke dilation)
+    if (font_style == 1u) {
+        let left_b = select(0.0, ascii_raw_bit(charset, band, gx - 1u, gy), gx > 0u);
+        let up_b = select(0.0, ascii_raw_bit(charset, band, gx, gy - 1u), gy > 0u && band >= 5u);
+        return max(base, max(left_b, up_b));
+    }
+    // fontFamily 2: Block / pixel (chunky 2x2 LCD pixel grid)
+    if (font_style == 2u) {
+        let qx = min((gx / 2u) * 2u, 4u);
+        let qy = min((gy / 2u) * 2u, 6u);
+        let b0 = ascii_raw_bit(charset, band, qx, qy);
+        let b1 = select(0.0, ascii_raw_bit(charset, band, qx + 1u, qy), qx + 1u < 5u);
+        let b2 = select(0.0, ascii_raw_bit(charset, band, qx, qy + 1u), qy + 1u < 7u);
+        return max(b0, max(b1, b2));
+    }
+    // fontFamily 3: Retro / thin CRT (slim centered hairline strokes with scanline modulation)
+    if (font_style == 3u) {
+        if (base < 0.5) {
+            return 0.0;
+        }
+        let has_l = select(0.0, ascii_raw_bit(charset, band, gx - 1u, gy), gx > 0u);
+        let has_r = select(0.0, ascii_raw_bit(charset, band, gx + 1u, gy), gx + 1u < 5u);
+        let interior_h = has_l > 0.5 && has_r > 0.5 && (gy % 2u == 0u);
+        return select(select(0.72, 1.0, (gy % 2u) == 1u), 0.35, interior_h);
+    }
+    // fontFamily 4: Serif (crisp top/bottom terminal feet on vertical stems)
+    if (base > 0.5) {
+        return 1.0;
+    }
+    if ((gy == 0u || gy == 6u) && band >= 3u) {
+        let stem_near = select(ascii_raw_bit(charset, band, gx, 5u), ascii_raw_bit(charset, band, gx, 1u), gy == 0u);
+        let stem_l = select(0.0, select(ascii_raw_bit(charset, band, gx - 1u, 5u), ascii_raw_bit(charset, band, gx - 1u, 1u), gy == 0u), gx > 0u);
+        let stem_r = select(0.0, select(ascii_raw_bit(charset, band, gx + 1u, 5u), ascii_raw_bit(charset, band, gx + 1u, 1u), gy == 0u), gx + 1u < 5u);
+        return select(0.0, 1.0, stem_near > 0.5 || stem_l > 0.5 || stem_r > 0.5);
+    }
+    return 0.0;
 }
 
 @fragment
@@ -1794,7 +2222,7 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         lum_raw = lum_raw + (hash13(vec3<f32>(cell_id, floor(u.frame))) - 0.5) * u.p1.w;
     }
     var lum = clamp((lum_raw - 0.5) * u.p0.w + 0.5 + u.p0.z, 0.0, 1.0);
-    if (u.mode == 4u) {
+    if (u.mode == 4u || (u.flags & 256u) != 0u) {
         lum = 1.0 - lum;
     }
     var band = min(u32(floor(lum * 8.0)), 7u);
@@ -1853,8 +2281,16 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
             bg = u.c1.xyz;
         }
     }
-    let out_rgb = mix(bg, fg, cov * clamp(band_op, 0.0, 1.0));
-    return premultiply(out_rgb, sampled.a);
+    let glyph_a = cov * clamp(band_op, 0.0, 1.0);
+    let bg_op = clamp(u.c1.a, 0.0, 1.0);
+    let bg_rgb = mix(rgb, bg, bg_op);
+    let out_rgb = mix(bg_rgb, fg, glyph_a);
+    let ascii_out = premultiply(out_rgb, sampled.a);
+    let master_op = clamp(u.c0.a, 0.0, 1.0);
+    if (master_op >= 0.999) {
+        return ascii_out;
+    }
+    return mix(sample_diffuse(in_v.v_uv), ascii_out, master_op);
 }
 "#;
 
@@ -1890,8 +2326,50 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let split = mix(u.c0.xyz, u.c1.xyz, tone_w);
     rgb = rgb * split;
 
-    let pop = u.p0.w;
-    rgb = rgb + (rgb - vec3<f32>(lum)) * (pop * 0.25);
+    // Genuine multi-ring radial Gaussian diffusion blur blended softly over highlights
+    let diff_amt = clamp(u.p0.w, 0.0, 2.0);
+    if (diff_amt > 1e-4) {
+        let inv_res = vec2<f32>(1.0) / max(u.resolution, vec2<f32>(1.0));
+        let scale_ref = clamp(min(u.resolution.x, u.resolution.y) / 720.0, 0.25, 2.5);
+        let diff_rad = clamp((3.5 + diff_amt * 14.0) * scale_ref, 2.0, 36.0);
+        let wb_mul = vec3<f32>(1.0 + temp, 1.0 - tint, 1.0 - temp);
+        let exp_mul = exp2(u.p0.x);
+
+        var diff_acc = clamp(rgb, vec3<f32>(0.0), vec3<f32>(4.0));
+        var diff_wsum = 1.0;
+
+        // Ring 1: 8 taps at 0.45 * radius
+        let w1 = exp(-0.5 * (0.45 / 0.52) * (0.45 / 0.52));
+        for (var k: i32 = 0; k < 8; k = k + 1) {
+            let ang = f32(k) * (TAU / 8.0);
+            let suv = clamp(in_v.v_uv + vec2<f32>(cos(ang), sin(ang)) * (diff_rad * 0.45) * inv_res, vec2<f32>(0.0), vec2<f32>(1.0));
+            let tap = unpremultiply(sample_diffuse(suv)) * exp_mul * wb_mul;
+            diff_acc = diff_acc + tap * w1;
+            diff_wsum = diff_wsum + w1;
+        }
+        // Ring 2: 12 taps at 1.0 * radius
+        let w2 = exp(-0.5 * (1.0 / 0.52) * (1.0 / 0.52));
+        for (var k: i32 = 0; k < 12; k = k + 1) {
+            let ang = f32(k) * (TAU / 12.0) + (PI / 12.0);
+            let suv = clamp(in_v.v_uv + vec2<f32>(cos(ang), sin(ang)) * diff_rad * inv_res, vec2<f32>(0.0), vec2<f32>(1.0));
+            let tap = unpremultiply(sample_diffuse(suv)) * exp_mul * wb_mul;
+            diff_acc = diff_acc + tap * w2;
+            diff_wsum = diff_wsum + w2;
+        }
+
+        let diff_rgb = clamp(diff_acc / max(diff_wsum, EPS), vec3<f32>(0.0), vec3<f32>(1.0));
+        let hl_mask = smoothstep(0.25, 0.95, luma601(diff_rgb));
+        let bloom = diff_rgb * (0.35 + 0.65 * hl_mask);
+        let base_c = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+        let scr = vec3<f32>(1.0) - (vec3<f32>(1.0) - base_c) * (vec3<f32>(1.0) - bloom);
+        let sl = vec3<f32>(
+            soft_light_ch(base_c.r, diff_rgb.r),
+            soft_light_ch(base_c.g, diff_rgb.g),
+            soft_light_ch(base_c.b, diff_rgb.b),
+        );
+        let glow_blend = mix(sl, scr, 0.65);
+        rgb = mix(rgb, glow_blend, clamp(diff_amt * 0.65, 0.0, 0.92));
+    }
 
     let aspect = u.resolution.x / max(u.resolution.y, 1.0);
     let v_dist = length(center_vec * vec2<f32>(aspect, 1.0));
@@ -2036,22 +2514,43 @@ fn sglow_simplex3(v: vec3<f32>) -> f32 {
     return 42.0 * dot(m * m, vec4<f32>(dot(p0, x0), dot(p1, x1), dot(p2, x2), dot(p3, x3)));
 }
 
-fn sglow_atmosphere(uv: vec2<f32>, amp: f32, freq: f32, detail: f32, seed: f32, speed: f32, t_sec: f32) -> f32 {
+fn sglow_atmosphere(uv: vec2<f32>, amp: f32, freq: f32, detail: f32, seed: f32, speed: f32, t_sec: f32, model: f32) -> f32 {
     if (abs(amp) < 1e-5) {
         return 1.0;
     }
     let res = max(u.resolution, vec2<f32>(1.0));
     let xy = 2.8 * (uv - vec2<f32>(0.5)) * vec2<f32>(1.0, res.y / res.x);
-    var q = vec3<f32>(freq * xy, 0.1 * speed * (t_sec + 1.0)) + seed * vec3<f32>(17.17, 41.73, 93.31);
+    let freq_mul = select(select(1.0, 0.65, model > 0.5 && model < 1.5), 2.5, model >= 1.5);
+    var q = vec3<f32>(freq * freq_mul * xy, 0.1 * speed * (t_sec + 1.0)) + seed * vec3<f32>(17.17, 41.73, 93.31);
     var value = 0.0;
     var weight = 1.0;
     var energy = 0.0;
     let det = clamp(detail, 0.0, 1.0);
-    for (var octave: i32 = 0; octave < 8; octave = octave + 1) {
-        value = value + weight * sglow_simplex3(q);
-        energy = energy + weight * weight;
-        q = q * 2.0;
-        weight = weight * det;
+    if (model > 0.5 && model < 1.5) {
+        // Legacy Clouds: 4-octave billowy fBM
+        for (var octave: i32 = 0; octave < 4; octave = octave + 1) {
+            value = value + weight * (abs(sglow_simplex3(q)) * 2.0 - 1.0);
+            energy = energy + weight * weight;
+            q = q * 2.0;
+            weight = weight * (det * 0.85);
+        }
+    } else if (model >= 1.5) {
+        // Fine Dust: 6-octave high-frequency particulate noise
+        for (var octave: i32 = 0; octave < 6; octave = octave + 1) {
+            let n = sglow_simplex3(q);
+            value = value + weight * (n * n * sign(n));
+            energy = energy + weight * weight;
+            q = q * 2.25;
+            weight = weight * min(det * 1.15, 0.98);
+        }
+    } else {
+        // Standard 8-octave 3D Simplex atmosphere
+        for (var octave: i32 = 0; octave < 8; octave = octave + 1) {
+            value = value + weight * sglow_simplex3(q);
+            energy = energy + weight * weight;
+            q = q * 2.0;
+            weight = weight * det;
+        }
     }
     let noise = value / sqrt(max(energy, 1e-6)) - 0.07 * det;
     return 1.0 - amp * noise;
@@ -2177,7 +2676,7 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     if (op_mode < 0.5) {
         source.a = 1.0;
     }
-    let atmo = sglow_atmosphere(in_v.v_uv, u.p1.x, u.p1.y, u.p3.x, u.p1.z, u.p3.y, u.p1.w);
+    let atmo = sglow_atmosphere(in_v.v_uv, u.p1.x, u.p1.y, u.p3.x, u.p1.z, u.p3.y, u.p1.w, u.p3.w);
 
     if ((u.flags & 1u) != 0u) {
         let t_emit = sglow_bright(sample_diffuse(in_v.v_uv), u.p2.x, u.c1.xyz, u.p2.y, op_mode);
@@ -2238,81 +2737,126 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 /// Smart Motion Blur (`smartmotionblur` / `smart-motion-blur-lite`, Native FX / ZSMB).
-/// Multi-scale / multi-radius structure-tensor + block-matching optical-flow estimator
-/// between `t_diffuse` (current), `t_aux` (previous frame), and `t_aux2` (next frame)
-/// plus confidence-weighted shutter integration.
+/// Hierarchical coarse-to-fine block-matching optical-flow estimator with sub-pixel parabolic
+/// refinement between `t_diffuse` (current), `t_aux` (previous frame), and `t_aux2` (next frame),
+/// strict stationary / photometric-improvement confidence gating, and shutter integration.
 ///
 /// Uniforms:
 /// - `u.mode`: `0 = Result`, `1 = Motion Vectors`, `2 = Confidence`.
-/// - `u.extra`: sample count from `quality` (`0 -> 8`, `1 -> 16`, `2 -> 24`).
+/// - `u.extra`: sample count from `quality` (`8..=24`).
 /// - `flags bit 0 = hasPrev`, `bit 1 = hasNext`.
 /// - `p0 = [blurAmount, sensitivity (0..1), maxDisplacementPx, smoothness (0..1)]`.
 /// - `p1 = [shutterStart (-0.5 default), shutterSpan (1.0 default), 0, 0]`.
 pub const SHADER_SMART_MOTION_BLUR: &str = r#"
-fn smb_luma_cur(uv: vec2<f32>) -> f32 {
-    let c = sample_diffuse(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)));
-    return luma601(c.rgb) + c.a * 0.2;
+fn smb_rgba_diff(a: vec4<f32>, b: vec4<f32>) -> f32 {
+    let d = abs(a - b);
+    let max_rgb = max(d.r, max(d.g, d.b));
+    return 0.5 * luma601(d.rgb) + 0.5 * max_rgb + d.a * 0.25;
 }
 
-fn smb_luma_prev(uv: vec2<f32>) -> f32 {
-    let c = sample_aux(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)));
-    return luma601(c.rgb) + c.a * 0.2;
-}
-
-fn smb_luma_next(uv: vec2<f32>) -> f32 {
-    let c = sample_aux2(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)));
-    return luma601(c.rgb) + c.a * 0.2;
-}
-
-fn smb_structure_tensor_flow(
+fn smb_cand_cost(
     uv: vec2<f32>,
-    step_uv: vec2<f32>,
+    off_px: vec2<f32>,
+    inv_res: vec2<f32>,
+    patch_r: f32,
     has_prev: bool,
     has_next: bool,
-    base_shift_uv: vec2<f32>,
-) -> vec3<f32> {
-    // 3x3 windowed Lucas-Kanade structure tensor around `uv` with coarse warp `base_shift_uv`.
-    var ixx = 0.0;
-    var ixy = 0.0;
-    var iyy = 0.0;
-    var ixt = 0.0;
-    var iyt = 0.0;
-    var res_sum = 0.0;
+    c0: vec4<f32>,
+    cl: vec4<f32>,
+    cr: vec4<f32>,
+    cu: vec4<f32>,
+    cd: vec4<f32>,
+) -> f32 {
+    let off_uv = off_px * inv_res;
+    let dx = vec2<f32>(inv_res.x * patch_r, 0.0);
+    let dy = vec2<f32>(0.0, inv_res.y * patch_r);
+    let lo = 0.5 * inv_res;
+    let hi = vec2<f32>(1.0) - lo;
 
-    for (var wy: i32 = -1; wy <= 1; wy = wy + 1) {
-        for (var wx: i32 = -1; wx <= 1; wx = wx + 1) {
-            let p = uv + vec2<f32>(f32(wx), f32(wy)) * step_uv;
-            let lc = smb_luma_cur(p);
-            let gx = (smb_luma_cur(p + vec2<f32>(step_uv.x, 0.0)) - smb_luma_cur(p - vec2<f32>(step_uv.x, 0.0))) * 0.5;
-            let gy = (smb_luma_cur(p + vec2<f32>(0.0, step_uv.y)) - smb_luma_cur(p - vec2<f32>(0.0, step_uv.y))) * 0.5;
-            var dt = 0.0;
-            if (has_prev && has_next) {
-                let lp = smb_luma_prev(p - base_shift_uv);
-                let ln = smb_luma_next(p + base_shift_uv);
-                dt = (ln - lp) * 0.5;
-            } else if (has_prev) {
-                dt = lc - smb_luma_prev(p - base_shift_uv);
-            } else {
-                dt = smb_luma_next(p + base_shift_uv) - lc;
-            }
-            ixx = ixx + gx * gx;
-            ixy = ixy + gx * gy;
-            iyy = iyy + gy * gy;
-            ixt = ixt + gx * dt;
-            iyt = iyt + gy * dt;
-            res_sum = res_sum + abs(dt);
+    var acc = 0.0;
+    var denom = 0.0;
+
+    if (has_prev) {
+        let qp = uv - off_uv;
+        if (qp.x < 0.0 || qp.x > 1.0 || qp.y < 0.0 || qp.y > 1.0) {
+            return 2.0;
+        }
+        let d0 = smb_rgba_diff(c0, sample_aux(clamp(qp, lo, hi)));
+        let dl = smb_rgba_diff(cl, sample_aux(clamp(qp - dx, lo, hi)));
+        let dr = smb_rgba_diff(cr, sample_aux(clamp(qp + dx, lo, hi)));
+        let du = smb_rgba_diff(cu, sample_aux(clamp(qp - dy, lo, hi)));
+        let dd = smb_rgba_diff(cd, sample_aux(clamp(qp + dy, lo, hi)));
+        acc = acc + (d0 + dl + dr + du + dd) * 0.2;
+        denom = denom + 1.0;
+    }
+
+    if (has_next) {
+        let qn = uv + off_uv;
+        if (qn.x < 0.0 || qn.x > 1.0 || qn.y < 0.0 || qn.y > 1.0) {
+            return 2.0;
+        }
+        let d0 = smb_rgba_diff(c0, sample_aux2(clamp(qn, lo, hi)));
+        let dl = smb_rgba_diff(cl, sample_aux2(clamp(qn - dx, lo, hi)));
+        let dr = smb_rgba_diff(cr, sample_aux2(clamp(qn + dx, lo, hi)));
+        let du = smb_rgba_diff(cu, sample_aux2(clamp(qn - dy, lo, hi)));
+        let dd = smb_rgba_diff(cd, sample_aux2(clamp(qn + dy, lo, hi)));
+        acc = acc + (d0 + dl + dr + du + dd) * 0.2;
+        denom = denom + 1.0;
+    }
+
+    return acc / max(denom, 1.0);
+}
+
+fn smb_search_level(
+    uv: vec2<f32>,
+    init_px: vec2<f32>,
+    step_px: f32,
+    inv_res: vec2<f32>,
+    reg_pen: f32,
+    has_prev: bool,
+    has_next: bool,
+) -> vec2<f32> {
+    let patch_r = clamp(step_px * 0.5, 1.0, 32.0);
+    let dx = vec2<f32>(inv_res.x * patch_r, 0.0);
+    let dy = vec2<f32>(0.0, inv_res.y * patch_r);
+    let lo = 0.5 * inv_res;
+    let hi = vec2<f32>(1.0) - lo;
+
+    let c0 = sample_diffuse(clamp(uv, lo, hi));
+    let cl = sample_diffuse(clamp(uv - dx, lo, hi));
+    let cr = sample_diffuse(clamp(uv + dx, lo, hi));
+    let cu = sample_diffuse(clamp(uv - dy, lo, hi));
+    let cd = sample_diffuse(clamp(uv + dy, lo, hi));
+
+    // Always allow zero-motion to reclaim the candidate at every scale.
+    var best_px = vec2<f32>(0.0);
+    var best_score = smb_cand_cost(uv, best_px, inv_res, patch_r, has_prev, has_next, c0, cl, cr, cu, cd);
+
+    if (length(init_px) > 1e-4) {
+        let init_score = smb_cand_cost(uv, init_px, inv_res, patch_r, has_prev, has_next, c0, cl, cr, cu, cd)
+            + reg_pen * length(init_px);
+        if (init_score < best_score) {
+            best_score = init_score;
+            best_px = init_px;
         }
     }
 
-    let reg = 0.004;
-    let a = ixx + reg;
-    let b = ixy;
-    let d = iyy + reg;
-    let det = a * d - b * b;
-    let inv_det = 1.0 / max(abs(det), 1e-6);
-    let vx = (-d * ixt + b * iyt) * inv_det;
-    let vy = (b * ixt - a * iyt) * inv_det;
-    return vec3<f32>(vx, vy, res_sum / 9.0);
+    let base_px = init_px;
+    for (var j: i32 = -1; j <= 1; j = j + 1) {
+        for (var i: i32 = -1; i <= 1; i = i + 1) {
+            if (i == 0 && j == 0) {
+                continue;
+            }
+            let cand_px = base_px + vec2<f32>(f32(i), f32(j)) * step_px;
+            let score = smb_cand_cost(uv, cand_px, inv_res, patch_r, has_prev, has_next, c0, cl, cr, cu, cd)
+                + reg_pen * length(cand_px);
+            if (score < best_score) {
+                best_score = score;
+                best_px = cand_px;
+            }
+        }
+    }
+    return best_px;
 }
 
 @fragment
@@ -2320,6 +2864,117 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let cur = sample_diffuse(in_v.v_uv);
     let has_prev = (u.flags & 1u) != 0u;
     let has_next = (u.flags & 2u) != 0u;
+    let res = max(u.resolution, vec2<f32>(1.0));
+    let inv_res = vec2<f32>(1.0) / res;
+    let lo = 0.5 * inv_res;
+    let hi = vec2<f32>(1.0) - lo;
+    let sensitivity = clamp(u.p0.y, 0.0, 1.0);
+    let max_d = clamp(u.p0.z, 1.0, 256.0);
+    let smooth_w = clamp(u.p0.w, 0.0, 1.0);
+
+    // Pass 0: Multi-scale optical flow estimation -> Rgba16Float (xy = vel_px, z = conf, w = 1.0)
+    if (u.pass_idx == 0u) {
+        if (!has_prev && !has_next) {
+            return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        }
+
+        // Fine 1-pixel 5-point cross patch on current frame for stationary detection & final refinement.
+        let dx1 = vec2<f32>(inv_res.x, 0.0);
+        let dy1 = vec2<f32>(0.0, inv_res.y);
+        let c0 = cur;
+        let cl = sample_diffuse(clamp(in_v.v_uv - dx1, lo, hi));
+        let cr = sample_diffuse(clamp(in_v.v_uv + dx1, lo, hi));
+        let cu = sample_diffuse(clamp(in_v.v_uv - dy1, lo, hi));
+        let cd = sample_diffuse(clamp(in_v.v_uv + dy1, lo, hi));
+
+        // Exact stationary fast-path: identical or near-identical pixels never blur.
+        let zero_cost = smb_cand_cost(in_v.v_uv, vec2<f32>(0.0), inv_res, 1.0, has_prev, has_next, c0, cl, cr, cu, cd);
+        if (zero_cost < 0.012) {
+            return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        }
+
+        // Honor full maxDisplacement up to 256px via dynamic coarse-to-fine pyramid (up to 7 octaves + 1px fine).
+        let max_reach = clamp(max_d * max(sensitivity, 0.05), 1.0, min(max_d, max(res.x, res.y) * 0.75));
+        let max_step = clamp(max_reach * 0.5, 4.0, 128.0);
+        let reg_pen = (0.002 + 0.004 * smooth_w) / max(max_reach, 1.0);
+
+        var best_px = vec2<f32>(0.0);
+        var step_px = max_step;
+        for (var oct: i32 = 0; oct < 7; oct = oct + 1) {
+            if (step_px < 1.5) {
+                break;
+            }
+            best_px = smb_search_level(in_v.v_uv, best_px, step_px, inv_res, reg_pen, has_prev, has_next);
+            step_px = step_px * 0.5;
+        }
+
+        // Finest 1-pixel search reusing c0/cl/cr/cu/cd, always keeping zero-motion eligible.
+        let fine_base = best_px;
+        var best_cost = zero_cost;
+        var best_score = zero_cost;
+        best_px = vec2<f32>(0.0);
+
+        if (length(fine_base) > 1e-4) {
+            let base_cost = smb_cand_cost(in_v.v_uv, fine_base, inv_res, 1.0, has_prev, has_next, c0, cl, cr, cu, cd);
+            let base_score = base_cost + reg_pen * length(fine_base);
+            if (base_score < best_score) {
+                best_score = base_score;
+                best_cost = base_cost;
+                best_px = fine_base;
+            }
+        }
+
+        for (var j: i32 = -1; j <= 1; j = j + 1) {
+            for (var i: i32 = -1; i <= 1; i = i + 1) {
+                if (i == 0 && j == 0) {
+                    continue;
+                }
+                let cand_px = fine_base + vec2<f32>(f32(i), f32(j));
+                let c_cost = smb_cand_cost(in_v.v_uv, cand_px, inv_res, 1.0, has_prev, has_next, c0, cl, cr, cu, cd);
+                let score = c_cost + reg_pen * length(cand_px);
+                if (score < best_score) {
+                    best_score = score;
+                    best_cost = c_cost;
+                    best_px = cand_px;
+                }
+            }
+        }
+
+        // Bounded sub-pixel parabolic refinement around integer match.
+        var vel_px_raw = best_px;
+        if (length(best_px) > 1e-4) {
+            let cmx = smb_cand_cost(in_v.v_uv, best_px - vec2<f32>(1.0, 0.0), inv_res, 1.0, has_prev, has_next, c0, cl, cr, cu, cd);
+            let cpx = smb_cand_cost(in_v.v_uv, best_px + vec2<f32>(1.0, 0.0), inv_res, 1.0, has_prev, has_next, c0, cl, cr, cu, cd);
+            let cmy = smb_cand_cost(in_v.v_uv, best_px - vec2<f32>(0.0, 1.0), inv_res, 1.0, has_prev, has_next, c0, cl, cr, cu, cd);
+            let cpy = smb_cand_cost(in_v.v_uv, best_px + vec2<f32>(0.0, 1.0), inv_res, 1.0, has_prev, has_next, c0, cl, cr, cu, cd);
+            let dx_den = cmx - 2.0 * best_cost + cpx;
+            let dy_den = cmy - 2.0 * best_cost + cpy;
+            if (dx_den > 1e-4) {
+                vel_px_raw.x = vel_px_raw.x + clamp(0.5 * (cmx - cpx) / dx_den, -0.5, 0.5);
+            }
+            if (dy_den > 1e-4) {
+                vel_px_raw.y = vel_px_raw.y + clamp(0.5 * (cmy - cpy) / dy_den, -0.5, 0.5);
+            }
+        }
+
+        let v_len = length(vel_px_raw);
+        let vel_clamped = select(vel_px_raw, vel_px_raw * (max_d / max(v_len, EPS)), v_len > max_d);
+        let final_cost = select(
+            best_cost,
+            smb_cand_cost(in_v.v_uv, vel_clamped, inv_res, 1.0, has_prev, has_next, c0, cl, cr, cu, cd),
+            v_len > 1e-4,
+        );
+
+        let improvement = max(zero_cost - final_cost, 0.0);
+        let rel_drop = improvement / max(zero_cost, 1e-4);
+        let match_conf = smoothstep(0.18, 0.45, rel_drop) * smoothstep(0.008, 0.03, improvement);
+        let cut_conf = 1.0 - smoothstep(0.22, 0.50, final_cost);
+        let mag_conf = smoothstep(0.35, 1.0, v_len);
+        let conf = clamp(match_conf * cut_conf * mag_conf, 0.0, 1.0);
+        return vec4<f32>(vel_clamped.x, vel_clamped.y, conf, 1.0);
+    }
+
+    // Pass 1: Bilateral spatial flow smoothing (honoring `smoothness`) + directional motion-blur gather.
     if (!has_prev && !has_next) {
         if (u.mode == 1u) {
             return vec4<f32>(0.5, 0.5, 0.0, 1.0);
@@ -2330,71 +2985,59 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         return cur;
     }
 
-    let res = max(u.resolution, vec2<f32>(1.0));
-    let inv_res = vec2<f32>(1.0) / res;
-    let sensitivity = clamp(u.p0.y, 0.0, 1.0);
-    let max_d = max(u.p0.z, 1.0);
-    let smooth_w = clamp(u.p0.w, 0.0, 1.0);
+    let flow0 = sample_aux(clamp(in_v.v_uv, lo, hi));
+    var vel_sm = flow0.xy;
+    var conf_sm = flow0.z;
 
-    // Stage 1: Coarse multi-direction block-matching search to capture larger motions
-    let coarse_r = (3.0 + smooth_w * 5.0) * (0.4 + sensitivity * 1.2);
-    let coarse_step = inv_res * coarse_r;
-    var best_cost = 1e9;
-    var best_dir = vec2<f32>(0.0);
-    let lc0 = smb_luma_cur(in_v.v_uv);
-    let lcx = smb_luma_cur(in_v.v_uv + vec2<f32>(inv_res.x * 2.0, 0.0));
-    let lcy = smb_luma_cur(in_v.v_uv + vec2<f32>(0.0, inv_res.y * 2.0));
-    for (var j: i32 = -1; j <= 1; j = j + 1) {
-        for (var i: i32 = -1; i <= 1; i = i + 1) {
-            let off_uv = vec2<f32>(f32(i), f32(j)) * coarse_step;
-            var c_cost = 0.0;
-            if (has_prev) {
-                c_cost = c_cost
-                    + abs(lc0 - smb_luma_prev(in_v.v_uv - off_uv))
-                    + abs(lcx - smb_luma_prev(in_v.v_uv + vec2<f32>(inv_res.x * 2.0, 0.0) - off_uv))
-                    + abs(lcy - smb_luma_prev(in_v.v_uv + vec2<f32>(0.0, inv_res.y * 2.0) - off_uv));
+    if (smooth_w > 1e-3) {
+        let cur_rgb = unpremultiply(cur);
+        let rad_step = mix(1.0, 2.75, smooth_w);
+        let sigma_s = mix(0.85, 2.1, smooth_w);
+        let inv2s2 = 0.5 / (sigma_s * sigma_s);
+        let sigma_r = mix(0.08, 0.24, smooth_w);
+        let inv2r2 = 0.5 / (sigma_r * sigma_r);
+        var v_acc = vec2<f32>(0.0);
+        var c_acc = 0.0;
+        var w_acc = 0.0;
+        for (var j: i32 = -2; j <= 2; j = j + 1) {
+            for (var i: i32 = -2; i <= 2; i = i + 1) {
+                let suv = clamp(in_v.v_uv + vec2<f32>(f32(i), f32(j)) * rad_step * inv_res, lo, hi);
+                let nc = sample_diffuse(suv);
+                let nrgb = unpremultiply(nc);
+                let nf = sample_aux(suv);
+                let d2 = f32(i * i + j * j);
+                let cd = length(nrgb - cur_rgb) + abs(nc.a - cur.a) * 0.5;
+                let w_sp = exp(-d2 * inv2s2);
+                let w_rg = exp(-(cd * cd) * inv2r2);
+                let w_cf = 0.15 + 0.85 * nf.z;
+                let w = w_sp * w_rg * w_cf;
+                v_acc = v_acc + nf.xy * w;
+                c_acc = c_acc + nf.z * w;
+                w_acc = w_acc + w;
             }
-            if (has_next) {
-                c_cost = c_cost
-                    + abs(lc0 - smb_luma_next(in_v.v_uv + off_uv))
-                    + abs(lcx - smb_luma_next(in_v.v_uv + vec2<f32>(inv_res.x * 2.0, 0.0) + off_uv))
-                    + abs(lcy - smb_luma_next(in_v.v_uv + vec2<f32>(0.0, inv_res.y * 2.0) + off_uv));
-            }
-            c_cost = c_cost + 0.015 * length(vec2<f32>(f32(i), f32(j)));
-            if (c_cost < best_cost) {
-                best_cost = c_cost;
-                best_dir = off_uv;
-            }
+        }
+        if (w_acc > EPS) {
+            vel_sm = mix(flow0.xy, v_acc / w_acc, smooth_w);
+            conf_sm = mix(flow0.z, c_acc / w_acc, smooth_w * 0.7);
         }
     }
 
-    // Stage 2: Fine structure-tensor refinement around coarse block match
-    let fine_step = inv_res * (1.5 + smooth_w * 3.0);
-    let st_fine = smb_structure_tensor_flow(in_v.v_uv, fine_step, has_prev, has_next, best_dir);
-    let st_coarse = smb_structure_tensor_flow(in_v.v_uv, fine_step * 2.5, has_prev, has_next, best_dir);
-    let delta_px = (st_fine.xy * 0.65 + st_coarse.xy * 0.35) * (1.5 + smooth_w * 3.0) * (sensitivity * 2.5);
-    let vel_px_raw = best_dir * res * sensitivity + delta_px;
-    let v_len = length(vel_px_raw);
-    let vel_clamped = select(vel_px_raw, vel_px_raw * (max_d / max(v_len, EPS)), v_len > max_d);
-    let vel_uv = vel_clamped * inv_res;
-
-    // Confidence rejects scene cuts and stationary flat noise
-    let residual = min(st_fine.z, st_coarse.z);
-    let cut_conf = 1.0 - smoothstep(0.32, 0.72, residual);
-    let mag_conf = smoothstep(0.02, 0.25, v_len);
-    let conf = clamp(cut_conf * mag_conf, 0.0, 1.0);
-
     if (u.mode == 1u) {
-        let vis = clamp(vel_clamped / max_d * 0.5 + vec2<f32>(0.5), vec2<f32>(0.0), vec2<f32>(1.0));
+        let vis = clamp((vel_sm * conf_sm) / max_d * 0.5 + vec2<f32>(0.5), vec2<f32>(0.0), vec2<f32>(1.0));
         return vec4<f32>(vis.x, vis.y, 0.5, 1.0);
     }
     if (u.mode == 2u) {
-        return vec4<f32>(conf, conf, conf, 1.0);
+        return vec4<f32>(conf_sm, conf_sm, conf_sm, 1.0);
     }
 
     let shutter_start = u.p1.x;
     let shutter_span = u.p1.y;
-    let shutter = vel_uv * u.p0.x * conf;
+    let shutter_px = vel_sm * u.p0.x * conf_sm;
+    if (length(shutter_px) * abs(shutter_span) < 0.35) {
+        return cur;
+    }
+
+    let shutter = shutter_px * inv_res;
     let taps = clamp(i32(u.extra), 8, 24);
     var sum = vec4<f32>(0.0);
     var wsum = 0.0;
@@ -2404,9 +3047,8 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         }
         let frac = (f32(i) + 0.5) / f32(taps);
         let t = shutter_start + frac * shutter_span;
-        let uv_s = clamp(in_v.v_uv + shutter * t, vec2<f32>(0.0), vec2<f32>(1.0));
+        let uv_s = clamp(in_v.v_uv + shutter * t, lo, hi);
         let tap_c = sample_diffuse(uv_s);
-        // Subtle center-biased tent weighting prevents ghost fringes
         let w = 1.0 - 0.15 * abs(frac - 0.5);
         sum = sum + tap_c * w;
         wsum = wsum + w;
@@ -2476,7 +3118,7 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
                 wet = vec4<f32>(rgb, max(base.a, tap.a));
             }
         }
-        let str_w = clamp(u.p0.z, 0.0, 1.0);
+        let str_w = select(1.0, clamp(u.p0.z, 0.0, 1.0), u.p1.y > 0.5);
         let mixed = mix(base, wet, str_w);
         let out_a = clamp(mixed.a, 0.0, 1.0);
         return vec4<f32>(clamp(mixed.rgb, vec3<f32>(0.0), vec3<f32>(out_a)), out_a);

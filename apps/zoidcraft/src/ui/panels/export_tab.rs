@@ -39,6 +39,26 @@ fn audio_codec_label(c: ExportAudioCodec) -> &'static str {
 }
 
 pub(crate) fn available_export_containers(mp4_enabled: bool) -> &'static [ExportContainer] {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if mp4_enabled {
+            &[
+                ExportContainer::Mp4,
+                ExportContainer::WebM,
+                ExportContainer::PngSequence,
+                ExportContainer::Wav,
+                ExportContainer::M4a,
+            ]
+        } else {
+            &[
+                ExportContainer::WebM,
+                ExportContainer::PngSequence,
+                ExportContainer::Wav,
+                ExportContainer::M4a,
+            ]
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
     if mp4_enabled {
         &ExportContainer::ALL
     } else {
@@ -86,12 +106,25 @@ pub(crate) fn allowed_audio_codecs(container: ExportContainer) -> &'static [Expo
             ExportAudioCodec::None,
         ],
         ExportContainer::WebM => &[ExportAudioCodec::Opus, ExportAudioCodec::None],
-        ExportContainer::Mkv => &[
-            ExportAudioCodec::AacLc,
-            ExportAudioCodec::Opus,
-            ExportAudioCodec::PcmS16Le,
-            ExportAudioCodec::None,
-        ],
+        ExportContainer::Mkv => {
+            #[cfg(target_arch = "wasm32")]
+            {
+                &[
+                    ExportAudioCodec::AacLc,
+                    ExportAudioCodec::Opus,
+                    ExportAudioCodec::None,
+                ]
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                &[
+                    ExportAudioCodec::AacLc,
+                    ExportAudioCodec::Opus,
+                    ExportAudioCodec::PcmS16Le,
+                    ExportAudioCodec::None,
+                ]
+            }
+        }
         ExportContainer::PngSequence | ExportContainer::Gif => &[ExportAudioCodec::None],
         ExportContainer::Wav => &[ExportAudioCodec::PcmS16Le],
         ExportContainer::M4a => &[ExportAudioCodec::AacLc],
@@ -102,11 +135,19 @@ pub(crate) fn supports_transparent_alpha(
     container: ExportContainer,
     video_codec: ExportVideoCodec,
 ) -> bool {
-    matches!(
-        container,
-        ExportContainer::PngSequence | ExportContainer::Gif
-    ) || (matches!(container, ExportContainer::WebM | ExportContainer::Mkv)
-        && video_codec == ExportVideoCodec::Vp9)
+    #[cfg(target_arch = "wasm32")]
+    {
+        container == ExportContainer::PngSequence
+            || (container == ExportContainer::WebM && video_codec == ExportVideoCodec::Vp9)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        matches!(
+            container,
+            ExportContainer::PngSequence | ExportContainer::Gif
+        ) || (matches!(container, ExportContainer::WebM | ExportContainer::Mkv)
+            && matches!(video_codec, ExportVideoCodec::Vp9 | ExportVideoCodec::Vp8))
+    }
 }
 
 pub(crate) fn sanitize_export_settings(settings: &mut ExportSettings, mp4_enabled: bool) {
@@ -411,6 +452,16 @@ pub(super) fn show_export_tab(
     actions: &mut Vec<PanelAction>,
 ) {
     let mp4_enabled = session.plugins.is_enabled("mp4-export");
+    #[cfg(not(target_arch = "wasm32"))]
+    let legacy_enabled = session.plugins.is_enabled("openzoid-legacy");
+    #[cfg(not(target_arch = "wasm32"))]
+    if !legacy_enabled {
+        state.export_settings.datamosh_mode = 0;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        state.export_settings.datamosh_mode = 0;
+    }
     let available_containers = available_export_containers(mp4_enabled);
 
     // Auto-coerce container, video codec, audio codec, alpha, and CRF bounds
@@ -715,6 +766,23 @@ pub(super) fn show_export_tab(
                     });
                     ui.add_space(4.0);
 
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        Frame::NONE
+                            .fill(BG_TITLE)
+                            .stroke(Stroke::new(1.0, BORDER_CONTROL))
+                            .inner_margin(egui::Margin::symmetric(8, 5))
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.label(
+                                    egui::RichText::new("Web build: MP4 / WebM / PNG / JPEG / WebP")
+                                        .font(theme.font(FONT_SMALL))
+                                        .color(theme.value()),
+                                );
+                            });
+                        ui.add_space(4.0);
+                    }
+
                     // FFmpeg status bar (shown for video device render modes)
                     if needs_ffmpeg {
                         #[cfg(not(target_arch = "wasm32"))]
@@ -732,11 +800,25 @@ pub(super) fn show_export_tab(
                             .inner_margin(egui::Margin::symmetric(8, 5))
                             .show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
+                                ui.spacing_mut().item_spacing.y = 4.0;
                                 ui.label(
                                     egui::RichText::new(encoding_status)
-                                    .font(theme.font(FONT_SMALL))
-                                    .color(ff_color),
+                                        .font(theme.font(FONT_SMALL))
+                                        .color(ff_color),
                                 );
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if !state.export_status.ffmpeg_available
+                                    && cm3_prop_button(
+                                        ui,
+                                        "Install / Setup FFmpeg...",
+                                        ButtonVariant::Primary,
+                                        true,
+                                        theme,
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(PanelAction::OpenFfmpegSetup);
+                                }
                             });
                         ui.add_space(4.0);
                     }
@@ -918,9 +1000,106 @@ pub(super) fn show_export_tab(
                                     }
                                 }
                             }
+
+                            // Native Hardware Acceleration & Encoder Speed Preset
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                let probed_hw = if state.export_status.ffmpeg_available {
+                                    crate::export_worker::ensure_hw_encoders_probed(
+                                        state.app_settings.ffmpeg_path.as_deref().map(std::path::Path::new),
+                                    )
+                                } else {
+                                    None
+                                };
+                                let mut hw_opts: Vec<(zc_export::HardwareAcceleration, &str)> = vec![
+                                    (zc_export::HardwareAcceleration::Off, "Off (CPU)"),
+                                    (zc_export::HardwareAcceleration::Auto, "Auto"),
+                                ];
+                                let is_macos = cfg!(target_os = "macos");
+                                let is_linux = cfg!(target_os = "linux");
+                                let has_vt = probed_hw
+                                    .is_some_and(|p| p.h264_videotoolbox || p.hevc_videotoolbox);
+                                let has_nvenc =
+                                    probed_hw.is_some_and(|p| p.h264_nvenc || p.hevc_nvenc);
+                                let has_vaapi = probed_hw.is_some_and(|p| p.h264_vaapi);
+                                if is_macos || has_vt {
+                                    hw_opts.push((
+                                        zc_export::HardwareAcceleration::VideoToolbox,
+                                        "VideoToolbox",
+                                    ));
+                                }
+                                if !is_macos || has_nvenc {
+                                    hw_opts.push((zc_export::HardwareAcceleration::Nvenc, "NVENC"));
+                                }
+                                if is_linux || has_vaapi {
+                                    hw_opts.push((zc_export::HardwareAcceleration::Vaapi, "VAAPI"));
+                                }
+                                let current_hw = crate::export_worker::export_hardware_acceleration();
+                                let mut hw_idx = hw_opts
+                                    .iter()
+                                    .position(|(h, _)| *h == current_hw)
+                                    .unwrap_or(0);
+                                let hw_labels: Vec<&str> = hw_opts.iter().map(|(_, l)| *l).collect();
+                                if cm3_property_row_aligned(
+                                    ui,
+                                    "Hardware accel",
+                                    false,
+                                    export_cols,
+                                    theme,
+                                    |_| {},
+                                    |ui| {
+                                        export_uniform_dropdown(
+                                            ui,
+                                            Id::unique("exp_hw_accel"),
+                                            &mut hw_idx,
+                                            &hw_labels,
+                                            viewport_rect,
+                                            theme,
+                                        )
+                                    },
+                                ) {
+                                    crate::export_worker::set_export_hardware_acceleration(
+                                        hw_opts[hw_idx].0,
+                                    );
+                                }
+
+                                const SPEED_OPTS: [zc_export::EncoderSpeedPreset; 3] = [
+                                    zc_export::EncoderSpeedPreset::Fast,
+                                    zc_export::EncoderSpeedPreset::Balanced,
+                                    zc_export::EncoderSpeedPreset::Slow,
+                                ];
+                                const SPEED_LABELS: [&str; 3] = ["Fast", "Balanced", "Slow"];
+                                let current_speed = crate::export_worker::export_speed_preset();
+                                let mut sp_idx = SPEED_OPTS
+                                    .iter()
+                                    .position(|s| *s == current_speed)
+                                    .unwrap_or(1);
+                                if cm3_property_row_aligned(
+                                    ui,
+                                    "Encoder speed",
+                                    false,
+                                    export_cols,
+                                    theme,
+                                    |_| {},
+                                    |ui| {
+                                        export_uniform_dropdown(
+                                            ui,
+                                            Id::unique("exp_speed_preset"),
+                                            &mut sp_idx,
+                                            &SPEED_LABELS,
+                                            viewport_rect,
+                                            theme,
+                                        )
+                                    },
+                                ) {
+                                    crate::export_worker::set_export_speed_preset(
+                                        SPEED_OPTS[sp_idx],
+                                    );
+                                }
+                            }
                         }
 
-                        // Transparent alpha (PNG Sequence, GIF, or VP9 in WebM/MKV)
+                        // Transparent alpha (PNG Sequence, GIF, or VP9/VP8 in WebM/MKV on native; PNG/VP9 WebM on web)
                         let show_alpha = supports_transparent_alpha(
                             state.export_settings.container,
                             state.export_settings.video_codec,
@@ -946,6 +1125,37 @@ pub(super) fn show_export_tab(
                                 },
                             ) {
                                 state.export_settings.transparent_alpha = alpha_idx != 0;
+                            }
+                        }
+
+                        // True Datamosh post-export WebM/MKV I-frame stripper (native + openzoid-legacy plugin only)
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if legacy_enabled
+                            && matches!(
+                                state.export_settings.container,
+                                ExportContainer::WebM | ExportContainer::Mkv
+                            )
+                        {
+                            let mut dm_idx = state.export_settings.datamosh_mode.min(2);
+                            if cm3_property_row_aligned(
+                                ui,
+                                "True Datamosh",
+                                false,
+                                export_cols,
+                                theme,
+                                |_| {},
+                                |ui| {
+                                    export_uniform_dropdown(
+                                        ui,
+                                        Id::unique("exp_datamosh_mode"),
+                                        &mut dm_idx,
+                                        &["Off", "Full video", "At clip cuts"],
+                                        viewport_rect,
+                                        theme,
+                                    )
+                                },
+                            ) {
+                                state.export_settings.datamosh_mode = dm_idx;
                             }
                         }
 
@@ -1039,6 +1249,31 @@ pub(super) fn show_export_tab(
                         }
                     }
 
+                    // Single-frame image format selector (PNG / JPG / WebP)
+                    if !is_device {
+                        let mut fmt_idx = state.export_frame_format.min(2);
+                        if cm3_property_row_aligned(
+                            ui,
+                            "Image format",
+                            false,
+                            export_cols,
+                            theme,
+                            |_| {},
+                            |ui| {
+                                export_uniform_dropdown(
+                                    ui,
+                                    Id::unique("exp_frame_format"),
+                                    &mut fmt_idx,
+                                    &["PNG (.png)", "JPEG (.jpg)", "WebP (.webp)"],
+                                    viewport_rect,
+                                    theme,
+                                )
+                            },
+                        ) {
+                            state.export_frame_format = fmt_idx;
+                        }
+                    }
+
                     // Resolution (shown for Video, PNG Sequence, GIF, and Single Frame; hidden for audio-only)
                     if !is_audio_only {
                         let mut res = [
@@ -1068,6 +1303,35 @@ pub(super) fn show_export_tab(
                             state.export_settings.width = res[0].round().clamp(16.0, 7680.0) as u32;
                             state.export_settings.height =
                                 res[1].round().clamp(16.0, 7680.0) as u32;
+                        }
+
+                        // Aspect-ratio fit mode when export aspect differs from sequence aspect
+                        let [seq_w, seq_h] = session.document().resolution;
+                        let seq_aspect = f64::from(seq_w.max(1)) / f64::from(seq_h.max(1));
+                        let exp_aspect = f64::from(state.export_settings.width.max(1))
+                            / f64::from(state.export_settings.height.max(1));
+                        if (seq_aspect - exp_aspect).abs() > 0.01 {
+                            let mut am_idx = state.export_aspect_mode.min(2);
+                            if cm3_property_row_aligned(
+                                ui,
+                                "Aspect fit",
+                                false,
+                                export_cols,
+                                theme,
+                                |_| {},
+                                |ui| {
+                                    export_uniform_dropdown(
+                                        ui,
+                                        Id::unique("exp_aspect_mode"),
+                                        &mut am_idx,
+                                        &["Stretch", "Crop", "Black fill"],
+                                        viewport_rect,
+                                        theme,
+                                    )
+                                },
+                            ) {
+                                state.export_aspect_mode = am_idx;
+                            }
                         }
                     }
 
@@ -1139,6 +1403,44 @@ pub(super) fn show_export_tab(
 
                     ui.add_space(8.0);
 
+                    // Live Export Frame Preview Thumbnail (when actively rendering)
+                    if state.export_status.exporting
+                        && let Some((pw, ph, ref rgba)) = state.export_preview_rgba
+                        && pw > 0
+                        && ph > 0
+                        && rgba.len() == (pw as usize) * (ph as usize) * 4
+                    {
+                        let img = egui::ColorImage::from_rgba_unmultiplied(
+                            [pw as usize, ph as usize],
+                            rgba,
+                        );
+                        let tex = ui.ctx().load_texture(
+                            "zc_live_export_preview_thumb",
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        let avail_w = ui.available_width().max(64.0);
+                        let aspect = pw as f32 / ph as f32;
+                        let draw_h = (avail_w / aspect).clamp(48.0, 136.0);
+                        let draw_w = (draw_h * aspect).min(avail_w);
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(avail_w, draw_h), Sense::hover());
+                        let thumb_rect = Rect::from_center_size(rect.center(), Vec2::new(draw_w, draw_h));
+                        ui.painter().rect_filled(rect, CornerRadius::ZERO, BG_SUNKEN);
+                        ui.painter().image(
+                            tex.id(),
+                            thumb_rect,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        ui.painter().rect_stroke(
+                            rect,
+                            CornerRadius::ZERO,
+                            Stroke::new(1.0, BORDER_CONTROL),
+                            StrokeKind::Inside,
+                        );
+                        ui.add_space(6.0);
+                    }
+
                     // Live Progress Bar (#222222 track, #384668 accent fill, Spec 01 §2.5)
                     if state.export_status.exporting || state.export_status.progress > 0.0 {
                         let p = state.export_status.progress.clamp(0.0, 1.0);
@@ -1207,7 +1509,11 @@ pub(super) fn show_export_tab(
                                 | ExportContainer::Mkv => "Start video render",
                             }
                         } else {
-                            "Export current frame (PNG)"
+                            match state.export_frame_format {
+                                1 => "Export current frame (JPEG)",
+                                2 => "Export current frame (WebP)",
+                                _ => "Export current frame (PNG)",
+                            }
                         };
                         let can_start = !needs_ffmpeg || state.export_status.ffmpeg_available;
                         if can_start {

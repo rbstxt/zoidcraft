@@ -2575,3 +2575,420 @@ fn fallback_glyph_contours(ch: char, curve_segments: u32) -> (Vec<(Vec<Vec2>, bo
     out.extend(stroke_polys);
     (out, adv)
 }
+
+// ---------------------------------------------------------------------------
+// 2D TrueType / OpenType Glyph Outline Extraction (for Shape+ & 2D vector text)
+// ---------------------------------------------------------------------------
+
+/// Extracted 2D glyph outline in Y-up coordinates scaled to `font_size` units,
+/// with origin at the glyph's baseline left.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlyphOutline2D {
+    pub contours: Vec<Vec<[f64; 2]>>,
+    pub advance: f64,
+}
+
+/// Extracted 2D glyph outline as exact cubic Bezier contours (`[x, y, in_x, in_y, out_x, out_y]`)
+/// in Y-up coordinates scaled to `font_size` units, with origin at the glyph's baseline left.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlyphBezierOutline2D {
+    pub contours: Vec<Vec<[f64; 6]>>,
+    pub advance: f64,
+}
+
+#[inline]
+fn pt2_dist_sq(a: [f64; 2], b: [f64; 2]) -> f64 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    dx * dx + dy * dy
+}
+
+#[inline]
+fn push_pt_dedup(pts: &mut Vec<[f64; 2]>, p: [f64; 2]) {
+    if let Some(&last) = pts.last()
+        && pt2_dist_sq(last, p) <= 1e-12
+    {
+        return;
+    }
+    pts.push(p);
+}
+
+fn subdivide_quad_2d(
+    p0: [f64; 2],
+    p1: [f64; 2],
+    p2: [f64; 2],
+    tol_sq: f64,
+    depth: u8,
+    out: &mut Vec<[f64; 2]>,
+) {
+    let mx = 0.5 * (p0[0] + p2[0]);
+    let my = 0.5 * (p0[1] + p2[1]);
+    let dx = 0.5 * (p1[0] - mx);
+    let dy = 0.5 * (p1[1] - my);
+    if depth >= 8 || (dx * dx + dy * dy) <= tol_sq {
+        push_pt_dedup(out, p2);
+        return;
+    }
+    let q0 = [0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1])];
+    let q1 = [0.5 * (p1[0] + p2[0]), 0.5 * (p1[1] + p2[1])];
+    let mid = [0.5 * (q0[0] + q1[0]), 0.5 * (q0[1] + q1[1])];
+    subdivide_quad_2d(p0, q0, mid, tol_sq, depth + 1, out);
+    subdivide_quad_2d(mid, q1, p2, tol_sq, depth + 1, out);
+}
+
+fn subdivide_cubic_2d(
+    p0: [f64; 2],
+    p1: [f64; 2],
+    p2: [f64; 2],
+    p3: [f64; 2],
+    tol_sq: f64,
+    depth: u8,
+    out: &mut Vec<[f64; 2]>,
+) {
+    let ux = 3.0 * p1[0] - 2.0 * p0[0] - p3[0];
+    let uy = 3.0 * p1[1] - 2.0 * p0[1] - p3[1];
+    let vx = 3.0 * p2[0] - p0[0] - 2.0 * p3[0];
+    let vy = 3.0 * p2[1] - p0[1] - 2.0 * p3[1];
+    if depth >= 8 || (ux * ux).max(vx * vx) + (uy * uy).max(vy * vy) <= 16.0 * tol_sq {
+        push_pt_dedup(out, p3);
+        return;
+    }
+    let p01 = [0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1])];
+    let p12 = [0.5 * (p1[0] + p2[0]), 0.5 * (p1[1] + p2[1])];
+    let p23 = [0.5 * (p2[0] + p3[0]), 0.5 * (p2[1] + p3[1])];
+    let p012 = [0.5 * (p01[0] + p12[0]), 0.5 * (p01[1] + p12[1])];
+    let p123 = [0.5 * (p12[0] + p23[0]), 0.5 * (p12[1] + p23[1])];
+    let mid = [0.5 * (p012[0] + p123[0]), 0.5 * (p012[1] + p123[1])];
+    subdivide_cubic_2d(p0, p01, p012, mid, tol_sq, depth + 1, out);
+    subdivide_cubic_2d(mid, p123, p23, p3, tol_sq, depth + 1, out);
+}
+
+struct GlyphOutline2DCollector {
+    contours: Vec<Vec<[f64; 2]>>,
+    current: Vec<[f64; 2]>,
+    cursor: [f64; 2],
+    scale: f64,
+    tol_sq: f64,
+}
+
+impl GlyphOutline2DCollector {
+    fn new(scale: f64, font_size: f64) -> Self {
+        let tol = (font_size * 0.002).clamp(1e-3, 0.25);
+        Self {
+            contours: Vec::new(),
+            current: Vec::new(),
+            cursor: [0.0, 0.0],
+            scale,
+            tol_sq: tol * tol,
+        }
+    }
+
+    #[inline]
+    fn map(&self, x: f32, y: f32) -> [f64; 2] {
+        [f64::from(x) * self.scale, f64::from(y) * self.scale]
+    }
+
+    fn finish_current(&mut self) {
+        while self.current.len() >= 2
+            && pt2_dist_sq(
+                self.current[0],
+                *self.current.last().unwrap_or(&self.current[0]),
+            ) <= 1e-12
+        {
+            self.current.pop();
+        }
+        if self.current.len() >= 3 {
+            self.contours.push(std::mem::take(&mut self.current));
+        } else {
+            self.current.clear();
+        }
+    }
+}
+
+impl OutlineBuilder for GlyphOutline2DCollector {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.finish_current();
+        let p = self.map(x, y);
+        self.cursor = p;
+        self.current.push(p);
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        let p = self.map(x, y);
+        push_pt_dedup(&mut self.current, p);
+        self.cursor = p;
+    }
+
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        let p0 = self.cursor;
+        let p1 = self.map(x1, y1);
+        let p2 = self.map(x, y);
+        subdivide_quad_2d(p0, p1, p2, self.tol_sq, 0, &mut self.current);
+        self.cursor = p2;
+    }
+
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        let p0 = self.cursor;
+        let p1 = self.map(x1, y1);
+        let p2 = self.map(x2, y2);
+        let p3 = self.map(x, y);
+        subdivide_cubic_2d(p0, p1, p2, p3, self.tol_sq, 0, &mut self.current);
+        self.cursor = p3;
+    }
+
+    fn close(&mut self) {
+        self.finish_current();
+    }
+}
+
+struct GlyphBezier2DCollector {
+    contours: Vec<Vec<[f64; 6]>>,
+    current: Vec<[f64; 6]>,
+    cursor: [f64; 2],
+    scale: f64,
+}
+
+impl GlyphBezier2DCollector {
+    fn new(scale: f64) -> Self {
+        Self {
+            contours: Vec::new(),
+            current: Vec::new(),
+            cursor: [0.0, 0.0],
+            scale,
+        }
+    }
+
+    #[inline]
+    fn map(&self, x: f32, y: f32) -> [f64; 2] {
+        [f64::from(x) * self.scale, f64::from(y) * self.scale]
+    }
+
+    fn finish_current(&mut self) {
+        if self.current.len() > 1 {
+            let first = self.current[0];
+            let last = *self.current.last().unwrap_or(&first);
+            if pt2_dist_sq([first[0], first[1]], [last[0], last[1]]) <= 1e-12 {
+                let popped = self.current.pop().unwrap_or(first);
+                self.current[0][2] = popped[2];
+                self.current[0][3] = popped[3];
+            }
+        }
+        if self.current.len() >= 2 {
+            self.contours.push(std::mem::take(&mut self.current));
+        } else {
+            self.current.clear();
+        }
+    }
+}
+
+impl OutlineBuilder for GlyphBezier2DCollector {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.finish_current();
+        let p = self.map(x, y);
+        self.cursor = p;
+        self.current.push([p[0], p[1], 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        let p = self.map(x, y);
+        if pt2_dist_sq(self.cursor, p) > 1e-12 {
+            self.current.push([p[0], p[1], 0.0, 0.0, 0.0, 0.0]);
+            self.cursor = p;
+        }
+    }
+
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        let p0 = self.cursor;
+        let q = self.map(x1, y1);
+        let p2 = self.map(x, y);
+        if let Some(prev) = self.current.last_mut() {
+            prev[4] = (q[0] - p0[0]) * (2.0 / 3.0);
+            prev[5] = (q[1] - p0[1]) * (2.0 / 3.0);
+        }
+        let in_x = (q[0] - p2[0]) * (2.0 / 3.0);
+        let in_y = (q[1] - p2[1]) * (2.0 / 3.0);
+        self.current.push([p2[0], p2[1], in_x, in_y, 0.0, 0.0]);
+        self.cursor = p2;
+    }
+
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        let p0 = self.cursor;
+        let c1 = self.map(x1, y1);
+        let c2 = self.map(x2, y2);
+        let p3 = self.map(x, y);
+        if let Some(prev) = self.current.last_mut() {
+            prev[4] = c1[0] - p0[0];
+            prev[5] = c1[1] - p0[1];
+        }
+        let in_x = c2[0] - p3[0];
+        let in_y = c2[1] - p3[1];
+        self.current.push([p3[0], p3[1], in_x, in_y, 0.0, 0.0]);
+        self.cursor = p3;
+    }
+
+    fn close(&mut self) {
+        self.finish_current();
+    }
+}
+
+/// Extracts a single glyph's 2D vector outline from TrueType or OpenType (CFF) font bytes.
+///
+/// Coordinates are Y-up in `font_size` units with origin at the glyph's baseline left.
+/// Quadratic and cubic Bezier curves are adaptively subdivided into smooth polylines while
+/// preserving native contour winding and exact horizontal advance. Returns `None` if the font
+/// cannot be parsed, `font_size <= 0`, or the glyph is absent (or maps to `.notdef` / gid 0).
+#[must_use]
+pub fn extract_glyph_outline_2d(
+    font_bytes: &[u8],
+    ch: char,
+    font_size: f64,
+) -> Option<GlyphOutline2D> {
+    if !font_size.is_finite() || font_size <= 0.0 {
+        return None;
+    }
+    let face = Face::parse(font_bytes, 0).ok()?;
+    let gid = face.glyph_index(ch).filter(|g| g.0 != 0)?;
+    let upem = f64::from(face.units_per_em().max(1));
+    let scale = font_size / upem;
+    let advance = face
+        .glyph_hor_advance(gid)
+        .map_or(font_size * 0.5, |a| f64::from(a) * scale);
+
+    let mut collector = GlyphOutline2DCollector::new(scale, font_size);
+    face.outline_glyph(gid, &mut collector);
+    collector.finish_current();
+
+    Some(GlyphOutline2D {
+        contours: collector.contours,
+        advance,
+    })
+}
+
+/// Extracts a 2D glyph outline trying `primary` first (requiring glyph id != 0), then `fallback`.
+///
+/// Enables mixed-script typography (e.g., Latin primary + CJK fallback) with real font outlines.
+#[must_use]
+pub fn extract_glyph_outline_2d_with_fallback(
+    primary: Option<&[u8]>,
+    fallback: Option<&[u8]>,
+    ch: char,
+    font_size: f64,
+) -> Option<GlyphOutline2D> {
+    if let Some(bytes) = primary
+        && let Some(outline) = extract_glyph_outline_2d(bytes, ch, font_size)
+    {
+        return Some(outline);
+    }
+    if let Some(bytes) = fallback {
+        return extract_glyph_outline_2d(bytes, ch, font_size);
+    }
+    None
+}
+
+/// Extracts a single glyph's exact cubic Bezier contours (`[x, y, in_x, in_y, out_x, out_y]`)
+/// in Y-up `font_size` units, elevating TrueType quadratic curves losslessly to cubics.
+#[must_use]
+pub fn extract_glyph_bezier_outline_2d(
+    font_bytes: &[u8],
+    ch: char,
+    font_size: f64,
+) -> Option<GlyphBezierOutline2D> {
+    if !font_size.is_finite() || font_size <= 0.0 {
+        return None;
+    }
+    let face = Face::parse(font_bytes, 0).ok()?;
+    let gid = face.glyph_index(ch).filter(|g| g.0 != 0)?;
+    let upem = f64::from(face.units_per_em().max(1));
+    let scale = font_size / upem;
+    let advance = face
+        .glyph_hor_advance(gid)
+        .map_or(font_size * 0.5, |a| f64::from(a) * scale);
+
+    let mut collector = GlyphBezier2DCollector::new(scale);
+    face.outline_glyph(gid, &mut collector);
+    collector.finish_current();
+
+    Some(GlyphBezierOutline2D {
+        contours: collector.contours,
+        advance,
+    })
+}
+
+/// Extracts exact cubic Bezier glyph contours trying `primary` first (glyph id != 0), then `fallback`.
+#[must_use]
+pub fn extract_glyph_bezier_outline_2d_with_fallback(
+    primary: Option<&[u8]>,
+    fallback: Option<&[u8]>,
+    ch: char,
+    font_size: f64,
+) -> Option<GlyphBezierOutline2D> {
+    if let Some(bytes) = primary
+        && let Some(outline) = extract_glyph_bezier_outline_2d(bytes, ch, font_size)
+    {
+        return Some(outline);
+    }
+    if let Some(bytes) = fallback {
+        return extract_glyph_bezier_outline_2d(bytes, ch, font_size);
+    }
+    None
+}
+
+/// Returns horizontal kerning adjustment in `font_size` units between `prev` and `curr`
+/// from the font's `kern` table, or `0.0` if unavailable.
+#[must_use]
+pub fn font_kerning_2d(font_bytes: &[u8], prev: char, curr: char, font_size: f64) -> f64 {
+    if !font_size.is_finite() || font_size <= 0.0 {
+        return 0.0;
+    }
+    let Ok(face) = Face::parse(font_bytes, 0) else {
+        return 0.0;
+    };
+    let (Some(g0), Some(g1)) = (
+        face.glyph_index(prev).filter(|g| g.0 != 0),
+        face.glyph_index(curr).filter(|g| g.0 != 0),
+    ) else {
+        return 0.0;
+    };
+    let Some(kern) = face.tables().kern else {
+        return 0.0;
+    };
+    let scale = font_size / f64::from(face.units_per_em().max(1));
+    for subtable in kern.subtables {
+        if subtable.horizontal
+            && !subtable.variable
+            && let Some(k) = subtable.glyphs_kerning(g0, g1)
+        {
+            return f64::from(k) * scale;
+        }
+    }
+    0.0
+}
+
+/// Returns horizontal kerning between `prev` and `curr` using whichever font (primary, else
+/// fallback) resolves both characters.
+#[must_use]
+pub fn font_kerning_2d_with_fallback(
+    primary: Option<&[u8]>,
+    fallback: Option<&[u8]>,
+    prev: char,
+    curr: char,
+    font_size: f64,
+) -> f64 {
+    if let Some(bytes) = primary {
+        let k = font_kerning_2d(bytes, prev, curr, font_size);
+        if k != 0.0 {
+            return k;
+        }
+        // Only fall through to fallback kerning when primary misses either glyph.
+        if let Ok(face) = Face::parse(bytes, 0)
+            && face.glyph_index(prev).is_some_and(|g| g.0 != 0)
+            && face.glyph_index(curr).is_some_and(|g| g.0 != 0)
+        {
+            return 0.0;
+        }
+    }
+    if let Some(bytes) = fallback {
+        return font_kerning_2d(bytes, prev, curr, font_size);
+    }
+    0.0
+}

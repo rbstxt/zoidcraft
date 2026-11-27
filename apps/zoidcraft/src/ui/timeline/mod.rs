@@ -38,6 +38,29 @@ pub use ruler::*;
 pub use state::*;
 pub(crate) use tracks::*;
 
+/// Splits all currently selected clips at the rounded playhead frame inside a single undoable
+/// transaction. Returns `true` if at least one clip was split.
+pub(crate) fn split_selected_clips_at_playhead_in_timeline(session: &mut Session) -> bool {
+    let clip_ids = session.selection.clip_ids.clone();
+    if clip_ids.is_empty() {
+        return false;
+    }
+    let at_frame = session.playback.current_frame.round();
+    let mut any_split = false;
+    if session.begin_transaction("Split Clips").is_ok() {
+        for clip_id in clip_ids {
+            if session
+                .execute(Command::SplitClip { clip_id, at_frame })
+                .is_ok()
+            {
+                any_split = true;
+            }
+        }
+        let _ = session.commit_transaction(any_split);
+    }
+    any_split
+}
+
 /// Renders the complete ClipMaker 3 Timeline panel inside `ui`.
 pub fn show_timeline(
     ui: &mut Ui,
@@ -100,9 +123,14 @@ pub fn show_timeline(
     let content_width = (body_rect.right() - content_left).max(1.0);
     state.last_viewport_width = content_width;
 
-    // Keyboard timeline zoom (`Cmd/Ctrl + -` and `Cmd/Ctrl + =/+`) when timeline is focused or hovered.
-    if !ui.ctx().egui_wants_keyboard_input() && (state.focused || panel_resp.hovered()) {
-        let (zoom_in_key, zoom_out_key) = ui.ctx().input_mut(|i| {
+    // Keyboard timeline zoom (`Cmd/Ctrl + -` and `Cmd/Ctrl + =/+`), forward shuttle (`L`),
+    // and Timeline-focused Cut/Razor split (`C`).
+    if !ui.ctx().egui_wants_keyboard_input()
+        && !ui.ctx().text_edit_focused()
+        && (state.focused || panel_resp.hovered())
+    {
+        let timeline_focused = state.focused;
+        let (zoom_in_key, zoom_out_key, shuttle_forward_l, cut_razor_c) = ui.ctx().input_mut(|i| {
             let zin = i.consume_shortcut(&egui::KeyboardShortcut::new(
                 egui::Modifiers::COMMAND,
                 egui::Key::Equals,
@@ -123,13 +151,53 @@ pub fn show_timeline(
                 egui::Modifiers::CTRL,
                 egui::Key::Minus,
             ));
-            (zin, zout)
+            let mut l_pressed = false;
+            let mut c_pressed = false;
+            i.events.retain(|ev| {
+                if matches!(
+                    ev,
+                    egui::Event::Key {
+                        key: egui::Key::L,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } if !modifiers.ctrl && !modifiers.command && !modifiers.shift && !modifiers.alt
+                ) {
+                    l_pressed = true;
+                    false
+                } else if timeline_focused
+                    && matches!(
+                        ev,
+                        egui::Event::Key {
+                            key: egui::Key::C,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                            ..
+                        } if !modifiers.ctrl && !modifiers.command && !modifiers.shift && !modifiers.alt
+                    )
+                {
+                    c_pressed = true;
+                    false
+                } else {
+                    true
+                }
+            });
+            (zin, zout, l_pressed, c_pressed)
         });
         if zoom_in_key || zoom_out_key {
             let playhead_px = frame_to_px(session.playback.current_frame, fps, state.zoom);
             let anchor_x = (playhead_px - state.scroll_x).clamp(0.0, f64::from(content_width));
             let factor = if zoom_in_key { 1.25 } else { 1.0 / 1.25 };
             state.zoom_by(factor, anchor_x);
+        }
+        if shuttle_forward_l {
+            let next = super::shortcuts::next_shuttle_forward_speed(session.playback.speed);
+            let _ = session.execute(Command::SetSpeed { speed: next });
+        }
+        if cut_razor_c && split_selected_clips_at_playhead_in_timeline(session) {
+            action.clips_modified = true;
         }
     }
 
@@ -470,19 +538,32 @@ pub fn show_timeline(
     );
 
     // 7. Complete active clip drag / trim / marker / marquee state machines across full panel.
-    process_active_drag_state(
-        ui,
-        session,
-        state,
-        palette,
-        ruler_rect,
-        kf_lanes_rect,
-        video_tracks_lanes_rect,
-        audio_tracks_lanes_rect,
-        fps,
-        total_frames,
-        &mut action,
-    );
+    let handled_custom_drag =
+        process_cross_domain_clip_drag(
+            ui,
+            session,
+            state,
+            palette,
+            video_tracks_lanes_rect,
+            audio_tracks_lanes_rect,
+            fps,
+            &mut action,
+        ) || maybe_commit_custom_keyframe_drag(ui, session, state, &mut action);
+    if !handled_custom_drag {
+        process_active_drag_state(
+            ui,
+            session,
+            state,
+            palette,
+            ruler_rect,
+            kf_lanes_rect,
+            video_tracks_lanes_rect,
+            audio_tracks_lanes_rect,
+            fps,
+            total_frames,
+            &mut action,
+        );
+    }
 
     // 8. Slim 6 px overlay horizontal scrollbar (only shown when scrollable and hovered/needed).
     paint_and_interact_scrollbar(ui, state, scrollbar_rect, seq_px, max_scroll_x);
@@ -523,40 +604,23 @@ pub fn show_timeline(
     }
 
     let cache_top = ruler_rect.top().round();
-    if !state.cached_frame_spans.is_empty() {
-        for &(start_f, end_f) in &state.cached_frame_spans {
-            if end_f <= start_f {
-                continue;
-            }
-            let x0 = (content_left
-                + (frame_to_px(start_f, fps, state.zoom) - state.scroll_x) as f32)
-                .round();
-            let x1 = (content_left + (frame_to_px(end_f, fps, state.zoom) - state.scroll_x) as f32)
-                .round()
-                .max(x0 + 1.0);
-            if x1 < content_left || x0 > body_rect.right() {
-                continue;
-            }
-            overlay_painter.rect_filled(
-                Rect::from_min_max(pos2(x0, cache_top), pos2(x1, cache_top + 3.0)),
-                CornerRadius::ZERO,
-                COLOR_PLAYHEAD_CAP,
-            );
+    for &(start_f, end_f) in &state.cached_frame_spans {
+        if end_f <= start_f {
+            continue;
         }
-    } else {
-        let f0 = session.playback.current_frame.floor().max(0.0);
-        let x0 =
-            (content_left + (frame_to_px(f0, fps, state.zoom) - state.scroll_x) as f32).round();
-        let x1 = (content_left + (frame_to_px(f0 + 5.0, fps, state.zoom) - state.scroll_x) as f32)
+        let x0 = (content_left + (frame_to_px(start_f, fps, state.zoom) - state.scroll_x) as f32)
+            .round();
+        let x1 = (content_left + (frame_to_px(end_f, fps, state.zoom) - state.scroll_x) as f32)
             .round()
             .max(x0 + 1.0);
-        if x1 >= content_left && x0 <= body_rect.right() {
-            overlay_painter.rect_filled(
-                Rect::from_min_max(pos2(x0, cache_top), pos2(x1, cache_top + 3.0)),
-                CornerRadius::ZERO,
-                COLOR_PLAYHEAD_CAP,
-            );
+        if x1 < content_left || x0 > body_rect.right() {
+            continue;
         }
+        overlay_painter.rect_filled(
+            Rect::from_min_max(pos2(x0, cache_top), pos2(x1, cache_top + 3.0)),
+            CornerRadius::ZERO,
+            COLOR_PLAYHEAD_CAP,
+        );
     }
 
     // 11. Transient timeline status toast (composition switch / blocked drop feedback).
@@ -782,5 +846,250 @@ pub(crate) fn claim_timeline_focus(
     action.clicked_timeline = true;
     if let Some(focused_id) = ui.ctx().memory(|m| m.focused()) {
         ui.ctx().memory_mut(|m| m.surrender_focus(focused_id));
+    }
+}
+
+#[cfg(test)]
+mod wave1_timeline_tests {
+    use super::*;
+    use serde_json::json;
+    use zc_project::{
+        LayerMask, MaskMode, PropertyKeyframe, PropertyTrack, PropertyValue, StaticBehavior,
+    };
+
+    #[test]
+    fn timeline_c_key_splits_selected_clip_at_playhead() {
+        let mut session = Session::new();
+        let before_count = session.document().video_tracks[0].clips.len();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        session.selection.clip_ids = vec![clip_id];
+        session.playback.current_frame = 25.0;
+
+        let ctx = egui::Context::default();
+        let mut state = TimelineViewState::new();
+        state.focused = true;
+        let palette = ThemePalette::default();
+
+        let mut raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 400.0))),
+            focused: true,
+            ..Default::default()
+        };
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+
+        let mut action = TimelineAction::default();
+        let mut full = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    action = show_timeline(ui, &mut session, &mut state, &palette);
+                });
+        });
+        full.textures_delta.clear();
+
+        assert!(action.clips_modified);
+        let clips = &session.document().video_tracks[0].clips;
+        assert_eq!(
+            clips.len(),
+            before_count + 1,
+            "Key::C in focused timeline must split selected clip"
+        );
+        assert!((clips[0].length - 25.0).abs() < 1e-6);
+        assert!((clips[1].start - 25.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mask_and_shape_plus_keyframe_rows_are_unlocked_and_editable() {
+        let mut session = Session::new();
+        let added_track = session
+            .execute(Command::AddVideoTrack { name: None })
+            .expect("add video track");
+        let track_id = added_track["track_id"]
+            .as_str()
+            .expect("track_id")
+            .to_owned();
+        let added = session
+            .execute(Command::AddClip {
+                track_id,
+                kind: "zoidium:shape-plus/shape-layer".to_owned(),
+                name: Some("ShapeAndMask".to_owned()),
+                start: 0.0,
+                length: 90.0,
+            })
+            .expect("add shape-plus clip");
+        let clip_id = added["clip_id"].as_str().expect("clip_id").to_owned();
+        let clip_uuid = zc_project::Uuid::parse_str(&clip_id).expect("clip uuid");
+
+        let mask = LayerMask {
+            id: "mask-1".to_owned(),
+            name: "Main Mask".to_owned(),
+            enabled: true,
+            mode: MaskMode::Add,
+            invert: false,
+            feather: 0.0,
+            expansion: 0.0,
+            opacity: 1.0,
+            closed: true,
+            locked: false,
+            outline_color: "#58a6ff".to_owned(),
+            vertex_ids: Vec::new(),
+            vertex_modes: BTreeMap::new(),
+            path: PropertyTrack {
+                animated: true,
+                expression: None,
+                static_behavior: StaticBehavior::Constant,
+                value: PropertyValue::Json(json!({"commands": []})),
+                keyframes: vec![
+                    PropertyKeyframe::linear(0.0, PropertyValue::Json(json!({"commands": []}))),
+                    PropertyKeyframe::linear(20.0, PropertyValue::Json(json!({"commands": []}))),
+                ],
+                channels: Vec::new(),
+            },
+            preserved: BTreeMap::new(),
+        };
+        session
+            .execute(Command::AddLayerMask {
+                clip_id: clip_uuid,
+                mask,
+            })
+            .expect("add mask");
+
+        let shape_payload = json!({
+            "version": 1,
+            "contents": [{
+                "id": "rect-1",
+                "kind": "rectangle",
+                "properties": {
+                    "name": "Box",
+                    "size": {
+                        "animated": true,
+                        "value": [100.0, 100.0],
+                        "keyframes": [
+                            { "frame": 0.0, "value": [100.0, 100.0], "tween": 1 },
+                            { "frame": 20.0, "value": [200.0, 150.0], "tween": 1 }
+                        ]
+                    }
+                }
+            }]
+        });
+        session
+            .execute(Command::UpdateShapePlusPayload {
+                clip_id: clip_uuid,
+                payload: shape_payload,
+            })
+            .expect("update shape-plus payload");
+
+        session.selection.clip_ids = vec![clip_id.clone()];
+        let rows = collect_keyframe_rows(&session);
+        let mask_target = format!("mask:{clip_id}:mask-1");
+        let shape_target = format!("shape_plus:{clip_id}:rect-1");
+
+        let mask_row = rows
+            .iter()
+            .find(|r| r.target_id == mask_target && r.property == "path")
+            .expect("mask path row");
+        assert!(
+            !mask_row.locked,
+            "mask keyframe row on unlocked track must be unlocked"
+        );
+
+        let shape_row = rows
+            .iter()
+            .find(|r| r.target_id == shape_target && r.property == "size")
+            .expect("shape+ size row");
+        assert!(
+            !shape_row.locked,
+            "shape+ keyframe row on unlocked track must be unlocked"
+        );
+
+        // Move & delete Mask keyframe.
+        assert_eq!(
+            move_mask_or_shape_keyframe(&mut session, &mask_target, "path", 20.0, 35.0),
+            Ok(true)
+        );
+        assert!(mask_or_shape_keyframe_exists(
+            &session,
+            &mask_target,
+            "path",
+            35.0
+        ));
+        assert!(!mask_or_shape_keyframe_exists(
+            &session,
+            &mask_target,
+            "path",
+            20.0
+        ));
+        assert_eq!(
+            delete_mask_or_shape_keyframe(&mut session, &mask_target, "path", 35.0),
+            Ok(true)
+        );
+        assert!(!mask_or_shape_keyframe_exists(
+            &session,
+            &mask_target,
+            "path",
+            35.0
+        ));
+        // Sole remaining keyframe must not be deleted.
+        assert!(!matches!(
+            delete_mask_or_shape_keyframe(&mut session, &mask_target, "path", 0.0),
+            Ok(true)
+        ));
+
+        // Move & delete Shape+ keyframe.
+        assert_eq!(
+            move_mask_or_shape_keyframe(&mut session, &shape_target, "size", 20.0, 40.0),
+            Ok(true)
+        );
+        assert!(mask_or_shape_keyframe_exists(
+            &session,
+            &shape_target,
+            "size",
+            40.0
+        ));
+        assert_eq!(
+            delete_mask_or_shape_keyframe(&mut session, &shape_target, "size", 40.0),
+            Ok(true)
+        );
+        assert!(!mask_or_shape_keyframe_exists(
+            &session,
+            &shape_target,
+            "size",
+            40.0
+        ));
+    }
+
+    #[test]
+    fn cross_domain_selection_collects_both_video_and_audio_clips() {
+        let mut session = Session::new();
+        let v_id = session.document().video_tracks[0].clips[0].id.clone();
+        let a_track = session.document().audio_tracks[0].id.clone();
+        let a_added = session
+            .execute(Command::AddClip {
+                track_id: a_track,
+                kind: "audio".to_owned(),
+                name: Some("AClip".to_owned()),
+                start: 15.0,
+                length: 40.0,
+            })
+            .expect("add audio clip");
+        let a_id = a_added["clip_id"].as_str().expect("a clip_id").to_owned();
+        session.selection.clip_ids = vec![v_id.clone(), a_id.clone()];
+
+        let all = collect_all_selected_clips(&session);
+        assert_eq!(all.len(), 2);
+        assert!(
+            all.iter()
+                .any(|c| c.clip_id == v_id && c.kind == TrackKind::Video)
+        );
+        assert!(
+            all.iter()
+                .any(|c| c.clip_id == a_id && c.kind == TrackKind::Audio)
+        );
     }
 }

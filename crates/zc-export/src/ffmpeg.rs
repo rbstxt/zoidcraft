@@ -16,7 +16,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::ExportError;
-use crate::settings::{AudioCodec, ExportContainer, ExportSettings, QualityMode, VideoCodec};
+use crate::datamosh::DatamoshMode;
+use crate::settings::{
+    AudioCodec, EncoderSpeedPreset, ExportContainer, ExportEncodeOptions, ExportSettings,
+    HardwareAcceleration, QualityMode, VideoCodec,
+};
 
 /// Maximum bytes retained from FFmpeg `stderr` (64 KiB ring buffer, zero unbounded growth).
 pub const MAX_STDERR_BYTES: usize = 64 * 1024;
@@ -244,6 +248,397 @@ pub fn resolve_ffmpeg_binary(binary: Option<&Path>) -> std::borrow::Cow<'_, Path
     }
 }
 
+/// Hardware video encoders reported as available by `ffmpeg -hide_banner -encoders`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AvailableHwEncoders {
+    pub h264_videotoolbox: bool,
+    pub hevc_videotoolbox: bool,
+    pub h264_nvenc: bool,
+    pub hevc_nvenc: bool,
+    pub h264_vaapi: bool,
+}
+
+/// Concrete FFmpeg video encoder selected after hardware acceleration resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedVideoEncoder {
+    Libx264,
+    Libx265,
+    LibvpxVp9,
+    Libvpx,
+    Libsvtav1,
+    H264VideoToolbox,
+    HevcVideoToolbox,
+    H264Nvenc,
+    HevcNvenc,
+    H264Vaapi,
+}
+
+impl ResolvedVideoEncoder {
+    /// Returns the FFmpeg `-c:v` encoder name.
+    #[must_use]
+    pub const fn ffmpeg_name(self) -> &'static str {
+        match self {
+            Self::Libx264 => "libx264",
+            Self::Libx265 => "libx265",
+            Self::LibvpxVp9 => "libvpx-vp9",
+            Self::Libvpx => "libvpx",
+            Self::Libsvtav1 => "libsvtav1",
+            Self::H264VideoToolbox => "h264_videotoolbox",
+            Self::HevcVideoToolbox => "hevc_videotoolbox",
+            Self::H264Nvenc => "h264_nvenc",
+            Self::HevcNvenc => "hevc_nvenc",
+            Self::H264Vaapi => "h264_vaapi",
+        }
+    }
+
+    /// Returns `true` when this encoder uses a hardware acceleration backend.
+    #[must_use]
+    pub const fn is_hardware(self) -> bool {
+        matches!(
+            self,
+            Self::H264VideoToolbox
+                | Self::HevcVideoToolbox
+                | Self::H264Nvenc
+                | Self::HevcNvenc
+                | Self::H264Vaapi
+        )
+    }
+}
+
+/// Parses the stdout of `ffmpeg -hide_banner -encoders` to detect supported hardware encoders.
+#[must_use]
+pub fn parse_ffmpeg_encoders_output(stdout: &str) -> AvailableHwEncoders {
+    let mut avail = AvailableHwEncoders::default();
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(flags) = parts.next() else {
+            continue;
+        };
+        if !flags.starts_with('V') {
+            continue;
+        }
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        match name {
+            "h264_videotoolbox" => avail.h264_videotoolbox = true,
+            "hevc_videotoolbox" => avail.hevc_videotoolbox = true,
+            "h264_nvenc" => avail.h264_nvenc = true,
+            "hevc_nvenc" => avail.hevc_nvenc = true,
+            "h264_vaapi" => avail.h264_vaapi = true,
+            _ => {}
+        }
+    }
+    avail
+}
+
+/// Resolves the concrete FFmpeg video encoder for `(codec, transparent_alpha, hw_accel, available)`,
+/// gracefully falling back to software encoders (`libx264` / `libx265` / etc.) when hardware
+/// encoding is disabled, unavailable, or incompatible (such as transparent alpha exports).
+#[must_use]
+pub const fn resolve_video_encoder(
+    codec: VideoCodec,
+    transparent_alpha: bool,
+    hw_accel: HardwareAcceleration,
+    available: &AvailableHwEncoders,
+) -> ResolvedVideoEncoder {
+    let software = match codec {
+        VideoCodec::H264 => ResolvedVideoEncoder::Libx264,
+        VideoCodec::H265 => ResolvedVideoEncoder::Libx265,
+        VideoCodec::Vp9 => ResolvedVideoEncoder::LibvpxVp9,
+        VideoCodec::Vp8 => ResolvedVideoEncoder::Libvpx,
+        VideoCodec::Av1 => ResolvedVideoEncoder::Libsvtav1,
+    };
+    if transparent_alpha || matches!(hw_accel, HardwareAcceleration::Off) {
+        return software;
+    }
+    match codec {
+        VideoCodec::H264 => match hw_accel {
+            HardwareAcceleration::VideoToolbox if available.h264_videotoolbox => {
+                ResolvedVideoEncoder::H264VideoToolbox
+            }
+            HardwareAcceleration::Nvenc if available.h264_nvenc => ResolvedVideoEncoder::H264Nvenc,
+            HardwareAcceleration::Vaapi if available.h264_vaapi => ResolvedVideoEncoder::H264Vaapi,
+            HardwareAcceleration::Auto => {
+                if available.h264_videotoolbox {
+                    ResolvedVideoEncoder::H264VideoToolbox
+                } else if available.h264_nvenc {
+                    ResolvedVideoEncoder::H264Nvenc
+                } else if available.h264_vaapi {
+                    ResolvedVideoEncoder::H264Vaapi
+                } else {
+                    ResolvedVideoEncoder::Libx264
+                }
+            }
+            _ => ResolvedVideoEncoder::Libx264,
+        },
+        VideoCodec::H265 => match hw_accel {
+            HardwareAcceleration::VideoToolbox if available.hevc_videotoolbox => {
+                ResolvedVideoEncoder::HevcVideoToolbox
+            }
+            HardwareAcceleration::Nvenc if available.hevc_nvenc => ResolvedVideoEncoder::HevcNvenc,
+            HardwareAcceleration::Auto => {
+                if available.hevc_videotoolbox {
+                    ResolvedVideoEncoder::HevcVideoToolbox
+                } else if available.hevc_nvenc {
+                    ResolvedVideoEncoder::HevcNvenc
+                } else {
+                    ResolvedVideoEncoder::Libx265
+                }
+            }
+            _ => ResolvedVideoEncoder::Libx265,
+        },
+        VideoCodec::Vp9 | VideoCodec::Vp8 | VideoCodec::Av1 => software,
+    }
+}
+
+/// Probes `ffmpeg -hide_banner -encoders` with a bounded timeout and platform device checks to
+/// report usable hardware video encoders. Returns an empty set if FFmpeg cannot be probed.
+#[cfg(not(target_arch = "wasm32"))]
+#[must_use]
+pub fn probe_hardware_encoders(binary: Option<&Path>) -> AvailableHwEncoders {
+    let Ok(stdout) =
+        run_ffmpeg_probe_command(binary, &["-hide_banner", "-encoders"], PROBE_TIMEOUT)
+    else {
+        return AvailableHwEncoders::default();
+    };
+    let mut avail = parse_ffmpeg_encoders_output(&stdout);
+    if !cfg!(target_os = "macos") {
+        avail.h264_videotoolbox = false;
+        avail.hevc_videotoolbox = false;
+    }
+    if !cfg!(target_os = "linux") || !Path::new("/dev/dri/renderD128").exists() {
+        avail.h264_vaapi = false;
+    }
+    avail
+}
+
+/// Reports no CLI hardware encoders on `wasm32`.
+#[cfg(target_arch = "wasm32")]
+#[must_use]
+pub fn probe_hardware_encoders(_binary: Option<&Path>) -> AvailableHwEncoders {
+    AvailableHwEncoders::default()
+}
+
+/// Formats sorted, deduplicated positive cut timestamps (ms) for FFmpeg's `-force_key_frames`.
+#[must_use]
+pub fn format_forced_keyframes_arg(cut_times_ms: &[u64]) -> Option<String> {
+    let mut cuts: Vec<u64> = cut_times_ms.iter().copied().filter(|&ms| ms > 0).collect();
+    if cuts.is_empty() {
+        return None;
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let formatted: Vec<String> = cuts
+        .into_iter()
+        .map(|ms| format!("{}.{:03}", ms / 1_000, ms % 1_000))
+        .collect();
+    Some(formatted.join(","))
+}
+
+/// Parsed snapshot emitted by FFmpeg's `-progress pipe:1 -nostats` stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FfmpegProgressUpdate {
+    /// Encoded video frames reported by `frame=N`, when present.
+    pub frame: Option<u32>,
+    /// Encoded media timestamp in microseconds reported by `out_time_us=` / `out_time=`.
+    pub out_time_us: Option<u64>,
+    /// `true` when FFmpeg emitted `progress=end`.
+    pub ended: bool,
+}
+
+fn parse_ffmpeg_clock_us(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.eq_ignore_ascii_case("N/A") {
+        return None;
+    }
+    let mut parts = trimmed.split(':');
+    let hours: u64 = parts.next()?.parse().ok()?;
+    let mins: u64 = parts.next()?.parse().ok()?;
+    let secs_str = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (whole_s, frac_us) = match secs_str.split_once('.') {
+        Some((w, f)) => {
+            let whole: u64 = w.parse().ok()?;
+            let mut scaled = 0_u64;
+            let mut digits = 0_u32;
+            for ch in f.chars().take(6) {
+                let d = ch.to_digit(10)?;
+                scaled = scaled * 10 + u64::from(d);
+                digits += 1;
+            }
+            for _ in digits..6 {
+                scaled *= 10;
+            }
+            (whole, scaled)
+        }
+        None => (secs_str.parse().ok()?, 0),
+    };
+    let total_secs = hours
+        .checked_mul(3_600)?
+        .checked_add(mins.checked_mul(60)?)?
+        .checked_add(whole_s)?;
+    total_secs.checked_mul(1_000_000)?.checked_add(frac_us)
+}
+
+/// Feeds one line from FFmpeg's `-progress pipe:1` stream into `state`.
+/// Returns `true` when a `progress=continue` or `progress=end` block terminator was parsed.
+pub fn parse_ffmpeg_progress_line(line: &str, state: &mut FfmpegProgressUpdate) -> bool {
+    let trimmed = line.trim();
+    let Some((raw_key, raw_val)) = trimmed.split_once('=') else {
+        return false;
+    };
+    let key = raw_key.trim();
+    let val = raw_val.trim();
+    match key {
+        "frame" => {
+            if let Ok(frame) = val.parse::<u32>() {
+                state.frame = Some(frame);
+            }
+            false
+        }
+        "out_time_us" => {
+            if let Ok(us) = val.parse::<i64>()
+                && us >= 0
+            {
+                state.out_time_us = Some(us as u64);
+            }
+            false
+        }
+        "out_time_ms" => {
+            // FFmpeg historically wrote microseconds into `out_time_ms`; use only as fallback.
+            if state.out_time_us.is_none()
+                && let Ok(us) = val.parse::<i64>()
+                && us >= 0
+            {
+                state.out_time_us = Some(us as u64);
+            }
+            false
+        }
+        "out_time" => {
+            if state.out_time_us.is_none()
+                && let Some(us) = parse_ffmpeg_clock_us(val)
+            {
+                state.out_time_us = Some(us);
+            }
+            false
+        }
+        "progress" => {
+            state.ended = val == "end";
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Converts an [`FfmpegProgressUpdate`] into a bounded completed frame count (`0..=total_frames`).
+#[must_use]
+pub fn ffmpeg_progress_completed_frames(
+    update: &FfmpegProgressUpdate,
+    total_frames: u32,
+    fps: f64,
+) -> u32 {
+    if update.ended {
+        return total_frames;
+    }
+    let from_frame = update.frame.unwrap_or(0);
+    let from_time = update.out_time_us.map_or(0, |us| {
+        let safe_fps = if fps.is_finite() && fps > 0.0 {
+            fps
+        } else {
+            1.0
+        };
+        let est = ((us as f64 / 1_000_000.0) * safe_fps).floor();
+        if est.is_finite() && est >= 0.0 {
+            est.min(f64::from(total_frames)) as u32
+        } else {
+            0
+        }
+    });
+    from_frame.max(from_time).min(total_frames)
+}
+
+/// Drains FFmpeg's `-progress pipe:1` stdout stream with bounded per-line buffering and
+/// cooperative abort handling, invoking `on_update` on each flushed progress block.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn drain_ffmpeg_progress_interruptible<R, F>(
+    mut reader: R,
+    abort: &AtomicBool,
+    mut on_update: F,
+) where
+    R: Read,
+    F: FnMut(FfmpegProgressUpdate),
+{
+    const MAX_PROGRESS_LINE_BYTES: usize = 512;
+    let mut chunk = [0_u8; 4_096];
+    let mut line_buf: Vec<u8> = Vec::with_capacity(128);
+    let mut line_overflow = false;
+    let mut state = FfmpegProgressUpdate::default();
+
+    let flush_line = |line_buf: &mut Vec<u8>,
+                      line_overflow: &mut bool,
+                      state: &mut FfmpegProgressUpdate,
+                      on_update: &mut F| {
+        if !*line_overflow && !line_buf.is_empty() {
+            let line = String::from_utf8_lossy(line_buf);
+            if parse_ffmpeg_progress_line(&line, state) {
+                on_update(*state);
+                *state = FfmpegProgressUpdate::default();
+            }
+        }
+        line_buf.clear();
+        *line_overflow = false;
+    };
+
+    loop {
+        if abort.load(Ordering::Acquire) {
+            break;
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => {
+                flush_line(
+                    &mut line_buf,
+                    &mut line_overflow,
+                    &mut state,
+                    &mut on_update,
+                );
+                break;
+            }
+            Ok(n) => {
+                for &b in &chunk[..n] {
+                    if b == b'\n' {
+                        flush_line(
+                            &mut line_buf,
+                            &mut line_overflow,
+                            &mut state,
+                            &mut on_update,
+                        );
+                    } else if !line_overflow {
+                        if line_buf.len() < MAX_PROGRESS_LINE_BYTES {
+                            line_buf.push(b);
+                        } else {
+                            line_overflow = true;
+                        }
+                    }
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                ) =>
+            {
+                if abort.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 /// Probes whether `ffmpeg` is available and returns its version banner line, enforcing
 /// bounded stdout/stderr buffering and a hard timeout so a stalled executable can never hang.
 #[cfg(not(target_arch = "wasm32"))]
@@ -262,9 +657,25 @@ pub(crate) fn probe_ffmpeg_with_timeout(
     binary: Option<&Path>,
     timeout: Duration,
 ) -> Result<String, ExportError> {
+    let stdout = run_ffmpeg_probe_command(binary, &["-version"], timeout)?;
+    let first_line = stdout
+        .lines()
+        .next()
+        .unwrap_or("ffmpeg (unknown version)")
+        .trim()
+        .to_string();
+    Ok(first_line)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_ffmpeg_probe_command(
+    binary: Option<&Path>,
+    probe_args: &[&str],
+    timeout: Duration,
+) -> Result<String, ExportError> {
     let bin = resolve_ffmpeg_binary(binary);
     let mut cmd = Command::new(bin.as_ref());
-    cmd.arg("-version").stdin(Stdio::null());
+    cmd.args(probe_args).stdin(Stdio::null());
 
     #[cfg(unix)]
     let (mut child, stdout_reader, stdout_cancel, stderr_reader, stderr_cancel): (
@@ -416,7 +827,8 @@ pub(crate) fn probe_ffmpeg_with_timeout(
                     return Err(ExportError::FfmpegFailed {
                         exit_code: None,
                         stderr: format!(
-                            "ffmpeg -version probe timed out after {:.1}s",
+                            "ffmpeg {} probe timed out after {:.1}s",
+                            probe_args.join(" "),
                             timeout.as_secs_f64()
                         ),
                     });
@@ -488,13 +900,7 @@ pub(crate) fn probe_ffmpeg_with_timeout(
         });
     }
 
-    let first_line = stdout
-        .lines()
-        .next()
-        .unwrap_or("ffmpeg (unknown version)")
-        .trim()
-        .to_string();
-    Ok(first_line)
+    Ok(stdout)
 }
 
 /// Standard NTSC rational frame rates (`N * 1000 / 1001`).
@@ -541,6 +947,9 @@ pub(crate) fn build_ffmpeg_m4a_args(
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
+        "-nostats".into(),
+        "-progress".into(),
+        "pipe:1".into(),
         "-i".into(),
         temp_audio_wav.as_os_str().to_os_string(),
         "-vn".into(),
@@ -560,14 +969,53 @@ pub(crate) fn build_ffmpeg_m4a_args(
     ])
 }
 
-/// Builds deterministic FFmpeg CLI arguments for `settings` and an optional pre-staged WAV input.
+/// Builds deterministic FFmpeg CLI arguments for `settings` and an optional pre-staged WAV input
+/// using default [`ExportEncodeOptions`].
 ///
 /// Uses padded even dimensions for 4:2:0 codecs matching [`ExportSettings::padded_dimensions`].
 pub fn build_ffmpeg_args(
     settings: &ExportSettings,
     temp_audio_wav: Option<&Path>,
 ) -> Result<Vec<String>, ExportError> {
-    build_ffmpeg_os_args_with_output(settings, temp_audio_wav, &settings.output_path).map(|args| {
+    build_ffmpeg_args_with_hw(
+        settings,
+        temp_audio_wav,
+        &ExportEncodeOptions::default(),
+        &AvailableHwEncoders::default(),
+    )
+}
+
+/// Builds deterministic FFmpeg CLI arguments for `settings` and `options`, falling back to
+/// software encoders when no hardware capability table is provided.
+pub fn build_ffmpeg_args_with_options(
+    settings: &ExportSettings,
+    temp_audio_wav: Option<&Path>,
+    options: &ExportEncodeOptions,
+) -> Result<Vec<String>, ExportError> {
+    build_ffmpeg_args_with_hw(
+        settings,
+        temp_audio_wav,
+        options,
+        &AvailableHwEncoders::default(),
+    )
+}
+
+/// Builds deterministic FFmpeg CLI arguments for `settings`, `options`, and a probed
+/// [`AvailableHwEncoders`] table.
+pub fn build_ffmpeg_args_with_hw(
+    settings: &ExportSettings,
+    temp_audio_wav: Option<&Path>,
+    options: &ExportEncodeOptions,
+    available_hw: &AvailableHwEncoders,
+) -> Result<Vec<String>, ExportError> {
+    build_ffmpeg_os_args_with_output_and_options(
+        settings,
+        temp_audio_wav,
+        &settings.output_path,
+        options,
+        available_hw,
+    )
+    .map(|args| {
         args.into_iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
@@ -576,10 +1024,12 @@ pub fn build_ffmpeg_args(
 
 /// Builds deterministic FFmpeg CLI arguments as raw [`OsString`] values targeting an explicit
 /// `output_path` (preserving non-UTF-8 Unix paths losslessly).
-pub(crate) fn build_ffmpeg_os_args_with_output(
+pub(crate) fn build_ffmpeg_os_args_with_output_and_options(
     settings: &ExportSettings,
     temp_audio_wav: Option<&Path>,
     output_path: &Path,
+    options: &ExportEncodeOptions,
+    available_hw: &AvailableHwEncoders,
 ) -> Result<Vec<OsString>, ExportError> {
     settings.validate()?;
     if matches!(
@@ -601,15 +1051,34 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
     let (enc_w, enc_h) = settings.padded_dimensions();
     let fps_str = format_fps(settings.fps);
     let gop = (settings.fps * 2.0).round().max(1.0) as u32;
-    let has_audio = !matches!(settings.container, ExportContainer::Gif)
-        && temp_audio_wav.is_some()
-        && settings.audio_codec != AudioCodec::None;
+    let is_gif = matches!(settings.container, ExportContainer::Gif);
+    let has_audio = !is_gif && temp_audio_wav.is_some() && settings.audio_codec != AudioCodec::None;
+    let encoder = if is_gif {
+        ResolvedVideoEncoder::Libx264
+    } else {
+        resolve_video_encoder(
+            settings.video_codec,
+            settings.transparent_alpha,
+            options.hardware_acceleration,
+            available_hw,
+        )
+    };
 
     let mut args: Vec<OsString> = vec![
         "-y".into(),
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
+        "-nostats".into(),
+        "-progress".into(),
+        "pipe:1".into(),
+    ];
+
+    if !is_gif && encoder == ResolvedVideoEncoder::H264Vaapi {
+        args.extend(["-vaapi_device".into(), "/dev/dri/renderD128".into()]);
+    }
+
+    args.extend([
         "-f".into(),
         "rawvideo".into(),
         "-pix_fmt".into(),
@@ -620,7 +1089,7 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
         fps_str.into(),
         "-i".into(),
         "pipe:0".into(),
-    ];
+    ]);
 
     if let Some(audio_path) = temp_audio_wav
         && has_audio
@@ -629,7 +1098,7 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
         args.push(audio_path.as_os_str().to_os_string());
     }
 
-    if matches!(settings.container, ExportContainer::Gif) {
+    if is_gif {
         let reserve = if settings.transparent_alpha {
             "on"
         } else {
@@ -656,14 +1125,20 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
     // Explicit BT.709 matrix + limited TV range conversion from full-range sRGB RGBA input,
     // plus matching container/bitstream color metadata (`iec61966-2-1` sRGB transfer, BT.709
     // primaries & matrix, limited range) and strict constant frame rate (`-fps_mode cfr`).
-    let target_pix_fmt = if settings.transparent_alpha && settings.video_codec == VideoCodec::Vp9 {
+    let target_pix_fmt = if settings.transparent_alpha
+        && matches!(settings.video_codec, VideoCodec::Vp9 | VideoCodec::Vp8)
+    {
         "yuva420p"
     } else {
         "yuv420p"
     };
-    let color_vf = format!(
-        "scale=in_range=full:out_color_matrix=bt709:out_range=tv,format={target_pix_fmt},setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv"
-    );
+    let color_vf = if encoder == ResolvedVideoEncoder::H264Vaapi {
+        "scale=in_range=full:out_color_matrix=bt709:out_range=tv,format=nv12,setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv,hwupload".to_owned()
+    } else {
+        format!(
+            "scale=in_range=full:out_color_matrix=bt709:out_range=tv,format={target_pix_fmt},setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv"
+        )
+    };
     args.extend([
         "-vf".into(),
         color_vf.into(),
@@ -671,38 +1146,64 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
         "cfr".into(),
     ]);
 
-    match settings.video_codec {
-        VideoCodec::H264 => {
+    match encoder {
+        ResolvedVideoEncoder::Libx264 => {
+            let preset = match options.speed_preset {
+                EncoderSpeedPreset::Fast => "veryfast",
+                EncoderSpeedPreset::Balanced => "medium",
+                EncoderSpeedPreset::Slow => "slow",
+            };
             args.extend([
                 "-c:v".into(),
                 "libx264".into(),
                 "-preset".into(),
-                "medium".into(),
+                preset.into(),
             ]);
             push_quality_args(&mut args, settings.quality, 51, false);
             args.extend(["-g".into(), gop.to_string().into()]);
         }
-        VideoCodec::H265 => {
+        ResolvedVideoEncoder::Libx265 => {
+            let preset = match options.speed_preset {
+                EncoderSpeedPreset::Fast => "fast",
+                EncoderSpeedPreset::Balanced => "medium",
+                EncoderSpeedPreset::Slow => "slow",
+            };
             args.extend([
                 "-c:v".into(),
                 "libx265".into(),
+                "-preset".into(),
+                preset.into(),
                 "-tag:v".into(),
                 "hvc1".into(),
             ]);
             push_quality_args(&mut args, settings.quality, 51, false);
             args.extend(["-g".into(), gop.to_string().into()]);
         }
-        VideoCodec::Vp9 => {
+        ResolvedVideoEncoder::LibvpxVp9 => {
+            let cpu_used = match options.speed_preset {
+                EncoderSpeedPreset::Fast => "4",
+                EncoderSpeedPreset::Balanced => "2",
+                EncoderSpeedPreset::Slow => "1",
+            };
             args.extend(["-c:v".into(), "libvpx-vp9".into()]);
             push_quality_args(&mut args, settings.quality, 63, true);
             args.extend([
+                "-deadline".into(),
+                "good".into(),
+                "-cpu-used".into(),
+                cpu_used.into(),
                 "-row-mt".into(),
                 "1".into(),
                 "-g".into(),
                 gop.to_string().into(),
             ]);
         }
-        VideoCodec::Vp8 => {
+        ResolvedVideoEncoder::Libvpx => {
+            let cpu_used = match options.speed_preset {
+                EncoderSpeedPreset::Fast => "4",
+                EncoderSpeedPreset::Balanced => "2",
+                EncoderSpeedPreset::Slow => "1",
+            };
             args.extend(["-c:v".into(), "libvpx".into()]);
             match settings.quality {
                 QualityMode::Crf(crf) => {
@@ -717,23 +1218,106 @@ pub(crate) fn build_ffmpeg_os_args_with_output(
                     args.extend(["-b:v".into(), format!("{kbps}k").into()]);
                 }
             }
-            args.extend(["-g".into(), gop.to_string().into()]);
+            args.extend([
+                "-deadline".into(),
+                "good".into(),
+                "-cpu-used".into(),
+                cpu_used.into(),
+                "-g".into(),
+                gop.to_string().into(),
+            ]);
         }
-        VideoCodec::Av1 => {
+        ResolvedVideoEncoder::Libsvtav1 => {
+            let preset = match options.speed_preset {
+                EncoderSpeedPreset::Fast => "8",
+                EncoderSpeedPreset::Balanced => "6",
+                EncoderSpeedPreset::Slow => "4",
+            };
             args.extend([
                 "-c:v".into(),
                 "libsvtav1".into(),
                 "-preset".into(),
-                "6".into(),
+                preset.into(),
             ]);
             push_quality_args(&mut args, settings.quality, 63, false);
             args.extend(["-g".into(), gop.to_string().into()]);
         }
+        ResolvedVideoEncoder::H264VideoToolbox => {
+            args.extend(["-c:v".into(), "h264_videotoolbox".into()]);
+            push_videotoolbox_quality_args(&mut args, settings.quality);
+            args.extend(["-g".into(), gop.to_string().into()]);
+        }
+        ResolvedVideoEncoder::HevcVideoToolbox => {
+            args.extend([
+                "-c:v".into(),
+                "hevc_videotoolbox".into(),
+                "-tag:v".into(),
+                "hvc1".into(),
+            ]);
+            push_videotoolbox_quality_args(&mut args, settings.quality);
+            args.extend(["-g".into(), gop.to_string().into()]);
+        }
+        ResolvedVideoEncoder::H264Nvenc => {
+            let preset = match options.speed_preset {
+                EncoderSpeedPreset::Fast => "p2",
+                EncoderSpeedPreset::Balanced => "p4",
+                EncoderSpeedPreset::Slow => "p6",
+            };
+            args.extend([
+                "-c:v".into(),
+                "h264_nvenc".into(),
+                "-preset".into(),
+                preset.into(),
+            ]);
+            push_nvenc_quality_args(&mut args, settings.quality);
+            args.extend(["-g".into(), gop.to_string().into()]);
+        }
+        ResolvedVideoEncoder::HevcNvenc => {
+            let preset = match options.speed_preset {
+                EncoderSpeedPreset::Fast => "p2",
+                EncoderSpeedPreset::Balanced => "p4",
+                EncoderSpeedPreset::Slow => "p6",
+            };
+            args.extend([
+                "-c:v".into(),
+                "hevc_nvenc".into(),
+                "-preset".into(),
+                preset.into(),
+                "-tag:v".into(),
+                "hvc1".into(),
+            ]);
+            push_nvenc_quality_args(&mut args, settings.quality);
+            args.extend(["-g".into(), gop.to_string().into()]);
+        }
+        ResolvedVideoEncoder::H264Vaapi => {
+            args.extend(["-c:v".into(), "h264_vaapi".into()]);
+            match settings.quality {
+                QualityMode::Crf(crf) => {
+                    args.extend([
+                        "-rc_mode".into(),
+                        "CQP".into(),
+                        "-qp".into(),
+                        crf.min(51).to_string().into(),
+                    ]);
+                }
+                QualityMode::BitrateKbps(kbps) => {
+                    args.extend(["-b:v".into(), format!("{kbps}k").into()]);
+                }
+            }
+            args.extend(["-g".into(), gop.to_string().into()]);
+        }
     }
 
+    if options.datamosh_mode == DatamoshMode::AtClipCuts
+        && let Some(kf_times) = format_forced_keyframes_arg(&options.cut_times_ms)
+    {
+        args.extend(["-force_key_frames".into(), kf_times.into()]);
+    }
+
+    if encoder != ResolvedVideoEncoder::H264Vaapi {
+        args.extend(["-pix_fmt".into(), target_pix_fmt.into()]);
+    }
     args.extend([
-        "-pix_fmt".into(),
-        target_pix_fmt.into(),
         "-color_range".into(),
         "tv".into(),
         "-colorspace".into(),
@@ -836,6 +1420,38 @@ fn push_quality_args(args: &mut Vec<OsString>, quality: QualityMode, max_crf: u8
         QualityMode::BitrateKbps(kbps) => {
             args.push("-b:v".into());
             args.push(format!("{kbps}k").into());
+        }
+    }
+}
+
+fn push_videotoolbox_quality_args(args: &mut Vec<OsString>, quality: QualityMode) {
+    match quality {
+        QualityMode::Crf(crf) => {
+            let q = ((f64::from(51_u8.saturating_sub(crf.min(51))) / 51.0) * 99.0 + 1.0)
+                .round()
+                .clamp(1.0, 100.0) as u8;
+            args.extend(["-q:v".into(), q.to_string().into()]);
+        }
+        QualityMode::BitrateKbps(kbps) => {
+            args.extend(["-b:v".into(), format!("{kbps}k").into()]);
+        }
+    }
+}
+
+fn push_nvenc_quality_args(args: &mut Vec<OsString>, quality: QualityMode) {
+    match quality {
+        QualityMode::Crf(crf) => {
+            args.extend([
+                "-rc".into(),
+                "vbr".into(),
+                "-cq".into(),
+                crf.min(51).to_string().into(),
+                "-b:v".into(),
+                "0".into(),
+            ]);
+        }
+        QualityMode::BitrateKbps(kbps) => {
+            args.extend(["-b:v".into(), format!("{kbps}k").into()]);
         }
     }
 }
@@ -1157,5 +1773,199 @@ mod tests {
         aac.sample_rate = 192_000;
         let aac_args = build_ffmpeg_args(&aac, Some(&audio)).expect("valid AAC fallback rate args");
         assert!(has_pair(&aac_args, "-ar", "48000"));
+    }
+
+    #[test]
+    fn hw_encoder_probe_parser_and_args_with_software_fallback() {
+        let sample_encoders = "\
+Encoders:
+ V..... = Video
+ ------
+ V..... libx264              libx264 H.264 / AVC
+ V..... h264_videotoolbox    VideoToolbox H.264 Encoder (codec h264)
+ V..... hevc_videotoolbox    VideoToolbox H.265 Encoder (codec hevc)
+ V....D h264_nvenc           NVIDIA NVENC H.264 encoder (codec h264)
+ V....D hevc_nvenc           NVIDIA NVENC H.265 encoder (codec hevc)
+ V..... h264_vaapi           H.264/AVC (VAAPI) (codec h264)
+ A..... aac                  AAC (Advanced Audio Coding)
+";
+        let all_hw = parse_ffmpeg_encoders_output(sample_encoders);
+        assert!(all_hw.h264_videotoolbox);
+        assert!(all_hw.hevc_videotoolbox);
+        assert!(all_hw.h264_nvenc);
+        assert!(all_hw.hevc_nvenc);
+        assert!(all_hw.h264_vaapi);
+
+        let none_hw = AvailableHwEncoders::default();
+        let h264 = base_settings();
+        let mut h265 = base_settings();
+        h265.video_codec = VideoCodec::H265;
+
+        // Auto prefers VideoToolbox when present, NVENC next, VAAPI next, and falls back to software.
+        let opts_auto =
+            ExportEncodeOptions::default().with_hardware_acceleration(HardwareAcceleration::Auto);
+        let vt_h264 =
+            build_ffmpeg_args_with_hw(&h264, None, &opts_auto, &all_hw).expect("vt h264 args");
+        assert!(has_pair(&vt_h264, "-c:v", "h264_videotoolbox"));
+        assert!(vt_h264.windows(2).any(|w| w[0] == "-q:v"));
+
+        let vt_h265 =
+            build_ffmpeg_args_with_hw(&h265, None, &opts_auto, &all_hw).expect("vt h265 args");
+        assert!(has_pair(&vt_h265, "-c:v", "hevc_videotoolbox"));
+        assert!(has_pair(&vt_h265, "-tag:v", "hvc1"));
+
+        let opts_nvenc = ExportEncodeOptions::default()
+            .with_hardware_acceleration(HardwareAcceleration::Nvenc)
+            .with_speed_preset(EncoderSpeedPreset::Fast);
+        let nv_h264 =
+            build_ffmpeg_args_with_hw(&h264, None, &opts_nvenc, &all_hw).expect("nvenc h264 args");
+        assert!(has_pair(&nv_h264, "-c:v", "h264_nvenc"));
+        assert!(has_pair(&nv_h264, "-preset", "p2"));
+        assert!(has_pair(&nv_h264, "-rc", "vbr"));
+        assert!(has_pair(&nv_h264, "-cq", "18"));
+
+        let nv_h265 =
+            build_ffmpeg_args_with_hw(&h265, None, &opts_nvenc, &all_hw).expect("nvenc h265 args");
+        assert!(has_pair(&nv_h265, "-c:v", "hevc_nvenc"));
+        assert!(has_pair(&nv_h265, "-tag:v", "hvc1"));
+
+        let opts_vaapi =
+            ExportEncodeOptions::default().with_hardware_acceleration(HardwareAcceleration::Vaapi);
+        let vaapi_h264 =
+            build_ffmpeg_args_with_hw(&h264, None, &opts_vaapi, &all_hw).expect("vaapi h264 args");
+        assert!(has_pair(
+            &vaapi_h264,
+            "-vaapi_device",
+            "/dev/dri/renderD128"
+        ));
+        assert!(has_pair(&vaapi_h264, "-c:v", "h264_vaapi"));
+        assert!(has_pair(&vaapi_h264, "-rc_mode", "CQP"));
+        assert!(has_pair(&vaapi_h264, "-qp", "18"));
+        assert!(
+            vaapi_h264.windows(2).any(|w| w[0] == "-vf"
+                && w[1].contains("format=nv12")
+                && w[1].ends_with(",hwupload"))
+        );
+        assert!(!has_pair(&vaapi_h264, "-pix_fmt", "yuv420p"));
+
+        // Graceful software fallback when hardware encoders are unavailable.
+        let fallback_h264 =
+            build_ffmpeg_args_with_hw(&h264, None, &opts_auto, &none_hw).expect("sw h264 fallback");
+        assert!(has_pair(&fallback_h264, "-c:v", "libx264"));
+        let fallback_h265 =
+            build_ffmpeg_args_with_hw(&h265, None, &opts_auto, &none_hw).expect("sw h265 fallback");
+        assert!(has_pair(&fallback_h265, "-c:v", "libx265"));
+    }
+
+    #[test]
+    fn encoder_speed_presets_emit_vp9_cpu_used_and_h264_h265_presets() {
+        let mut vp9 = base_settings();
+        vp9.container = ExportContainer::Webm;
+        vp9.video_codec = VideoCodec::Vp9;
+        vp9.audio_codec = AudioCodec::None;
+
+        // Default Balanced preset uses `-deadline good -cpu-used 2` (avoiding slowest `-cpu-used 0`).
+        let vp9_default = build_ffmpeg_args(&vp9, None).expect("default vp9");
+        assert!(has_pair(&vp9_default, "-deadline", "good"));
+        assert!(has_pair(&vp9_default, "-cpu-used", "2"));
+
+        let vp9_fast = build_ffmpeg_args_with_options(
+            &vp9,
+            None,
+            &ExportEncodeOptions::default().with_speed_preset(EncoderSpeedPreset::Fast),
+        )
+        .expect("fast vp9");
+        assert!(has_pair(&vp9_fast, "-cpu-used", "4"));
+
+        let h264_slow = build_ffmpeg_args_with_options(
+            &base_settings(),
+            None,
+            &ExportEncodeOptions::default().with_speed_preset(EncoderSpeedPreset::Slow),
+        )
+        .expect("slow h264");
+        assert!(has_pair(&h264_slow, "-preset", "slow"));
+
+        let mut h265 = base_settings();
+        h265.video_codec = VideoCodec::H265;
+        let h265_fast = build_ffmpeg_args_with_options(
+            &h265,
+            None,
+            &ExportEncodeOptions::default().with_speed_preset(EncoderSpeedPreset::Fast),
+        )
+        .expect("fast h265");
+        assert!(has_pair(&h265_fast, "-preset", "fast"));
+    }
+
+    #[test]
+    fn datamosh_at_clip_cuts_emits_force_key_frames() {
+        let mut webm = base_settings();
+        webm.container = ExportContainer::Webm;
+        webm.video_codec = VideoCodec::Vp9;
+        webm.audio_codec = AudioCodec::None;
+
+        let cuts_opts = ExportEncodeOptions::default()
+            .with_datamosh_cuts(DatamoshMode::AtClipCuts, vec![2500, 1000, 1000, 0]);
+        let args = build_ffmpeg_args_with_options(&webm, None, &cuts_opts).expect("cut kf args");
+        assert!(has_pair(&args, "-force_key_frames", "1.000,2.500"));
+
+        let empty_cuts =
+            ExportEncodeOptions::default().with_datamosh_cuts(DatamoshMode::AtClipCuts, Vec::new());
+        let no_kf_args =
+            build_ffmpeg_args_with_options(&webm, None, &empty_cuts).expect("empty cut args");
+        assert!(!no_kf_args.iter().any(|a| a == "-force_key_frames"));
+
+        let full_video =
+            ExportEncodeOptions::default().with_datamosh_cuts(DatamoshMode::FullVideo, vec![1000]);
+        let full_args =
+            build_ffmpeg_args_with_options(&webm, None, &full_video).expect("full video args");
+        assert!(!full_args.iter().any(|a| a == "-force_key_frames"));
+    }
+
+    #[test]
+    fn ffmpeg_progress_flags_and_parser_handle_frames_time_and_end() {
+        let video_args = build_ffmpeg_args(&base_settings(), None).expect("video args");
+        assert!(video_args.iter().any(|a| a == "-nostats"));
+        assert!(has_pair(&video_args, "-progress", "pipe:1"));
+
+        let mut m4a = base_settings();
+        m4a.container = ExportContainer::M4a;
+        let audio = PathBuf::from("/tmp/audio.wav");
+        let m4a_args = build_ffmpeg_args(&m4a, Some(&audio)).expect("m4a args");
+        assert!(m4a_args.iter().any(|a| a == "-nostats"));
+        assert!(has_pair(&m4a_args, "-progress", "pipe:1"));
+
+        let mut state = FfmpegProgressUpdate::default();
+        assert!(!parse_ffmpeg_progress_line("frame=12", &mut state));
+        assert!(!parse_ffmpeg_progress_line(
+            "out_time_us=400000",
+            &mut state
+        ));
+        assert!(parse_ffmpeg_progress_line("progress=continue", &mut state));
+        assert_eq!(state.frame, Some(12));
+        assert_eq!(state.out_time_us, Some(400_000));
+        assert!(!state.ended);
+        assert_eq!(ffmpeg_progress_completed_frames(&state, 60, 30.0), 12);
+
+        // Audio-only progress (no `frame=` line, only `out_time_us=`) + N/A resilience.
+        let mut audio_state = FfmpegProgressUpdate::default();
+        assert!(!parse_ffmpeg_progress_line(
+            "out_time_us=N/A",
+            &mut audio_state
+        ));
+        assert!(!parse_ffmpeg_progress_line(
+            "out_time=00:00:01.500000",
+            &mut audio_state
+        ));
+        assert!(parse_ffmpeg_progress_line(
+            "progress=continue",
+            &mut audio_state
+        ));
+        assert_eq!(audio_state.out_time_us, Some(1_500_000));
+        assert_eq!(ffmpeg_progress_completed_frames(&audio_state, 60, 30.0), 45);
+
+        let mut end_state = FfmpegProgressUpdate::default();
+        assert!(parse_ffmpeg_progress_line("progress=end", &mut end_state));
+        assert!(end_state.ended);
+        assert_eq!(ffmpeg_progress_completed_frames(&end_state, 60, 30.0), 60);
     }
 }

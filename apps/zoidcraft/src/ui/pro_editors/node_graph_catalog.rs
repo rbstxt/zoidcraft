@@ -96,8 +96,34 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
                 default_f64: 0.0,
             },
             NodeParamSpec {
-                key: "default",
-                label: "Default",
+                key: "value",
+                label: "Value",
+                kind: NodeParamKind::Float {
+                    min: -100.0,
+                    max: 100.0,
+                    step: 0.05,
+                },
+                default_f64: 0.5,
+            },
+            NodeParamSpec {
+                key: "color",
+                label: "Color",
+                kind: NodeParamKind::ColorRgb,
+                default_f64: 1.0,
+            },
+            NodeParamSpec {
+                key: "x",
+                label: "X",
+                kind: NodeParamKind::Float {
+                    min: -100.0,
+                    max: 100.0,
+                    step: 0.05,
+                },
+                default_f64: 0.5,
+            },
+            NodeParamSpec {
+                key: "y",
+                label: "Y",
                 kind: NodeParamKind::Float {
                     min: -100.0,
                     max: 100.0,
@@ -177,6 +203,11 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
                 label: "Time",
                 data_type: PortDataType::Float,
             },
+            PortSpec {
+                id: "seed",
+                label: "Seed",
+                data_type: PortDataType::Float,
+            },
         ],
         outputs: &[PortSpec {
             id: "out",
@@ -201,6 +232,16 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
                     min: -100.0,
                     max: 100.0,
                     step: 0.05,
+                },
+                default_f64: 0.0,
+            },
+            NodeParamSpec {
+                key: "seed",
+                label: "Seed",
+                kind: NodeParamKind::Float {
+                    min: -1000.0,
+                    max: 1000.0,
+                    step: 1.0,
                 },
                 default_f64: 0.0,
             },
@@ -403,11 +444,11 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
             },
             NodeParamSpec {
                 key: "angle",
-                label: "Angle",
+                label: "Angle (rad)",
                 kind: NodeParamKind::Float {
-                    min: -360.0,
-                    max: 360.0,
-                    step: 1.0,
+                    min: -std::f64::consts::TAU,
+                    max: std::f64::consts::TAU,
+                    step: 0.05,
                 },
                 default_f64: 0.0,
             },
@@ -433,6 +474,11 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
                 label: "Time",
                 data_type: PortDataType::Float,
             },
+            PortSpec {
+                id: "angle",
+                label: "Angle",
+                data_type: PortDataType::Float,
+            },
         ],
         outputs: &[PortSpec {
             id: "out",
@@ -452,11 +498,11 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
             },
             NodeParamSpec {
                 key: "angle",
-                label: "Angle",
+                label: "Angle (rad)",
                 kind: NodeParamKind::Float {
-                    min: -360.0,
-                    max: 360.0,
-                    step: 1.0,
+                    min: -std::f64::consts::TAU,
+                    max: std::f64::consts::TAU,
+                    step: 0.05,
                 },
                 default_f64: 0.0,
             },
@@ -631,11 +677,11 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
                 key: "contrast",
                 label: "Contrast",
                 kind: NodeParamKind::Float {
-                    min: 0.0,
-                    max: 3.0,
+                    min: -1.0,
+                    max: 2.0,
                     step: 0.01,
                 },
-                default_f64: 1.0,
+                default_f64: 0.0,
             },
         ],
     },
@@ -742,11 +788,38 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
         kind: "levels",
         title: "Levels",
         category: "Color",
-        inputs: &[PortSpec {
-            id: "color",
-            label: "Color",
-            data_type: PortDataType::Color,
-        }],
+        inputs: &[
+            PortSpec {
+                id: "color",
+                label: "Color",
+                data_type: PortDataType::Color,
+            },
+            PortSpec {
+                id: "black",
+                label: "In Black",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "white",
+                label: "In White",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "gamma",
+                label: "Gamma",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "outBlack",
+                label: "Out Black",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "outWhite",
+                label: "Out White",
+                data_type: PortDataType::Float,
+            },
+        ],
         outputs: &[PortSpec {
             id: "color",
             label: "Color",
@@ -895,7 +968,7 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
                 key: "interpolation",
                 label: "Interp",
                 kind: NodeParamKind::Choice(RAMP_INTERP),
-                default_f64: 0.0,
+                default_f64: 1.0,
             },
             NodeParamSpec {
                 key: "stops",
@@ -1026,16 +1099,48 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
             label: "Color",
             data_type: PortDataType::Color,
         }],
-        params: &[NodeParamSpec {
-            key: "a",
-            label: "Alpha",
-            kind: NodeParamKind::Float {
-                min: 0.0,
-                max: 1.0,
-                step: 0.01,
+        params: &[
+            NodeParamSpec {
+                key: "r",
+                label: "R",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.01,
+                },
+                default_f64: 0.0,
             },
-            default_f64: 1.0,
-        }],
+            NodeParamSpec {
+                key: "g",
+                label: "G",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.01,
+                },
+                default_f64: 0.0,
+            },
+            NodeParamSpec {
+                key: "b",
+                label: "B",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.01,
+                },
+                default_f64: 0.0,
+            },
+            NodeParamSpec {
+                key: "a",
+                label: "Alpha",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.01,
+                },
+                default_f64: 1.0,
+            },
+        ],
     },
     NodeTypeSpec {
         kind: "separateHSV",
@@ -1091,7 +1196,38 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
             label: "Color",
             data_type: PortDataType::Color,
         }],
-        params: &[],
+        params: &[
+            NodeParamSpec {
+                key: "h",
+                label: "H",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.01,
+                },
+                default_f64: 0.0,
+            },
+            NodeParamSpec {
+                key: "s",
+                label: "S",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.01,
+                },
+                default_f64: 1.0,
+            },
+            NodeParamSpec {
+                key: "v",
+                label: "V",
+                kind: NodeParamKind::Float {
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.01,
+                },
+                default_f64: 1.0,
+            },
+        ],
     },
     // --- Math ---
     NodeTypeSpec {
@@ -1107,6 +1243,11 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
             PortSpec {
                 id: "b",
                 label: "B",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "c",
+                label: "C",
                 data_type: PortDataType::Float,
             },
         ],
@@ -1135,6 +1276,16 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
             NodeParamSpec {
                 key: "b",
                 label: "B",
+                kind: NodeParamKind::Float {
+                    min: -1000.0,
+                    max: 1000.0,
+                    step: 0.05,
+                },
+                default_f64: 0.5,
+            },
+            NodeParamSpec {
+                key: "c",
+                label: "C",
                 kind: NodeParamKind::Float {
                     min: -1000.0,
                     max: 1000.0,
@@ -1183,11 +1334,33 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
         kind: "mapRange",
         title: "Map Range",
         category: "Math",
-        inputs: &[PortSpec {
-            id: "value",
-            label: "Value",
-            data_type: PortDataType::Float,
-        }],
+        inputs: &[
+            PortSpec {
+                id: "value",
+                label: "Value",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "fromMin",
+                label: "From Min",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "fromMax",
+                label: "From Max",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "toMin",
+                label: "To Min",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "toMax",
+                label: "To Max",
+                data_type: PortDataType::Float,
+            },
+        ],
         outputs: &[PortSpec {
             id: "out",
             label: "Result",
@@ -1246,11 +1419,23 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
         kind: "clamp",
         title: "Clamp",
         category: "Math",
-        inputs: &[PortSpec {
-            id: "value",
-            label: "Value",
-            data_type: PortDataType::Float,
-        }],
+        inputs: &[
+            PortSpec {
+                id: "value",
+                label: "Value",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "min",
+                label: "Min",
+                data_type: PortDataType::Float,
+            },
+            PortSpec {
+                id: "max",
+                label: "Max",
+                data_type: PortDataType::Float,
+            },
+        ],
         outputs: &[PortSpec {
             id: "out",
             label: "Result",
@@ -1395,11 +1580,11 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
             },
             NodeParamSpec {
                 key: "angle",
-                label: "Angle",
+                label: "Angle (rad)",
                 kind: NodeParamKind::Float {
-                    min: -360.0,
-                    max: 360.0,
-                    step: 1.0,
+                    min: -std::f64::consts::TAU,
+                    max: std::f64::consts::TAU,
+                    step: 0.05,
                 },
                 default_f64: 0.0,
             },
@@ -1483,13 +1668,13 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
             },
             NodeParamSpec {
                 key: "angle",
-                label: "Angle",
+                label: "Angle (rad)",
                 kind: NodeParamKind::Float {
-                    min: -720.0,
-                    max: 720.0,
-                    step: 2.0,
+                    min: -12.5664,
+                    max: 12.5664,
+                    step: 0.05,
                 },
-                default_f64: 90.0,
+                default_f64: 1.5,
             },
         ],
     },
@@ -1527,11 +1712,11 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
             },
             NodeParamSpec {
                 key: "angle",
-                label: "Angle",
+                label: "Angle (rad)",
                 kind: NodeParamKind::Float {
-                    min: -360.0,
-                    max: 360.0,
-                    step: 1.0,
+                    min: -std::f64::consts::TAU,
+                    max: std::f64::consts::TAU,
+                    step: 0.05,
                 },
                 default_f64: 0.0,
             },
@@ -1657,13 +1842,13 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
             },
             NodeParamSpec {
                 key: "radius",
-                label: "Radius",
+                label: "Radius (px)",
                 kind: NodeParamKind::Float {
                     min: 0.0,
-                    max: 0.1,
-                    step: 0.001,
+                    max: 64.0,
+                    step: 0.25,
                 },
-                default_f64: 0.01,
+                default_f64: 8.0,
             },
             NodeParamSpec {
                 key: "taps",
@@ -1673,11 +1858,11 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
             },
             NodeParamSpec {
                 key: "angle",
-                label: "Angle",
+                label: "Angle (rad)",
                 kind: NodeParamKind::Float {
-                    min: -360.0,
-                    max: 360.0,
-                    step: 1.0,
+                    min: -std::f64::consts::TAU,
+                    max: std::f64::consts::TAU,
+                    step: 0.05,
                 },
                 default_f64: 0.0,
             },
@@ -1707,13 +1892,13 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
         params: &[
             NodeParamSpec {
                 key: "radius",
-                label: "Radius",
+                label: "Radius (px)",
                 kind: NodeParamKind::Float {
-                    min: 0.0005,
-                    max: 0.02,
-                    step: 0.0005,
+                    min: 0.25,
+                    max: 16.0,
+                    step: 0.25,
                 },
-                default_f64: 0.002,
+                default_f64: 1.0,
             },
             NodeParamSpec {
                 key: "amount",
@@ -1751,13 +1936,13 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
         params: &[
             NodeParamSpec {
                 key: "radius",
-                label: "Radius",
+                label: "Radius (px)",
                 kind: NodeParamKind::Float {
-                    min: 0.0005,
-                    max: 0.02,
-                    step: 0.0005,
+                    min: 0.25,
+                    max: 16.0,
+                    step: 0.25,
                 },
-                default_f64: 0.002,
+                default_f64: 1.0,
             },
             NodeParamSpec {
                 key: "strength",
@@ -1812,11 +1997,11 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
             },
             NodeParamSpec {
                 key: "angle",
-                label: "Angle",
+                label: "Angle (rad)",
                 kind: NodeParamKind::Float {
-                    min: -360.0,
-                    max: 360.0,
-                    step: 1.0,
+                    min: -std::f64::consts::TAU,
+                    max: std::f64::consts::TAU,
+                    step: 0.05,
                 },
                 default_f64: 0.0,
             },
@@ -1863,13 +2048,13 @@ pub const EFFECT_NODE_CATALOG: &[NodeTypeSpec] = &[
             },
             NodeParamSpec {
                 key: "radius",
-                label: "Radius",
+                label: "Radius (px)",
                 kind: NodeParamKind::Float {
-                    min: 0.002,
-                    max: 0.08,
-                    step: 0.002,
+                    min: 0.5,
+                    max: 32.0,
+                    step: 0.25,
                 },
-                default_f64: 0.015,
+                default_f64: 6.0,
             },
             NodeParamSpec {
                 key: "intensity",

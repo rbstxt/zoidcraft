@@ -242,9 +242,127 @@ fn triangulate_face(face_verts: &[u32], vertices: &[Vertex3D], indices: &mut Vec
     }
 }
 
+/// Parses a Wavefront `.mtl` material library into a map of material name -> linear RGBA `[r, g, b, a]`.
+///
+/// Supports `newmtl`, `Kd r g b` (and 1-component grayscale `Kd v`), `d alpha` (with optional `-halo`),
+/// and `Tr transparency` (`alpha = 1.0 - Tr`).
+fn parse_mtl_colors(source: &str) -> HashMap<String, [f32; 4]> {
+    let mut materials: HashMap<String, [f32; 4]> = HashMap::new();
+    let mut current: Option<String> = None;
+
+    for (_line_no, line) in collect_logical_lines(source) {
+        let mut parts = line.split_whitespace();
+        let Some(keyword) = parts.next() else {
+            continue;
+        };
+        match keyword {
+            "newmtl" => {
+                let name = line.strip_prefix(keyword).unwrap_or("").trim();
+                if !name.is_empty() {
+                    let owned = name.to_owned();
+                    materials
+                        .entry(owned.clone())
+                        .or_insert([1.0, 1.0, 1.0, 1.0]);
+                    current = Some(owned);
+                }
+            }
+            "Kd" => {
+                if let Some(ref name) = current
+                    && let Some(entry) = materials.get_mut(name)
+                    && let Some(r) = parts.next().and_then(|t| t.parse::<f32>().ok())
+                    && r.is_finite()
+                {
+                    let g = parts
+                        .next()
+                        .and_then(|t| t.parse::<f32>().ok())
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(r);
+                    let b = parts
+                        .next()
+                        .and_then(|t| t.parse::<f32>().ok())
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(g);
+                    entry[0] = r.clamp(0.0, 1.0);
+                    entry[1] = g.clamp(0.0, 1.0);
+                    entry[2] = b.clamp(0.0, 1.0);
+                }
+            }
+            "d" => {
+                if let Some(ref name) = current
+                    && let Some(entry) = materials.get_mut(name)
+                {
+                    let mut tok = parts.next();
+                    if tok == Some("-halo") {
+                        tok = parts.next();
+                    }
+                    if let Some(alpha) = tok
+                        .and_then(|t| t.parse::<f32>().ok())
+                        .filter(|v| v.is_finite())
+                    {
+                        entry[3] = alpha.clamp(0.0, 1.0);
+                    }
+                }
+            }
+            "Tr" => {
+                if let Some(ref name) = current
+                    && let Some(entry) = materials.get_mut(name)
+                    && let Some(tr) = parts
+                        .next()
+                        .and_then(|t| t.parse::<f32>().ok())
+                        .filter(|v| v.is_finite())
+                {
+                    entry[3] = (1.0 - tr).clamp(0.0, 1.0);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    materials
+}
+
 /// Clean-room Wavefront `.obj` parser supporting `v`, `vt`, `vn`, triangles/quads/n-gons,
 /// negative relative indices, `usemtl` material slots, and automatic normal generation.
 pub fn parse_obj(source: &str) -> Result<MeshData, ObjLoadError> {
+    parse_obj_with_mtl(source, None)
+}
+
+/// Loads a Wavefront `.obj` byte slice into a [`MeshData`].
+pub fn load_obj(obj_bytes: &[u8]) -> Result<MeshData, ObjLoadError> {
+    load_obj_with_mtl(obj_bytes, None)
+}
+
+/// Loads a Wavefront `.obj` byte slice with an optional `.mtl` material library byte slice,
+/// applying per-face `Kd` / `d` material colors to vertices via [`MeshData::with_colors`].
+pub fn load_obj_with_mtl(
+    obj_bytes: &[u8],
+    mtl_bytes: Option<&[u8]>,
+) -> Result<MeshData, ObjLoadError> {
+    let source = std::str::from_utf8(obj_bytes).map_err(|_| ObjLoadError::InvalidSyntax {
+        line: 1,
+        message: String::from("OBJ input is not valid UTF-8"),
+    })?;
+    let mtl_owned;
+    let mtl_source = match mtl_bytes {
+        Some(bytes) => {
+            mtl_owned = String::from_utf8_lossy(bytes);
+            Some(mtl_owned.as_ref())
+        }
+        None => None,
+    };
+    parse_obj_with_mtl(source, mtl_source)
+}
+
+/// Parses a Wavefront `.obj` string with an optional `.mtl` material library string,
+/// applying per-face `Kd` / `d` diffuse material colors via [`MeshData::with_colors`].
+pub fn parse_obj_with_mtl(
+    source: &str,
+    mtl_source: Option<&str>,
+) -> Result<MeshData, ObjLoadError> {
+    let mtl_colors = mtl_source.map(parse_mtl_colors).unwrap_or_default();
+    let mut slot_colors: HashMap<u32, [f32; 4]> = HashMap::new();
+    let mut used_mtl_color = false;
+
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut texcoords: Vec<[f32; 2]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
@@ -349,6 +467,10 @@ pub fn parse_obj(source: &str) -> Result<MeshData, ObjLoadError> {
                     let offset = u32::from(has_unassigned_faces);
                     let next_id = offset + material_map.len() as u32;
                     current_slot = *material_map.entry(name.to_owned()).or_insert(next_id);
+                    if let Some(&rgba) = mtl_colors.get(name) {
+                        slot_colors.insert(current_slot, rgba);
+                        used_mtl_color = true;
+                    }
                 }
             }
             "s" => {
@@ -453,7 +575,20 @@ pub fn parse_obj(source: &str) -> Result<MeshData, ObjLoadError> {
         return Err(ObjLoadError::EmptyMesh);
     }
 
-    let mut mesh = MeshData::new(vertices, indices);
+    let mut mesh = if used_mtl_color {
+        let colors: Vec<[f32; 4]> = vertices
+            .iter()
+            .map(|v| {
+                slot_colors
+                    .get(&v.material_slot)
+                    .copied()
+                    .unwrap_or([1.0, 1.0, 1.0, 1.0])
+            })
+            .collect();
+        MeshData::with_colors(vertices, indices, colors)
+    } else {
+        MeshData::new(vertices, indices)
+    };
     if missing_any_normal {
         let mut accum = vec![Vec3::ZERO; mesh.vertices.len()];
         for tri in mesh.indices.as_chunks::<3>().0 {
@@ -490,4 +625,59 @@ pub fn parse_obj(source: &str) -> Result<MeshData, ObjLoadError> {
         }
     }
     Ok(mesh)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_obj_with_mtl_applies_per_face_kd_and_alpha_colors() {
+        let obj = b"\
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+usemtl red_mat
+f 1 2 3
+usemtl glass_blue
+f 1 3 4
+";
+        let mtl = b"\
+# Material library
+newmtl red_mat
+Kd 0.9 0.1 0.2
+d 1.0
+
+newmtl glass_blue
+Kd 0.1 0.4 0.95
+d 0.5
+";
+        let mesh = load_obj_with_mtl(obj, Some(mtl)).expect("OBJ+MTL should parse");
+        assert_eq!(mesh.colors.len(), mesh.vertices.len());
+        assert_eq!(mesh.triangle_count(), 2);
+
+        let mut saw_red = false;
+        let mut saw_blue = false;
+        for (v, c) in mesh.vertices.iter().zip(&mesh.colors) {
+            if v.material_slot == 0 {
+                assert!((c[0] - 0.9).abs() < 1e-5);
+                assert!((c[1] - 0.1).abs() < 1e-5);
+                assert!((c[2] - 0.2).abs() < 1e-5);
+                assert!((c[3] - 1.0).abs() < 1e-5);
+                saw_red = true;
+            } else if v.material_slot == 1 {
+                assert!((c[0] - 0.1).abs() < 1e-5);
+                assert!((c[1] - 0.4).abs() < 1e-5);
+                assert!((c[2] - 0.95).abs() < 1e-5);
+                assert!((c[3] - 0.5).abs() < 1e-5);
+                saw_blue = true;
+            }
+        }
+        assert!(saw_red && saw_blue);
+
+        // Without MTL, colors stay empty for backward compatibility.
+        let plain = load_obj_with_mtl(obj, None).expect("plain OBJ should parse");
+        assert!(plain.colors.is_empty());
+    }
 }

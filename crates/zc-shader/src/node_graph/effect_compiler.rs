@@ -165,7 +165,7 @@ impl<'a> EffectCompiler<'a> {
                         param_f64(&node.params, &["x"], 0.5) as f32,
                         param_f64(&node.params, &["y"], 0.5) as f32,
                     ],
-                    _ => vec![param_f64(&node.params, &["value"], 0.5) as f32],
+                    _ => vec![param_f64(&node.params, &["value", "default"], 0.5) as f32],
                 };
                 let expr = match kind {
                     1 => glsl_rgb(&uniform_name),
@@ -218,21 +218,26 @@ impl<'a> EffectCompiler<'a> {
                 let uv = self.read_uv(node);
                 let scale = self.read_num(node, &["scale"], 8.0);
                 let time = self.read_num(node, &["time"], 0.0);
-                let mode = if let Some(m) = param_str(&node.params, &["mode", "feature"]) {
-                    match m.trim().to_ascii_lowercase().as_str() {
-                        "f2" => 1,
-                        "edge" | "distance to edge" => 2,
-                        _ => 0,
-                    }
+                let mode = resolve_voronoi_mode(&node.params);
+                if mode == 3 {
+                    let fn_name = self.alloc_var("ne_voronoi_cell");
+                    self.functions.push(format!(
+                        "vec3 {fn_name}(vec2 p, float t) {{\n vec2 cell = floor(p), f = fract(p), best_c = cell;\n float f1 = 1.0e10;\n for (int y = -1; y <= 1; y++) {{\n  for (int x = -1; x <= 1; x++) {{\n   vec2 g = vec2(float(x), float(y)), c = cell + g;\n   vec2 point = 0.5 + 0.5 * sin(t + 6.2831853 * vec2(ne_hash(c), ne_hash(c + 19.1)));\n   vec2 r = g + point - f;\n   float d = dot(r, r);\n   if (d < f1) {{ f1 = d; best_c = c; }}\n  }}\n }}\n return vec3(ne_hash(best_c), ne_hash(best_c + 17.3), ne_hash(best_c + 41.7));\n}}"
+                    ));
+                    let cell_var = self.alloc_var("nvc");
+                    self.lines.push(format!(
+                        " vec3 {cell_var} = {fn_name}({uv} * {scale}, {time});"
+                    ));
+                    self.push_out(&mut outs, "out", glsl_scalar(&format!("{cell_var}.x")));
+                    self.push_out(&mut outs, "color", glsl_rgb(&cell_var));
                 } else {
-                    (param_f64(&node.params, &["mode", "feature"], 0.0).round() as i32).clamp(0, 2)
-                };
-                let v = self.push_out(
-                    &mut outs,
-                    "out",
-                    glsl_scalar(&format!("ne_voronoi({uv} * {scale}, {time})[{mode}]")),
-                );
-                outs.insert("color".to_string(), v);
+                    let v = self.push_out(
+                        &mut outs,
+                        "out",
+                        glsl_scalar(&format!("ne_voronoi({uv} * {scale}, {time})[{mode}]")),
+                    );
+                    outs.insert("color".to_string(), v);
+                }
             }
             "gradient" => {
                 let uv = self.read_uv(node);
@@ -349,11 +354,12 @@ impl<'a> EffectCompiler<'a> {
                 let a = self.read_num(node, &["a"], 0.5);
                 let b = self.read_num(node, &["b"], 0.5);
                 let c = self.read_num(node, &["c"], 0.5);
-                self.push_out(
-                    &mut outs,
-                    "out",
-                    glsl_scalar(&format!("ne_math({a}, {b}, {c}, {mode})")),
-                );
+                let expr = match mode {
+                    31 => format!("step({b}, {a})"),
+                    32 => format!("ne_safe(-({a}))"),
+                    _ => format!("ne_math({a}, {b}, {c}, {mode})"),
+                };
+                self.push_out(&mut outs, "out", glsl_scalar(&expr));
             }
             "vectorMath" => {
                 let mode = resolve_vector_math_op(&node.params);
@@ -370,7 +376,11 @@ impl<'a> EffectCompiler<'a> {
                     5 => format!("vec3(dot({a}, {b}))"),
                     6 => format!("vec3(length({a}))"),
                     7 => format!("vec3(distance({a}, {b}))"),
-                    _ => format!("cross({a}, {b})"),
+                    8 => format!("cross({a}, {b})"),
+                    _ => {
+                        let scale = self.read_num(node, &["scale", "b"], 1.0);
+                        format!("{a} * ({scale})")
+                    }
                 };
                 let vec_out = self.push_out(&mut outs, "out", glsl_rgb(&expr));
                 self.push_out(&mut outs, "value", glsl_scalar(&format!("{vec_out}.x")));
@@ -416,35 +426,58 @@ impl<'a> EffectCompiler<'a> {
             }
             "trig" => {
                 let x = self.read_num(node, &["x", "value", "a"], 0.0);
-                let op = param_str(&node.params, &["op", "mode", "function"])
-                    .unwrap_or("sin")
-                    .to_ascii_lowercase();
-                let expr = match op.as_str() {
-                    "cos" | "cosine" | "1" => format!("cos({x})"),
-                    "tan" | "tangent" | "2" => format!("tan({x})"),
-                    "asin" | "3" => format!("asin(clamp({x}, -1.0, 1.0))"),
-                    "acos" | "4" => format!("acos(clamp({x}, -1.0, 1.0))"),
-                    "atan" | "5" => format!("atan({x})"),
+                let op = resolve_trig_op(&node.params);
+                let expr = match op {
+                    1 => format!("cos({x})"),
+                    2 => format!("tan({x})"),
+                    3 => format!("asin(clamp({x}, -1.0, 1.0))"),
+                    4 => format!("acos(clamp({x}, -1.0, 1.0))"),
+                    5 => format!("atan({x})"),
                     _ => format!("sin({x})"),
                 };
                 self.push_out(&mut outs, "out", glsl_scalar(&expr));
             }
             "mix" => {
                 let mode = resolve_blend_mode(&node.params, &["mode", "blendMode"]);
-                let a = self.read_col(node, &["a", "base"], [0.0, 0.0, 0.0]);
-                let b = self.read_col(node, &["b", "top"], [1.0, 1.0, 1.0]);
+                let a_v4 = self.read_port_expr(
+                    node,
+                    &["a", "base"],
+                    Some(glsl_rgb("vec3(0.0, 0.0, 0.0)")),
+                    0.0,
+                );
+                let b_v4 = self.read_port_expr(
+                    node,
+                    &["b", "top"],
+                    Some(glsl_rgb("vec3(1.0, 1.0, 1.0)")),
+                    1.0,
+                );
                 let fac = self.read_num(node, &["factor", "opacity", "mix"], 0.5);
+                let a_var = self.alloc_var("nma");
+                let b_var = self.alloc_var("nmb");
+                let f_var = self.alloc_var("nmf");
+                self.lines.push(format!(" vec4 {a_var} = {a_v4};"));
+                self.lines.push(format!(" vec4 {b_var} = {b_v4};"));
+                self.lines
+                    .push(format!(" float {f_var} = clamp({fac}, 0.0, 1.0);"));
+                let rgb_expr = if mode == 19 {
+                    let fn_name = self.alloc_var("ne_hard_light");
+                    self.functions.push(format!(
+                        "vec3 {fn_name}(vec3 a, vec3 b, float f) {{\n vec3 r = vec3(\n  b.r < 0.5 ? 2.0 * a.r * b.r : 1.0 - 2.0 * (1.0 - a.r) * (1.0 - b.r),\n  b.g < 0.5 ? 2.0 * a.g * b.g : 1.0 - 2.0 * (1.0 - a.g) * (1.0 - b.g),\n  b.b < 0.5 ? 2.0 * a.b * b.b : 1.0 - 2.0 * (1.0 - a.b) * (1.0 - b.b)\n );\n return mix(a, r, clamp(f, 0.0, 1.0));\n}}"
+                    ));
+                    format!("{fn_name}({a_var}.rgb, {b_var}.rgb, {f_var})")
+                } else {
+                    format!("ne_mix({a_var}.rgb, {b_var}.rgb, {f_var}, {mode})")
+                };
                 let v = self.push_out(
                     &mut outs,
                     "color",
-                    glsl_rgb(&format!("ne_mix({a}, {b}, {fac}, {mode})")),
+                    format!("vec4({rgb_expr}, mix({a_var}.a, {b_var}.a, {f_var}))"),
                 );
                 outs.insert("out".to_string(), v);
             }
             "colorRamp" => {
                 let stops = parse_ramp_stops(&node.params);
-                let interp =
-                    (param_f64(&node.params, &["interpolation"], 1.0).round() as i32).clamp(0, 3);
+                let interp = resolve_ramp_interp(&node.params);
                 let fn_name = self.alloc_var("ne_ramp");
                 let vec4_stop = |s: [f64; 5]| {
                     format!(
@@ -553,46 +586,74 @@ impl<'a> EffectCompiler<'a> {
                 outs.insert("out".to_string(), out);
             }
             "hue" => {
-                let c = self.read_col(node, &["color", "in"], [1.0, 1.0, 1.0]);
+                let src = self.read_port_expr(
+                    node,
+                    &["color", "in"],
+                    Some(glsl_rgb("vec3(1.0, 1.0, 1.0)")),
+                    1.0,
+                );
+                let s_var = self.alloc_var("nsrc");
+                self.lines.push(format!(" vec4 {s_var} = {src};"));
                 let h = self.read_num(node, &["hue", "h"], 0.0);
                 let s = self.read_num(node, &["saturation", "s"], 1.0);
                 let v = self.read_num(node, &["value", "v"], 1.0);
                 let out = self.push_out(
                     &mut outs,
                     "color",
-                    glsl_rgb(&format!(
-                        "ne_rgb(ne_hsv({c}) * vec3(1.0, {s}, {v}) + vec3({h}, 0.0, 0.0))"
-                    )),
+                    format!(
+                        "vec4(ne_rgb(ne_hsv({s_var}.rgb) * vec3(1.0, {s}, {v}) + vec3({h}, 0.0, 0.0)), {s_var}.a)"
+                    ),
                 );
                 outs.insert("out".to_string(), out);
             }
             "brightness" => {
-                let c = self.read_col(node, &["color", "in"], [0.5, 0.5, 0.5]);
+                let src = self.read_port_expr(
+                    node,
+                    &["color", "in"],
+                    Some(glsl_rgb("vec3(0.5, 0.5, 0.5)")),
+                    0.5,
+                );
+                let s_var = self.alloc_var("nsrc");
+                self.lines.push(format!(" vec4 {s_var} = {src};"));
                 let br = self.read_num(node, &["brightness"], 0.0);
                 let ct = self.read_num(node, &["contrast"], 0.0);
                 let out = self.push_out(
                     &mut outs,
                     "color",
-                    glsl_rgb(&format!("({c} - 0.5) * (1.0 + {ct}) + 0.5 + {br}")),
+                    format!("vec4(({s_var}.rgb - 0.5) * (1.0 + {ct}) + 0.5 + {br}, {s_var}.a)"),
                 );
                 outs.insert("out".to_string(), out);
             }
             "colorBalance" => {
-                let c = self.read_col(node, &["color", "in"], [0.5, 0.5, 0.5]);
+                let src = self.read_port_expr(
+                    node,
+                    &["color", "in"],
+                    Some(glsl_rgb("vec3(0.5, 0.5, 0.5)")),
+                    0.5,
+                );
+                let s_var = self.alloc_var("nsrc");
+                self.lines.push(format!(" vec4 {s_var} = {src};"));
                 let lift = self.read_col(node, &["lift", "shadows"], [0.0, 0.0, 0.0]);
                 let gamma = self.read_col(node, &["gamma", "midtones"], [1.0, 1.0, 1.0]);
                 let gain = self.read_col(node, &["gain", "highlights"], [1.0, 1.0, 1.0]);
                 let out = self.push_out(
                     &mut outs,
                     "color",
-                    glsl_rgb(&format!(
-                        "pow(clamp(({c} + {lift}) * {gain}, 0.0, 1.0), 1.0 / max({gamma}, vec3(0.01)))"
-                    )),
+                    format!(
+                        "vec4(pow(clamp(({s_var}.rgb + {lift}) * {gain}, 0.0, 1.0), 1.0 / max({gamma}, vec3(0.01))), {s_var}.a)"
+                    ),
                 );
                 outs.insert("out".to_string(), out);
             }
             "levels" => {
-                let c = self.read_col(node, &["color", "in"], [0.5, 0.5, 0.5]);
+                let src = self.read_port_expr(
+                    node,
+                    &["color", "in"],
+                    Some(glsl_rgb("vec3(0.5, 0.5, 0.5)")),
+                    0.5,
+                );
+                let s_var = self.alloc_var("nsrc");
+                self.lines.push(format!(" vec4 {s_var} = {src};"));
                 let black = self.read_num(node, &["black", "inBlack"], 0.0);
                 let white = self.read_num(node, &["white", "inWhite"], 1.0);
                 let gamma = self.read_num(node, &["gamma"], 1.0);
@@ -601,31 +662,47 @@ impl<'a> EffectCompiler<'a> {
                 let out = self.push_out(
                     &mut outs,
                     "color",
-                    glsl_rgb(&format!(
-                        "mix(vec3({out_black}), vec3({out_white}), pow(clamp(({c} - {black}) / max({white} - {black}, 1.0e-12), 0.0, 1.0), vec3(1.0 / max({gamma}, 1.0e-6))))"
-                    )),
+                    format!(
+                        "vec4(mix(vec3({out_black}), vec3({out_white}), pow(clamp(({s_var}.rgb - {black}) / max({white} - {black}, 1.0e-12), 0.0, 1.0), vec3(1.0 / max({gamma}, 1.0e-6)))), {s_var}.a)"
+                    ),
                 );
                 outs.insert("out".to_string(), out);
             }
             "invert" => {
-                let c = self.read_col(node, &["color", "in"], [0.5, 0.5, 0.5]);
+                let src = self.read_port_expr(
+                    node,
+                    &["color", "in"],
+                    Some(glsl_rgb("vec3(0.5, 0.5, 0.5)")),
+                    0.5,
+                );
+                let s_var = self.alloc_var("nsrc");
+                self.lines.push(format!(" vec4 {s_var} = {src};"));
                 let fac = self.read_num(node, &["factor", "strength"], 1.0);
                 let out = self.push_out(
                     &mut outs,
                     "color",
-                    glsl_rgb(&format!("mix({c}, 1.0 - {c}, clamp({fac}, 0.0, 1.0))")),
+                    format!(
+                        "vec4(mix({s_var}.rgb, 1.0 - {s_var}.rgb, clamp({fac}, 0.0, 1.0)), {s_var}.a)"
+                    ),
                 );
                 outs.insert("out".to_string(), out);
             }
             "grayscale" => {
-                let c = self.read_col(node, &["color", "in"], [0.5, 0.5, 0.5]);
+                let src = self.read_port_expr(
+                    node,
+                    &["color", "in"],
+                    Some(glsl_rgb("vec3(0.5, 0.5, 0.5)")),
+                    0.5,
+                );
+                let s_var = self.alloc_var("nsrc");
+                self.lines.push(format!(" vec4 {s_var} = {src};"));
                 let fac = self.read_num(node, &["factor", "amount"], 1.0);
                 let out = self.push_out(
                     &mut outs,
                     "color",
-                    glsl_rgb(&format!(
-                        "mix({c}, vec3(dot({c}, vec3(0.2126, 0.7152, 0.0722))), clamp({fac}, 0.0, 1.0))"
-                    )),
+                    format!(
+                        "vec4(mix({s_var}.rgb, vec3(dot({s_var}.rgb, vec3(0.2126, 0.7152, 0.0722))), clamp({fac}, 0.0, 1.0)), {s_var}.a)"
+                    ),
                 );
                 outs.insert("out".to_string(), out);
             }
@@ -743,7 +820,7 @@ impl<'a> EffectCompiler<'a> {
             }
             "blur" => {
                 let uv = self.read_uv(node);
-                let mode = (param_f64(&node.params, &["mode"], 0.0).round() as i32).clamp(0, 3);
+                let mode = resolve_blur_mode(&node.params);
                 let taps = (param_f64(&node.params, &["taps", "samples"], 9.0).round() as usize)
                     .clamp(1, 32);
                 let radius = self.read_num(node, &["radius"], 8.0);
@@ -751,59 +828,92 @@ impl<'a> EffectCompiler<'a> {
                 let cx = self.read_num(node, &["cx"], 0.5);
                 let cy = self.read_num(node, &["cy"], 0.5);
                 let fn_name = self.alloc_var("ne_blur");
-                let count = if mode < 2 {
-                    ((taps as f64).sqrt().floor() as usize).clamp(1, 5)
-                } else {
-                    taps
-                };
-                self.cost(if mode < 2 { count * count } else { count })?;
                 let mut fn_lines = vec![format!(
-                    "vec4 {fn_name}(vec2 uv, float radius, float angle, vec2 center) {{\n vec4 sum = vec4(0.0);\n float total = 0.0;"
+                    "vec4 {fn_name}(vec2 uv, float radius, float angle, vec2 center) {{\n vec2 px = radius / max(resolution, vec2(1.0));\n vec4 sum = vec4(0.0);\n float total = 0.0;"
                 )];
-                if mode < 2 {
-                    for y in 0..count {
-                        for x in 0..count {
-                            let dx = if count == 1 {
+                if mode == 0 {
+                    // Box blur: always use an odd symmetric grid (3x3 minimum for taps >= 2)
+                    // so taps=3 never collapses to a 1x1 no-op.
+                    let side: usize = if taps <= 1 {
+                        1
+                    } else if taps <= 9 {
+                        3
+                    } else if taps <= 25 {
+                        5
+                    } else {
+                        7
+                    };
+                    self.cost(side * side)?;
+                    for y in 0..side {
+                        for x in 0..side {
+                            let dx = if side == 1 {
                                 0.0
                             } else {
-                                (x as f64) / ((count - 1) as f64) * 2.0 - 1.0
+                                (x as f64) / ((side - 1) as f64) * 2.0 - 1.0
                             };
-                            let dy = if count == 1 {
+                            let dy = if side == 1 {
                                 0.0
                             } else {
-                                (y as f64) / ((count - 1) as f64) * 2.0 - 1.0
-                            };
-                            let weight = if mode == 1 {
-                                (-2.0 * (dx * dx + dy * dy)).exp()
-                            } else {
-                                1.0
+                                (y as f64) / ((side - 1) as f64) * 2.0 - 1.0
                             };
                             fn_lines.push(format!(
-                                " {{ vec4 s = ne_sample(uv + vec2({dx:.6}, {dy:.6}) * radius / resolution); float w = {weight:.6}; sum += vec4(s.rgb * s.a, s.a) * w; total += w; }}"
+                                " {{ vec4 s = ne_sample(clamp(uv + vec2({dx:.6}, {dy:.6}) * px, 0.0, 1.0)); sum += vec4(s.rgb * s.a, s.a); total += 1.0; }}"
+                            ));
+                        }
+                    }
+                } else if mode == 1 {
+                    // Radial Gaussian blur: center sample + staggered concentric rings so even
+                    // low tap counts (e.g. taps=3) produce a real multi-tap isotropic Gaussian blur.
+                    let rings: &[(f64, usize, f64)] = if taps <= 1 {
+                        &[]
+                    } else if taps <= 9 {
+                        &[(0.5, 4, 0.0), (1.0, 8, PI / 8.0)]
+                    } else if taps <= 20 {
+                        &[(0.5, 8, 0.0), (1.0, 16, PI / 16.0)]
+                    } else {
+                        &[(0.35, 8, 0.0), (0.68, 12, PI / 12.0), (1.0, 16, PI / 16.0)]
+                    };
+                    let total_samples = 1 + rings.iter().map(|&(_, n, _)| n).sum::<usize>();
+                    self.cost(total_samples)?;
+                    fn_lines.push(
+                        " { vec4 s = ne_sample(clamp(uv, 0.0, 1.0)); sum += vec4(s.rgb * s.a, s.a); total += 1.0; }"
+                            .to_string(),
+                    );
+                    for &(r_norm, ring_n, phase) in rings {
+                        let weight = (-2.0 * r_norm * r_norm).exp();
+                        for k in 0..ring_n {
+                            let theta = phase + TAU * (k as f64) / (ring_n as f64);
+                            let dx = r_norm * theta.cos();
+                            let dy = r_norm * theta.sin();
+                            fn_lines.push(format!(
+                                " {{ vec4 s = ne_sample(clamp(uv + vec2({dx:.6}, {dy:.6}) * px, 0.0, 1.0)); float w = {weight:.6}; sum += vec4(s.rgb * s.a, s.a) * w; total += w; }}"
                             ));
                         }
                     }
                 } else {
+                    let count = taps;
+                    self.cost(count)?;
                     for i in 0..count {
                         let t = if count == 1 {
                             0.0
                         } else {
                             (i as f64) / ((count - 1) as f64) * 2.0 - 1.0
                         };
+                        let weight = (-2.0 * t * t).exp();
                         let off = if mode == 2 {
-                            format!("vec2(cos(angle), sin(angle)) * radius * ({t:.6}) / resolution")
+                            format!("vec2(cos(angle), sin(angle)) * px * ({t:.6})")
                         } else {
                             format!(
-                                "(uv - center) * radius * ({t:.6}) / max(resolution.x, resolution.y)"
+                                "(uv - center) * radius * ({t:.6}) / max(max(resolution.x, resolution.y), 1.0)"
                             )
                         };
                         fn_lines.push(format!(
-                            " {{ vec4 s = ne_sample(uv + {off}); sum += vec4(s.rgb * s.a, s.a); total += 1.0; }}"
+                            " {{ vec4 s = ne_sample(clamp(uv + {off}, 0.0, 1.0)); float w = {weight:.6}; sum += vec4(s.rgb * s.a, s.a) * w; total += w; }}"
                         ));
                     }
                 }
                 fn_lines.push(
-                    " return vec4(sum.a > 0.000001 ? sum.rgb / sum.a : vec3(0.0), sum.a / max(total, 1.0));\n}"
+                    " return vec4(sum.a > 0.000001 ? sum.rgb / sum.a : vec3(0.0), sum.a / max(total, 0.000001));\n}"
                         .to_string(),
                 );
                 self.functions.push(fn_lines.join("\n"));
@@ -892,11 +1002,31 @@ impl<'a> EffectCompiler<'a> {
                 let threshold = self.read_num(node, &["threshold"], 0.6);
                 let radius = self.read_num(node, &["radius"], 6.0);
                 let intensity = self.read_num(node, &["intensity", "strength", "amount"], 0.8);
-                self.cost(9)?;
+                // Smooth 3-ring radial glow: 1 center + 6 inner + 8 mid + 10 outer = 25 weighted samples.
+                let rings: &[(f64, usize, f64)] =
+                    &[(0.35, 6, 0.0), (0.68, 8, PI / 8.0), (1.0, 10, PI / 10.0)];
+                let total_samples = 1 + rings.iter().map(|&(_, n, _)| n).sum::<usize>();
+                self.cost(total_samples)?;
                 let fn_name = self.alloc_var("ne_glow");
-                self.functions.push(format!(
-                    "vec4 {fn_name}(vec2 uv, float threshold, float radius, float intensity) {{\n vec4 base = ne_sample(uv);\n vec3 acc = vec3(0.0);\n float total = 0.0;\n for (int y = -1; y <= 1; y++) {{\n  for (int x = -1; x <= 1; x++) {{\n   vec4 s = ne_sample(clamp(uv + vec2(float(x), float(y)) * radius / max(resolution, vec2(1.0)), 0.0, 1.0));\n   float l = dot(s.rgb, vec3(0.2126, 0.7152, 0.0722));\n   float hi = max(l - threshold, 0.0) / max(1.0 - threshold, 0.001);\n   acc += s.rgb * hi;\n   total += 1.0;\n  }}\n }}\n return vec4(clamp(base.rgb + (acc / total) * intensity, 0.0, 1.0), base.a);\n}}"
-                ));
+                let mut fn_lines = vec![format!(
+                    "vec4 {fn_name}(vec2 uv, float threshold, float radius, float intensity) {{\n vec2 px = radius / max(resolution, vec2(1.0));\n vec4 base = ne_sample(clamp(uv, 0.0, 1.0));\n vec3 acc = vec3(0.0);\n float total = 0.0;\n float inv_span = 1.0 / max(1.0 - threshold, 0.001);\n {{\n  float l = dot(base.rgb, vec3(0.2126, 0.7152, 0.0722));\n  float hi = max(l - threshold, 0.0) * inv_span;\n  acc += base.rgb * hi;\n  total += 1.0;\n }}"
+                )];
+                for &(r_norm, ring_n, phase) in rings {
+                    let weight = (-2.0 * r_norm * r_norm).exp();
+                    for k in 0..ring_n {
+                        let theta = phase + TAU * (k as f64) / (ring_n as f64);
+                        let dx = r_norm * theta.cos();
+                        let dy = r_norm * theta.sin();
+                        fn_lines.push(format!(
+                            " {{\n  vec4 s = ne_sample(clamp(uv + vec2({dx:.6}, {dy:.6}) * px, 0.0, 1.0));\n  float l = dot(s.rgb, vec3(0.2126, 0.7152, 0.0722));\n  float hi = max(l - threshold, 0.0) * inv_span;\n  float w = {weight:.6};\n  acc += s.rgb * hi * w;\n  total += w;\n }}"
+                        ));
+                    }
+                }
+                fn_lines.push(
+                    " return vec4(clamp(base.rgb + (acc / max(total, 0.0001)) * intensity, 0.0, 1.0), base.a);\n}"
+                        .to_string(),
+                );
+                self.functions.push(fn_lines.join("\n"));
                 let c = self.push_out(
                     &mut outs,
                     "color",
@@ -909,23 +1039,25 @@ impl<'a> EffectCompiler<'a> {
                 if self.resolve_link(&node.id, &["color", "in"]).is_none() {
                     self.cost(1)?;
                 }
-                let color = self.read_port_expr(
+                let color_expr = self.read_port_expr(
                     node,
                     &["color", "in"],
                     Some("ne_sample(vUv)".to_string()),
                     0.0,
                 );
+                let out_col = self.alloc_var("ne_out");
+                self.lines.push(format!(" vec4 {out_col} = {color_expr};"));
                 let alpha = if self.resolve_link(&node.id, &["alpha"]).is_some()
                     || node.params.contains_key("alpha")
                 {
                     self.read_num(node, &["alpha"], 1.0)
                 } else {
-                    "1.0".to_string()
+                    format!("{out_col}.a")
                 };
                 self.lines
                     .push(format!(" float ne_alpha = clamp({alpha}, 0.0, 1.0);"));
                 self.lines.push(format!(
-                    " gl_FragColor = vec4(({color}).rgb * ne_alpha, ne_alpha);"
+                    " gl_FragColor = vec4({out_col}.rgb * ne_alpha, ne_alpha);"
                 ));
             }
             other => {
@@ -1066,6 +1198,115 @@ pub fn compile_node_effect_to_glsl(graph: &Value) -> Result<CompiledNodeEffect, 
         node_count: nodes.len(),
         link_count: links.len(),
     })
+}
+
+#[cfg(test)]
+mod effect_compiler_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn trig_node_compiles_all_six_modes_for_integers_and_strings() {
+        let cases: &[(i32, &str, &str)] = &[
+            (0, "sin", "sin("),
+            (1, "cos", "cos("),
+            (2, "tan", "tan("),
+            (3, "asin", "asin(clamp("),
+            (4, "acos", "acos(clamp("),
+            (5, "atan", "atan("),
+        ];
+        for &(idx, name, expected) in cases {
+            for op_val in [json!(idx), json!(name)] {
+                let graph = json!({
+                    "nodes": [
+                        { "id": "t", "type": "trig", "params": { "op": op_val, "x": 0.5 } },
+                        { "id": "out", "type": "output" }
+                    ],
+                    "links": [
+                        { "from": "t", "fromPort": "out", "to": "out", "toPort": "color" }
+                    ]
+                });
+                let compiled = compile_node_effect_to_glsl(&graph).expect("trig compile");
+                assert!(
+                    compiled.glsl_source.contains(expected),
+                    "trig op {op_val} expected `{expected}` in:\n{}",
+                    compiled.glsl_source
+                );
+                compiled.to_wgsl().expect("trig WGSL must validate");
+            }
+        }
+    }
+
+    #[test]
+    fn new_enum_modes_hard_light_step_negate_scale_voronoi_cell_id_compile_to_wgsl() {
+        let graph = json!({
+            "nodes": [
+                { "id": "vor", "type": "voronoi", "params": { "mode": 3, "scale": 5.0 } },
+                { "id": "st", "type": "math", "params": { "mode": 31, "a": 0.7, "b": 0.5 } },
+                { "id": "ng", "type": "math", "params": { "mode": 32, "a": 0.4 } },
+                { "id": "vm", "type": "vectorMath", "params": { "mode": 9, "scale": 2.0 } },
+                { "id": "mx", "type": "mix", "params": { "mode": 19, "factor": 0.6 } },
+                { "id": "out", "type": "output" }
+            ],
+            "links": [
+                { "from": "vor", "fromPort": "color", "to": "vm", "toPort": "a" },
+                { "from": "st", "fromPort": "out", "to": "vm", "toPort": "b" },
+                { "from": "vm", "fromPort": "out", "to": "mx", "toPort": "a" },
+                { "from": "ng", "fromPort": "out", "to": "mx", "toPort": "b" },
+                { "from": "mx", "fromPort": "color", "to": "out", "toPort": "color" }
+            ]
+        });
+        let compiled = compile_node_effect_to_glsl(&graph).expect("new enum modes compile");
+        assert!(compiled.glsl_source.contains("ne_voronoi_cell"));
+        assert!(compiled.glsl_source.contains("step("));
+        assert!(compiled.glsl_source.contains("ne_safe(-("));
+        assert!(compiled.glsl_source.contains("ne_hard_light"));
+        compiled.to_wgsl().expect("new enum modes WGSL validate");
+    }
+
+    #[test]
+    fn blur_taps_3_does_not_collapse_glow_is_multi_ring_and_output_preserves_alpha() {
+        // 1. Box blur & Gaussian blur with taps=3 must never collapse to 1x1.
+        for mode in [0, 1] {
+            let graph = json!({
+                "nodes": [
+                    { "id": "b", "type": "blur", "params": { "mode": mode, "taps": 3, "radius": 6.0 } },
+                    { "id": "out", "type": "output" }
+                ],
+                "links": [
+                    { "from": "b", "fromPort": "color", "to": "out", "toPort": "color" }
+                ]
+            });
+            let compiled = compile_node_effect_to_glsl(&graph).expect("blur taps=3 compile");
+            assert!(
+                compiled.sample_count >= 9,
+                "blur mode={mode} taps=3 collapsed to {} samples",
+                compiled.sample_count
+            );
+            // Output alpha must preserve upstream `.a`, never hardcoded `clamp(1.0, 0.0, 1.0)`.
+            assert!(
+                !compiled.glsl_source.contains("clamp(1.0, 0.0, 1.0)"),
+                "unconnected output alpha must preserve input alpha:\n{}",
+                compiled.glsl_source
+            );
+            assert!(compiled.glsl_source.contains(".a, 0.0, 1.0"));
+            compiled.to_wgsl().expect("blur taps=3 WGSL validate");
+        }
+
+        // 2. Multi-ring radial glow uses 25 weighted samples and validates in Naga.
+        let glow_graph = json!({
+            "nodes": [
+                { "id": "g", "type": "glow", "params": { "threshold": 0.5, "radius": 8.0, "intensity": 0.9 } },
+                { "id": "out", "type": "output" }
+            ],
+            "links": [
+                { "from": "g", "fromPort": "color", "to": "out", "toPort": "color" }
+            ]
+        });
+        let glow_compiled = compile_node_effect_to_glsl(&glow_graph).expect("glow compile");
+        assert_eq!(glow_compiled.sample_count, 25);
+        glow_compiled.to_wgsl().expect("glow WGSL validate");
+    }
 }
 
 // ===========================================================================

@@ -70,10 +70,86 @@ function writeText(text) {
 }
 
 let audioContext;
+const audioWorkletModules = new WeakMap();
+
+const AUDIO_WORKLET_PROCESSOR_SOURCE = `
+class ZcAudioWorkletProcessor extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this.capacity = 16384;
+        this.left = new Float32Array(this.capacity);
+        this.right = new Float32Array(this.capacity);
+        this.readPos = 0;
+        this.writePos = 0;
+        this.bufferedFrames = 0;
+        this.stopped = false;
+        this.lowWaterFrames = 2048;
+        this.needPending = false;
+        this.port.onmessage = event => {
+            const msg = event.data;
+            if (!msg) return;
+            if (msg.type === "stop") {
+                this.stopped = true;
+                this.bufferedFrames = 0;
+                this.readPos = 0;
+                this.writePos = 0;
+                return;
+            }
+            if (msg.type === "push" && msg.samples) {
+                const samples = msg.samples;
+                const frameCount = samples.length >>> 1;
+                for (let i = 0; i < frameCount; i++) {
+                    if (this.bufferedFrames >= this.capacity) {
+                        this.readPos = (this.readPos + 1) % this.capacity;
+                        this.bufferedFrames--;
+                    }
+                    this.left[this.writePos] = samples[i * 2];
+                    this.right[this.writePos] = samples[i * 2 + 1];
+                    this.writePos = (this.writePos + 1) % this.capacity;
+                    this.bufferedFrames++;
+                }
+                this.needPending = false;
+            }
+        };
+    }
+
+    process(_inputs, outputs) {
+        if (this.stopped) return false;
+        const output = outputs[0];
+        if (!output || output.length === 0) return true;
+        const outL = output[0];
+        const outR = output[1] ?? output[0];
+        const frames = outL.length;
+        for (let i = 0; i < frames; i++) {
+            if (this.bufferedFrames > 0) {
+                outL[i] = this.left[this.readPos];
+                if (outR !== outL) outR[i] = this.right[this.readPos];
+                this.readPos = (this.readPos + 1) % this.capacity;
+                this.bufferedFrames--;
+            } else {
+                outL[i] = 0;
+                if (outR !== outL) outR[i] = 0;
+            }
+        }
+        if (this.bufferedFrames <= this.lowWaterFrames && !this.needPending) {
+            this.needPending = true;
+            this.port.postMessage({ type: "need", bufferedFrames: this.bufferedFrames });
+        }
+        return true;
+    }
+}
+registerProcessor("zc-audio-worklet", ZcAudioWorkletProcessor);
+`;
+
 function audioOutputContext() {
     const Context = globalThis.AudioContext ?? globalThis.webkitAudioContext;
     if (!Context) throw new Error("Web Audio is unavailable");
     return audioContext ??= new Context({ latencyHint: "interactive" });
+}
+
+function sampleRate() {
+    const sr = audioOutputContext().sampleRate;
+    return Number.isFinite(sr) && sr > 0 ? Math.round(sr) : 48_000;
 }
 
 function resumeAudio() {
@@ -82,11 +158,25 @@ function resumeAudio() {
     if (context.state !== "running") context.resume().catch(() => {});
 }
 
-function start(sampleRate, pull) {
-    const context = audioOutputContext();
+function ensureAudioWorklet(context) {
+    let promise = audioWorkletModules.get(context);
+    if (promise) return promise;
+    const blob = new Blob([AUDIO_WORKLET_PROCESSOR_SOURCE], { type: "application/javascript" });
+    const url = URL.createObjectURL(blob);
+    promise = context.audioWorklet.addModule(url).finally(() => {
+        URL.revokeObjectURL(url);
+    });
+    audioWorkletModules.set(context, promise);
+    promise.catch(() => {
+        if (audioWorkletModules.get(context) === promise) audioWorkletModules.delete(context);
+    });
+    return promise;
+}
+
+function startFallbackScheduler(context, actualSampleRate, pull) {
     const sources = new Set();
     const blockFrames = 1024;
-    const blockDuration = blockFrames / sampleRate;
+    const blockDuration = blockFrames / actualSampleRate;
     let nextTime = context.currentTime;
 
     function schedule() {
@@ -94,9 +184,9 @@ function start(sampleRate, pull) {
         const now = context.currentTime;
         nextTime = Math.max(nextTime, now + 0.006);
         while (nextTime < now + 0.055) {
-            const samples = pull(blockFrames, Math.max(0, nextTime - now) + (context.outputLatency || 0));
+            const samples = pull(blockFrames, Math.max(0, nextTime - now) + (context.outputLatency || context.baseLatency || 0));
             if (samples.length !== blockFrames * 2) return;
-            const buffer = context.createBuffer(2, blockFrames, sampleRate);
+            const buffer = context.createBuffer(2, blockFrames, actualSampleRate);
             const left = buffer.getChannelData(0);
             const right = buffer.getChannelData(1);
             for (let i = 0; i < blockFrames; i++) {
@@ -123,6 +213,98 @@ function start(sampleRate, pull) {
             source.disconnect();
         }
         sources.clear();
+    };
+}
+
+function start(requestedSampleRate, pull) {
+    const context = audioOutputContext();
+    const actualSampleRate = Number.isFinite(context.sampleRate) && context.sampleRate > 0
+        ? Math.round(context.sampleRate)
+        : (requestedSampleRate || 48_000);
+    const canUseWorklet = !!context.audioWorklet
+        && typeof AudioWorkletNode === "function"
+        && typeof Blob === "function"
+        && typeof URL?.createObjectURL === "function";
+    if (!canUseWorklet) {
+        return startFallbackScheduler(context, actualSampleRate, pull);
+    }
+
+    let stopped = false;
+    let node = null;
+    let timer = null;
+    let stopFallback = null;
+    const blockFrames = 512;
+    const targetFrames = Math.max(2048, Math.round(actualSampleRate * 0.064));
+    let estimatedBufferedFrames = 0;
+    let lastFeedTime = context.currentTime;
+
+    function currentBufferedFrames() {
+        const now = context.currentTime;
+        const elapsed = Math.max(0, now - lastFeedTime);
+        lastFeedTime = now;
+        estimatedBufferedFrames = Math.max(0, estimatedBufferedFrames - elapsed * actualSampleRate);
+        return estimatedBufferedFrames;
+    }
+
+    function pumpWorklet(reportedBuffered) {
+        if (stopped || !node || context.state !== "running") return;
+        if (typeof reportedBuffered === "number") {
+            estimatedBufferedFrames = reportedBuffered;
+            lastFeedTime = context.currentTime;
+        } else {
+            currentBufferedFrames();
+        }
+        const hwLatency = context.outputLatency || context.baseLatency || 0;
+        let blocksSent = 0;
+        while (estimatedBufferedFrames < targetFrames && blocksSent < 8) {
+            const delaySecs = (estimatedBufferedFrames / actualSampleRate) + hwLatency;
+            const pulled = pull(blockFrames, delaySecs);
+            if (!pulled || pulled.length !== blockFrames * 2) return;
+            const copy = new Float32Array(pulled);
+            node.port.postMessage({ type: "push", samples: copy }, [copy.buffer]);
+            estimatedBufferedFrames += blockFrames;
+            blocksSent++;
+        }
+    }
+
+    resumeAudio();
+    ensureAudioWorklet(context).then(() => {
+        if (stopped) return;
+        node = new AudioWorkletNode(context, "zc-audio-worklet", {
+            numberOfInputs: 0,
+            numberOfOutputs: 1,
+            outputChannelCount: [2],
+        });
+        node.port.onmessage = event => {
+            if (event.data?.type === "need") {
+                pumpWorklet(event.data.bufferedFrames);
+            }
+        };
+        node.connect(context.destination);
+        lastFeedTime = context.currentTime;
+        pumpWorklet(0);
+        timer = setInterval(() => pumpWorklet(), 12);
+    }).catch(() => {
+        if (stopped) return;
+        stopFallback = startFallbackScheduler(context, actualSampleRate, pull);
+    });
+
+    return () => {
+        stopped = true;
+        if (timer !== null) {
+            clearInterval(timer);
+            timer = null;
+        }
+        if (node) {
+            try { node.port.postMessage({ type: "stop" }); } catch { /* Ignore closed port. */ }
+            node.port.onmessage = null;
+            node.disconnect();
+            node = null;
+        }
+        if (stopFallback) {
+            stopFallback();
+            stopFallback = null;
+        }
     };
 }
 
@@ -156,8 +338,22 @@ async function decodeAudio(blob) {
 
 const videoTypes = {
     mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime",
-    webm: "video/webm", mkv: "video/webm", avi: "video/x-msvideo",
+    webm: "video/webm", mkv: "video/x-matroska", avi: "video/x-msvideo",
 };
+
+function resolveVideoMime(ext) {
+    if (ext === "mkv") {
+        if (typeof document !== "undefined") {
+            const probe = document.createElement("video");
+            if (typeof probe.canPlayType === "function") {
+                if (probe.canPlayType("video/x-matroska") !== "") return "video/x-matroska";
+                if (probe.canPlayType("video/webm") !== "") return "video/webm";
+            }
+        }
+        return "video/x-matroska";
+    }
+    return videoTypes[ext] ?? "";
+}
 const videos = new Map();
 const videoImports = new Map();
 const cache = new Map();
@@ -465,6 +661,17 @@ async function decodeRgba(asset, request) {
     return readRgba(asset, video, width, height);
 }
 
+function releaseVideoElement(asset) {
+    if (!asset?.element) return;
+    const { video, url } = asset.element;
+    try { video.pause(); } catch { /* Ignore detached/uninitialized video. */ }
+    video.removeAttribute("src");
+    try { video.load(); } catch { /* Ignore mock video elements. */ }
+    if (typeof video.remove === "function") video.remove();
+    if (url && typeof URL?.revokeObjectURL === "function") URL.revokeObjectURL(url);
+    asset.element = null;
+}
+
 function touchVideoSource(asset) {
     activeVideoSources.delete(asset.hash);
     activeVideoSources.set(asset.hash, asset);
@@ -472,15 +679,55 @@ function touchVideoSource(asset) {
         if (activeVideoSources.size <= 8) break;
         if (source === asset || source.pending.size > 0) continue;
         closeIsoDecoder(source);
-        if (source.element) {
-            source.element.video.removeAttribute("src");
-            source.element.video.load();
-            URL.revokeObjectURL(source.element.url);
-            source.element = null;
-        }
+        releaseVideoElement(source);
         source.canvas = null;
         activeVideoSources.delete(hash);
     }
+}
+
+function disposeVideo(hash) {
+    videoImports.delete(hash);
+    activeVideoSources.delete(hash);
+    const asset = videos.get(hash);
+    if (asset) {
+        videos.delete(hash);
+        asset.nextPreview = null;
+        asset.previewActive = false;
+        closeIsoDecoder(asset);
+        releaseVideoElement(asset);
+        asset.canvas = null;
+        asset.blob = null;
+        asset.pending.clear();
+        asset.failed.clear();
+        for (const [key, item] of [...asset.cached.entries()]) {
+            dropCached(key, item);
+        }
+    }
+    const prefix = `${hash}:`;
+    if (preparedFrames) {
+        for (const key of [...preparedFrames.keys()]) {
+            if (key.startsWith(prefix)) preparedFrames.delete(key);
+        }
+    }
+    if (frameRequests) {
+        for (const key of [...frameRequests.keys()]) {
+            if (key.startsWith(prefix)) frameRequests.delete(key);
+        }
+    }
+}
+
+function disposeAllVideos() {
+    for (const hash of [...videos.keys()]) {
+        disposeVideo(hash);
+    }
+    videos.clear();
+    videoImports.clear();
+    activeVideoSources.clear();
+    cache.clear();
+    cacheBytes = 0;
+    preparedFrames = null;
+    frameRequests = null;
+    dirty = false;
 }
 
 function dropCached(key, item) {
@@ -566,7 +813,8 @@ export async function importVideo(hash, filename, bytes) {
             return videoInfo(known, audio);
         }
         const ext = filename.split(".").at(-1).toLowerCase();
-        const blob = new Blob([bytes], { type: videoTypes[ext] ?? "" });
+        const mime = resolveVideoMime(ext);
+        let blob = new Blob([bytes], { type: mime });
         let probe;
         if (["mp4", "m4v", "mov"].includes(ext)) {
             try { probe = demuxIsoVideo(bytes); } catch { /* Use the browser's media demuxer. */ }
@@ -579,7 +827,19 @@ export async function importVideo(hash, filename, bytes) {
                 if (result.supported) iso = probe;
             } catch { /* Use the video element. */ }
         }
-        const element = iso ? null : await openVideoElement(blob);
+        let element = null;
+        if (!iso) {
+            try {
+                element = await openVideoElement(blob);
+            } catch (error) {
+                if (ext === "mkv" && mime !== "video/webm") {
+                    blob = new Blob([bytes], { type: "video/webm" });
+                    element = await openVideoElement(blob);
+                } else {
+                    throw error;
+                }
+            }
+        }
         const video = element?.video;
         const width = video?.videoWidth || iso?.width;
         const height = video?.videoHeight || iso?.height;
@@ -651,10 +911,106 @@ async function endFrameRequests() {
     const requests = frameRequests;
     frameRequests = null;
     const frames = new Map();
+    if (!requests) return frames;
     for (const [asset, request] of requests.values()) {
         frames.set(request.key, await decodeRequest(asset, request));
     }
     return frames;
+}
+
+async function prepareVideoFrames(requests) {
+    const frames = new Map();
+    if (Array.isArray(requests)) {
+        for (const entry of requests) {
+            if (!Array.isArray(entry) || entry.length < 4) continue;
+            const [hash, time, width, height] = entry;
+            const asset = videos.get(hash);
+            if (!asset) continue;
+            const request = requestAt(asset, time, width, height);
+            if (!frames.has(request.key)) {
+                frames.set(request.key, await decodeRequest(asset, request));
+            }
+        }
+    }
+    preparedFrames = frames.size > 0 ? frames : null;
+    return frames;
+}
+
+function beginMissedFrameCapture() {
+    frameRequests = new Map();
+}
+
+function hasPendingFrameRequests() {
+    return !!(frameRequests && frameRequests.size > 0);
+}
+
+async function endMissedFrameCapture() {
+    const requests = frameRequests;
+    frameRequests = null;
+    if (!requests || requests.size === 0) return preparedFrames;
+    const merged = preparedFrames ? new Map(preparedFrames) : new Map();
+    for (const [asset, request] of requests.values()) {
+        merged.set(request.key, await decodeRequest(asset, request));
+    }
+    preparedFrames = merged;
+    return merged;
+}
+
+function clearPreparedFrames() {
+    frameRequests = null;
+    preparedFrames = null;
+}
+
+async function encodeImageBlob(rgba, width, height, mime, quality = 0.92) {
+    const pixelCount = width * height;
+    const expected = pixelCount * 4;
+    if (!rgba || rgba.length !== expected) {
+        throw new Error(`Invalid RGBA frame size: expected ${expected}, got ${rgba?.length ?? 0}`);
+    }
+    const clamped = new Uint8ClampedArray(expected);
+    if (mime === "image/jpeg") {
+        // Composite straight-alpha RGBA onto opaque black for JPEG (no alpha channel).
+        for (let i = 0; i < expected; i += 4) {
+            const a = rgba[i + 3];
+            clamped[i] = ((rgba[i] * a + 127) / 255) | 0;
+            clamped[i + 1] = ((rgba[i + 1] * a + 127) / 255) | 0;
+            clamped[i + 2] = ((rgba[i + 2] * a + 127) / 255) | 0;
+            clamped[i + 3] = 255;
+        }
+    } else {
+        clamped.set(rgba);
+    }
+    const imageData = new ImageData(clamped, width, height);
+    if (typeof document !== "undefined") {
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("Could not create 2D canvas context for image export");
+        ctx.putImageData(imageData, 0, 0);
+        if (typeof canvas.toBlob === "function") {
+            return await new Promise((resolve, reject) => {
+                canvas.toBlob(blob => {
+                    if (blob) resolve(blob);
+                    else reject(new Error(`Browser failed to encode ${mime}`));
+                }, mime, quality);
+            });
+        }
+        const dataUrl = canvas.toDataURL(mime, quality);
+        const comma = dataUrl.indexOf(",");
+        const binary = atob(dataUrl.slice(comma + 1));
+        const out = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+        return new Blob([out], { type: mime });
+    }
+    if (typeof OffscreenCanvas === "function") {
+        const canvas = new OffscreenCanvas(width, height);
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("Could not create OffscreenCanvas 2D context for image export");
+        ctx.putImageData(imageData, 0, 0);
+        return await canvas.convertToBlob({ type: mime, quality });
+    }
+    throw new Error("Canvas image encoding is unavailable in this environment");
 }
 
 function consumeDirty() {
@@ -682,14 +1038,16 @@ function isSupported() {
 
 async function selectVideoEncoder(options) {
     const { width, height, fps, bitrateKbps, videoCodec } = options;
-    const base = { width, height, bitrate: bitrateKbps * 1000, framerate: fps, latencyMode: "realtime" };
+    const base = { width, height, bitrate: bitrateKbps * 1000, framerate: fps };
     if (videoCodec === "h264") base.avc = { format: "avc" };
-    for (const hardwareAcceleration of ["prefer-hardware", "no-preference"]) {
-        for (const codec of videoEncoderCodecs[videoCodec] ?? []) {
-            const config = { ...base, codec, hardwareAcceleration };
-            try {
-                if ((await VideoEncoder.isConfigSupported(config)).supported) return config;
-            } catch { /* Try the next browser encoder profile. */ }
+    for (const latencyMode of ["quality", "realtime"]) {
+        for (const hardwareAcceleration of ["prefer-hardware", "no-preference"]) {
+            for (const codec of videoEncoderCodecs[videoCodec] ?? []) {
+                const config = { ...base, codec, hardwareAcceleration, latencyMode };
+                try {
+                    if ((await VideoEncoder.isConfigSupported(config)).supported) return config;
+                } catch { /* Try the next browser encoder profile. */ }
+            }
         }
     }
     throw new Error(`No ${videoCodec.toUpperCase()} encoder is available at ${width}×${height}, ${fps} fps`);
@@ -801,7 +1159,7 @@ async function configureMovie(state) {
         } } : {}),
         firstTimestampBehavior: "offset",
     };
-    state.muxer = webm ? new WebmMuxer(tracks) : new Mp4Muxer({ ...tracks, fastStart: false });
+    state.muxer = webm ? new WebmMuxer(tracks) : new Mp4Muxer({ ...tracks, fastStart: "in-memory" });
     if (videoConfig) {
         if (state.transparentAlpha) configureAlphaEncoder(state, videoConfig);
         state.video = createEncoder(VideoEncoder, state, videoConfig, (chunk, metadata) => {
@@ -977,10 +1335,12 @@ function cancelExport(id) {
 
 globalThis.__zcFiles = { pickFile, downloadBlob, yieldToBrowser };
 globalThis.__zcClipboard = { readText, writeText };
-globalThis.__zcWebAudio = { start };
+globalThis.__zcWebAudio = { start, sampleRate };
 globalThis.__zcWebCodecs = {
-    isSupported, importVideo, getVideoFrame, isExactVideoFrame,
+    isSupported, importVideo, disposeVideo, disposeAllVideos, getVideoFrame, isExactVideoFrame,
     beginFrameRequests, endFrameRequests, usePreparedFrames: frames => { preparedFrames = frames; },
+    prepareVideoFrames, beginMissedFrameCapture, hasPendingFrameRequests, endMissedFrameCapture,
+    clearPreparedFrames, encodeImageBlob,
     consumeDirty, isDecoding: () => decoding > 0,
     startExport, encodeExportPng, encodeExportFrame, finishExport, cancelExport,
 };
@@ -994,4 +1354,4 @@ if (typeof document !== "undefined") {
     document.addEventListener("keydown", resumeAudio, { capture: true });
 }
 
-export { demuxIsoVideo, findSample, probeEbmlTracks };
+export { demuxIsoVideo, disposeAllVideos, disposeVideo, findSample, probeEbmlTracks, resolveVideoMime };

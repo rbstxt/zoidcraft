@@ -257,7 +257,7 @@ pub fn show_graph_editor_panel(
         state.drag_state,
         GraphDragState::DraggingHandle { .. } | GraphDragState::DraggingSpeedHandle { .. }
     ) {
-        sync_handles_from_tracks(&mut state.handles, &tracks);
+        sync_handles_from_tracks_preserving_channels(state, &tracks);
     }
 
     let full_rect = ui.available_rect_before_wrap();
@@ -387,23 +387,50 @@ pub fn show_graph_editor_panel(
     let graph_hovered = unoccluded_hover_pos(ui, full_rect).is_some();
     let canvas_hovered = unoccluded_hover_pos(ui, main_rect).is_some();
     if !ui.ctx().egui_wants_keyboard_input() && (state.window_focused || graph_hovered) {
-        let (has_copy, has_paste_key, pasted_text) = ui.input(|i| {
+        let (has_copy, has_cut, has_select_all, has_paste_key, pasted_text) = ui.input(|i| {
             let cmd = i.modifiers.command || i.modifiers.ctrl;
             let mut ev_copy = false;
+            let mut ev_cut = false;
             let mut ev_paste: Option<String> = None;
             for ev in &i.events {
                 match ev {
                     egui::Event::Copy => ev_copy = true,
+                    egui::Event::Cut => ev_cut = true,
                     egui::Event::Paste(text) => ev_paste = Some(text.clone()),
                     _ => {}
                 }
             }
             (
                 ev_copy || (cmd && i.key_pressed(egui::Key::C)),
+                ev_cut || (cmd && i.key_pressed(egui::Key::X)),
+                cmd && i.key_pressed(egui::Key::A),
                 cmd && i.key_pressed(egui::Key::V),
                 ev_paste,
             )
         });
+
+        if has_select_all {
+            state.selected_keys.clear();
+            for track in &tracks {
+                if !state.is_track_visible(&track.track_key) || track.is_expression {
+                    continue;
+                }
+                for kf in &track.keyframes {
+                    state.selected_keys.push(GraphKeyId::new(
+                        &track.target_id,
+                        &track.property,
+                        track.channel_index,
+                        kf.local_frame,
+                    ));
+                }
+            }
+        }
+
+        if has_cut && !state.selected_keys.is_empty() {
+            copy_selected_graph_keys(state, &tracks);
+            let _ = copy_curve_track_as_pz_json(ui.ctx(), session, state, &tracks);
+            delete_selected_graph_keys(session, state, &mut action);
+        }
 
         if has_copy {
             if !state.selected_keys.is_empty() {
@@ -435,9 +462,41 @@ pub fn show_graph_editor_panel(
         }
     }
 
-    if !ui.ctx().egui_wants_keyboard_input() && canvas_hovered {
-        let (k_f, k_bslash, k_h, k_v, k_s, k_i, k_t, k_r, k_k, k_n, k_del) = ui.input(|i| {
+    if !ui.ctx().egui_wants_keyboard_input() && (state.window_focused || canvas_hovered) {
+        let (
+            k_f,
+            k_bslash,
+            k_h,
+            k_v,
+            k_s,
+            k_i,
+            k_t,
+            k_r,
+            k_k,
+            k_n,
+            k_del,
+            k_esc,
+            k_zoom_in,
+            k_zoom_out,
+            nudge_dx,
+            nudge_dy,
+        ) = ui.input(|i| {
             let no_mod = !i.modifiers.ctrl && !i.modifiers.command && !i.modifiers.alt;
+            let step_mult = if i.modifiers.shift { 10.0 } else { 1.0 };
+            let dx = if no_mod && i.key_pressed(egui::Key::ArrowLeft) {
+                -step_mult
+            } else if no_mod && i.key_pressed(egui::Key::ArrowRight) {
+                step_mult
+            } else {
+                0.0
+            };
+            let dy = if no_mod && i.key_pressed(egui::Key::ArrowUp) {
+                step_mult
+            } else if no_mod && i.key_pressed(egui::Key::ArrowDown) {
+                -step_mult
+            } else {
+                0.0
+            };
             (
                 no_mod && i.key_pressed(egui::Key::F),
                 no_mod && i.key_pressed(egui::Key::Backslash),
@@ -450,9 +509,98 @@ pub fn show_graph_editor_panel(
                 no_mod && i.key_pressed(egui::Key::K),
                 no_mod && i.key_pressed(egui::Key::N),
                 no_mod && (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)),
+                no_mod && i.key_pressed(egui::Key::Escape),
+                no_mod && (i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus)),
+                no_mod && i.key_pressed(egui::Key::Minus),
+                dx,
+                dy,
             )
         });
-        if k_f {
+        if k_esc && !state.selected_keys.is_empty() {
+            state.selected_keys.clear();
+        } else if k_zoom_in {
+            state.zoom_x = (state.zoom_x / 1.25).clamp(1e-4, 500.0);
+            state.zoom_y = (state.zoom_y / 1.25).clamp(1e-6, 10000.0);
+        } else if k_zoom_out {
+            state.zoom_x = (state.zoom_x * 1.25).clamp(1e-4, 500.0);
+            state.zoom_y = (state.zoom_y * 1.25).clamp(1e-6, 10000.0);
+        } else if (nudge_dx != 0.0 || nudge_dy != 0.0) && !state.selected_keys.is_empty() {
+            let val_step = if state.plot_mode == GraphPlotMode::Speed {
+                0.0
+            } else {
+                nudge_dy * (state.zoom_y * 5.0).max(0.1)
+            };
+            let dragged = collect_dragged_graph_keys(&tracks, &state.selected_keys);
+            if !dragged.is_empty() && session.begin_transaction("Nudge Graph Keyframes").is_ok() {
+                let mut new_sel = Vec::new();
+                let mut changed = false;
+                let mut old_frames_to_del: Vec<(String, String, f64)> = Vec::new();
+                for dk in &dragged {
+                    let new_frame = (dk.orig_local_frame + nudge_dx).max(0.0);
+                    let dk_val_step = tracks
+                        .iter()
+                        .find(|t| t.track_key == dk.id.track_key())
+                        .map_or(val_step, |tr| state.raw_delta_from_display(tr, val_step));
+                    let new_val = write_channel_value(
+                        &dk.orig_full_value,
+                        dk.id.channel_index,
+                        dk.orig_value + dk_val_step,
+                    );
+                    if session
+                        .execute(Command::SetKeyframe {
+                            target_id: dk.id.target_id.clone(),
+                            property: dk.id.property.clone(),
+                            frame: new_frame,
+                            value: new_val,
+                            tween: Some(dk.tween),
+                        })
+                        .is_ok()
+                    {
+                        let _ = session.set_keyframe_bezier_handles(
+                            &dk.id.target_id,
+                            &dk.id.property,
+                            new_frame,
+                            dk.control_points,
+                            dk.continuous_tangent,
+                            Some(dk.tween),
+                        );
+                        changed = true;
+                        if (new_frame - dk.orig_local_frame).abs() > 1e-6 {
+                            old_frames_to_del.push((
+                                dk.id.target_id.clone(),
+                                dk.id.property.clone(),
+                                dk.orig_local_frame,
+                            ));
+                        }
+                        new_sel.push(GraphKeyId::new(
+                            &dk.id.target_id,
+                            &dk.id.property,
+                            dk.id.channel_index,
+                            new_frame,
+                        ));
+                    }
+                }
+                for (tid, prop, old_f) in old_frames_to_del {
+                    let still_used = dragged.iter().any(|o| {
+                        o.id.target_id == tid
+                            && o.id.property == prop
+                            && ((o.orig_local_frame + nudge_dx).max(0.0) - old_f).abs() < 1e-6
+                    });
+                    if !still_used {
+                        let _ = session.execute(Command::DeleteKeyframe {
+                            target_id: tid,
+                            property: prop,
+                            frame: old_f,
+                        });
+                    }
+                }
+                let _ = session.commit_transaction(changed);
+                if changed {
+                    state.selected_keys = new_sel;
+                    action.curves_modified = true;
+                }
+            }
+        } else if k_f {
             state.frame_selected_keys(&tracks, canvas_rect.size());
             if state.plot_mode == GraphPlotMode::Speed {
                 let doc = session.document().clone();
@@ -477,6 +625,8 @@ pub fn show_graph_editor_panel(
             insert_key_at_playhead(session, state, &tracks, &mut action);
         } else if k_n && graph_plus {
             state.normalize_curves = !state.normalize_curves;
+            let doc = session.document().clone();
+            state.fit_curves_for_mode(&tracks, &doc, fps, canvas_rect.size());
         } else if k_del && !state.selected_keys.is_empty() {
             delete_selected_graph_keys(session, state, &mut action);
         }
@@ -1186,7 +1336,13 @@ pub fn process_graph_drag(
                     BTreeMap::new();
                 for dk in &keys {
                     let new_frame = dk.orig_local_frame + preview_df;
-                    let new_val_scalar = dk.orig_value + preview_dv;
+                    let dk_dv = tracks
+                        .iter()
+                        .find(|t| t.track_key == dk.id.track_key())
+                        .map_or(preview_dv, |tr| {
+                            state.raw_delta_from_display(tr, preview_dv)
+                        });
+                    let new_val_scalar = dk.orig_value + dk_dv;
                     let new_id = GraphKeyId::new(
                         &dk.id.target_id,
                         &dk.id.property,
@@ -1226,6 +1382,7 @@ pub fn process_graph_drag(
 
                 let mut new_sel = Vec::new();
                 let mut updated_handles: Vec<(GraphKeyId, BezierHandlePair)> = Vec::new();
+                let mut updated_overrides: Vec<(GraphKeyId, BezierHandlePair)> = Vec::new();
                 let mut old_ids_to_clear: Vec<GraphKeyId> = Vec::new();
                 let mut changed = false;
 
@@ -1256,6 +1413,10 @@ pub fn process_graph_drag(
                         };
                         for (old_id, new_id) in edit.members {
                             let preserved = state.handles.get(&old_id).copied().unwrap_or(hp);
+                            if let Some(ovr) = state.channel_handle_overrides.get(&old_id).copied()
+                            {
+                                updated_overrides.push((new_id.clone(), ovr));
+                            }
                             old_ids_to_clear.push(old_id);
                             updated_handles.push((new_id.clone(), preserved));
                             new_sel.push(new_id);
@@ -1264,11 +1425,15 @@ pub fn process_graph_drag(
                 }
 
                 if changed {
-                    for old_id in old_ids_to_clear {
-                        state.handles.remove(&old_id);
+                    for old_id in &old_ids_to_clear {
+                        state.handles.remove(old_id);
+                        state.channel_handle_overrides.remove(old_id);
                     }
                     for (new_id, hp) in updated_handles {
                         state.handles.insert(new_id, hp);
+                    }
+                    for (new_id, ovr) in updated_overrides {
+                        state.channel_handle_overrides.insert(new_id, ovr);
                     }
                     // Delete old frames once per moved (target_id, property, orig_local_frame).
                     if preview_df.abs() > 1e-6 {
@@ -1298,6 +1463,86 @@ pub fn process_graph_drag(
                             }
                         }
                     }
+                    // Rescale Bezier handles on any segment where endpoints moved relative to each other.
+                    let mut affected_props: BTreeSet<(String, String)> = BTreeSet::new();
+                    for dk in &keys {
+                        affected_props.insert((dk.id.target_id.clone(), dk.id.property.clone()));
+                    }
+                    for (tid, prop_name) in affected_props {
+                        if let Some(tr) = tracks
+                            .iter()
+                            .find(|t| t.target_id == tid && t.property == prop_name)
+                        {
+                            for pair in tr.keyframes.windows(2) {
+                                let k0 = &pair[0];
+                                let k1 = &pair[1];
+                                let (mode, _) =
+                                    zc_anim::InterpolationMode::from_cm3_tween_code(k1.tween);
+                                if mode != zc_anim::InterpolationMode::Bezier {
+                                    continue;
+                                }
+                                let moved0 = keys.iter().any(|dk| {
+                                    dk.id.target_id == tid
+                                        && dk.id.property == prop_name
+                                        && (dk.orig_local_frame - k0.local_frame).abs() < 1e-6
+                                });
+                                let moved1 = keys.iter().any(|dk| {
+                                    dk.id.target_id == tid
+                                        && dk.id.property == prop_name
+                                        && (dk.orig_local_frame - k1.local_frame).abs() < 1e-6
+                                });
+                                if moved0 == moved1 {
+                                    continue;
+                                }
+                                let track_dv = state.raw_delta_from_display(tr, preview_dv);
+                                let new_f0 = k0.local_frame + if moved0 { preview_df } else { 0.0 };
+                                let new_v0 = k0.value + if moved0 { track_dv } else { 0.0 };
+                                let new_f1 = k1.local_frame + if moved1 { preview_df } else { 0.0 };
+                                let new_v1 = k1.value + if moved1 { track_dv } else { 0.0 };
+                                if new_f1 <= new_f0 + 1e-6 {
+                                    continue;
+                                }
+                                let (new_out, new_in) = zc_anim::rescale_segment_handles(
+                                    k0.local_frame,
+                                    k0.value,
+                                    k1.local_frame,
+                                    k1.value,
+                                    new_f0,
+                                    new_v0,
+                                    new_f1,
+                                    new_v1,
+                                    k0.control_points[1],
+                                    k1.control_points[0],
+                                );
+                                let _ = session.set_keyframe_bezier_handles(
+                                    &tid,
+                                    &prop_name,
+                                    new_f0,
+                                    [k0.control_points[0], new_out],
+                                    k0.continuous_tangent,
+                                    None,
+                                );
+                                let _ = session.set_keyframe_bezier_handles(
+                                    &tid,
+                                    &prop_name,
+                                    new_f1,
+                                    [new_in, k1.control_points[1]],
+                                    k1.continuous_tangent,
+                                    None,
+                                );
+                                let kid0 =
+                                    GraphKeyId::new(&tid, &prop_name, tr.channel_index, new_f0);
+                                let kid1 =
+                                    GraphKeyId::new(&tid, &prop_name, tr.channel_index, new_f1);
+                                if let Some(h0) = state.handles.get_mut(&kid0) {
+                                    h0.out_tangent = new_out;
+                                }
+                                if let Some(h1) = state.handles.get_mut(&kid1) {
+                                    h1.in_tangent = new_in;
+                                }
+                            }
+                        }
+                    }
                     state.selected_keys = new_sel;
                 }
                 let _ = session.commit_transaction(changed);
@@ -1315,13 +1560,37 @@ pub fn process_graph_drag(
             key_value,
             grab_start_pos,
             orig_tangent,
+            orig_other_tangents,
             mut changed,
         } => {
             if let Some(pos) = pointer_pos {
                 let delta_px = pos - grab_start_pos;
                 if changed || delta_px.length() > 0.5 || modifiers.alt {
-                    let raw_dx = orig_tangent[0] + f64::from(delta_px.x) * state.zoom_x;
-                    let raw_dy = orig_tangent[1] - f64::from(delta_px.y) * state.zoom_y;
+                    let anchor_track = tracks.iter().find(|t| t.track_key == key.track_key());
+                    let delta_disp_y = -f64::from(delta_px.y) * state.zoom_y;
+                    let delta_raw_y = anchor_track.map_or(delta_disp_y, |tr| {
+                        state.raw_delta_from_display(tr, delta_disp_y)
+                    });
+                    let mut raw_dx = orig_tangent[0] + f64::from(delta_px.x) * state.zoom_x;
+                    let mut raw_dy = orig_tangent[1] + delta_raw_y;
+
+                    // Shift snaps handle angle to 45° increments in screen space.
+                    if modifiers.shift {
+                        let disp_dy = anchor_track
+                            .map_or(raw_dy, |tr| state.display_delta_for_track(tr, raw_dy));
+                        let px = raw_dx / state.zoom_x.max(1e-9);
+                        let py = -disp_dy / state.zoom_y.max(1e-9);
+                        let len = px.hypot(py);
+                        if len > 1e-4 {
+                            let step = std::f64::consts::FRAC_PI_4;
+                            let snapped_angle = (py.atan2(px) / step).round() * step;
+                            raw_dx = len * snapped_angle.cos() * state.zoom_x;
+                            let snapped_disp_dy = -len * snapped_angle.sin() * state.zoom_y;
+                            raw_dy = anchor_track.map_or(snapped_disp_dy, |tr| {
+                                state.raw_delta_from_display(tr, snapped_disp_dy)
+                            });
+                        }
+                    }
 
                     // Clamp handle X strictly within adjacent segment [t0, t1].
                     let clamped_dx = if is_out {
@@ -1331,6 +1600,36 @@ pub fn process_graph_drag(
                         let min_dx = -(key.local_frame() - prev_local_frame).max(0.0);
                         raw_dx.clamp(min_dx, 0.0)
                     };
+
+                    // Ctrl/Cmd snaps to flat (dy = 0) or neighbor chord slope, whichever is closer.
+                    if (modifiers.ctrl || modifiers.command) && !modifiers.shift {
+                        let chord_dy = anchor_track.and_then(|tr| {
+                            let kidx = tr
+                                .keyframes
+                                .iter()
+                                .position(|k| (k.local_frame - key.local_frame()).abs() < 1e-6)?;
+                            let neighbor = if is_out {
+                                tr.keyframes.get(kidx + 1)?
+                            } else {
+                                tr.keyframes.get(kidx.checked_sub(1)?)?
+                            };
+                            let df = neighbor.local_frame - key.local_frame();
+                            if df.abs() > 1e-6 {
+                                Some(((neighbor.value - key_value) / df) * clamped_dx)
+                            } else {
+                                None
+                            }
+                        });
+                        raw_dy = match chord_dy {
+                            Some(cdy) if (raw_dy - cdy).abs() < raw_dy.abs() => cdy,
+                            _ => 0.0,
+                        };
+                    }
+
+                    let ddx = clamped_dx - orig_tangent[0];
+                    let ddy = raw_dy - orig_tangent[1];
+                    let disp_ddy =
+                        anchor_track.map_or(ddy, |tr| state.display_delta_for_track(tr, ddy));
 
                     let updated_pair = {
                         let entry = state.handles.entry(key.clone()).or_default();
@@ -1353,19 +1652,9 @@ pub fn process_graph_drag(
                         *entry
                     };
 
-                    // Persist tangent handles directly to Session / Project so rendering,
-                    // export, undo/redo, and save/reload immediately reflect the edited curve.
-                    if session
-                        .set_keyframe_bezier_handles(
-                            &key.target_id,
-                            &key.property,
-                            key.local_frame(),
-                            [updated_pair.in_tangent, updated_pair.out_tangent],
-                            updated_pair.continuous,
-                            None,
-                        )
-                        .is_ok()
-                    {
+                    // Persist tangent handles directly to Session / Project while preserving
+                    // sibling vector channel handles (e.g. Y/Z when dragging X of [x, y, z]).
+                    if persist_graph_handle_edit(session, state, tracks, &key, updated_pair) {
                         changed = true;
                         action.curves_modified = true;
                     }
@@ -1375,6 +1664,50 @@ pub fn process_graph_drag(
                     ensure_bezier_tween_for_handle(session, tracks, &key, is_out, action);
                     if updated_pair.continuous {
                         ensure_bezier_tween_for_handle(session, tracks, &key, !is_out, action);
+                    }
+
+                    // Propagate handle delta across all other selected keyframes.
+                    for (other_key, orig_ot, oprev, onext) in &orig_other_tangents {
+                        let o_dx = if is_out {
+                            (orig_ot[0] + ddx)
+                                .clamp(0.0, (*onext - other_key.local_frame()).max(0.0))
+                        } else {
+                            (orig_ot[0] + ddx)
+                                .clamp(-(other_key.local_frame() - *oprev).max(0.0), 0.0)
+                        };
+                        let o_ddy = tracks
+                            .iter()
+                            .find(|t| t.track_key == other_key.track_key())
+                            .map_or(disp_ddy, |tr| state.raw_delta_from_display(tr, disp_ddy));
+                        let o_dy = orig_ot[1] + o_ddy;
+                        let o_pair = {
+                            let entry = state.handles.entry(other_key.clone()).or_default();
+                            if modifiers.alt {
+                                entry.continuous = false;
+                            }
+                            if is_out {
+                                entry.out_tangent = [o_dx, o_dy];
+                                if entry.continuous {
+                                    let min_in = -(other_key.local_frame() - *oprev).max(0.0);
+                                    entry.in_tangent = [(-o_dx).clamp(min_in, 0.0), -o_dy];
+                                }
+                            } else {
+                                entry.in_tangent = [o_dx, o_dy];
+                                if entry.continuous {
+                                    let max_out = (*onext - other_key.local_frame()).max(0.0);
+                                    entry.out_tangent = [(-o_dx).clamp(0.0, max_out), -o_dy];
+                                }
+                            }
+                            *entry
+                        };
+                        let _ =
+                            persist_graph_handle_edit(session, state, tracks, other_key, o_pair);
+                        ensure_bezier_tween_for_handle(session, tracks, other_key, is_out, action);
+                        if o_pair.continuous {
+                            ensure_bezier_tween_for_handle(
+                                session, tracks, other_key, !is_out, action,
+                            );
+                        }
                     }
                 }
             }
@@ -1390,6 +1723,7 @@ pub fn process_graph_drag(
                     key_value,
                     grab_start_pos,
                     orig_tangent,
+                    orig_other_tangents,
                     changed,
                 };
             } else if session.history.is_in_transaction() {
@@ -1445,17 +1779,7 @@ pub fn process_graph_drag(
                     *entry
                 };
 
-                if session
-                    .set_keyframe_bezier_handles(
-                        &key.target_id,
-                        &key.property,
-                        key.local_frame(),
-                        [updated_pair.in_tangent, updated_pair.out_tangent],
-                        updated_pair.continuous,
-                        None,
-                    )
-                    .is_ok()
-                {
+                if persist_graph_handle_edit(session, state, tracks, &key, updated_pair) {
                     changed = true;
                     action.curves_modified = true;
                 }
@@ -1512,15 +1836,18 @@ pub fn process_graph_drag(
                         continue;
                     }
                     for (idx, kf) in track.keyframes.iter().enumerate() {
-                        let y_val = match state.plot_mode {
-                            GraphPlotMode::Value => kf.value,
+                        let y_px = match state.plot_mode {
+                            GraphPlotMode::Value => {
+                                state.track_value_to_screen_y(track, kf.value, rect)
+                            }
                             GraphPlotMode::Speed => {
-                                speed_keyframe_anchor_velocity(state, track, idx, fps)
+                                let vel = speed_keyframe_anchor_velocity(state, track, idx, fps);
+                                state.value_to_screen_y(vel, rect)
                             }
                         };
                         let pt = pos2(
                             state.frame_to_screen_x(track.frame_offset + kf.local_frame, rect),
-                            state.value_to_screen_y(y_val, rect),
+                            y_px,
                         );
                         if sel_rect.contains(pt) {
                             let kid = GraphKeyId::new(
@@ -1709,6 +2036,73 @@ pub fn hit_test_speed_keyframe<'a>(
     hit
 }
 
+/// Persists a Bezier handle edit to `session` while preserving sibling vector channel handles
+/// (e.g. preserving `Y`/`Z` handles in `state.channel_handle_overrides` when dragging `X` of a
+/// `[x, y, z]` property).
+pub fn persist_graph_handle_edit(
+    session: &mut Session,
+    state: &mut GraphEditorState,
+    tracks: &[CurveTrack],
+    key: &GraphKeyId,
+    updated_pair: BezierHandlePair,
+) -> bool {
+    if key.channel_index.is_some() {
+        for sib_track in tracks {
+            if sib_track.target_id == key.target_id
+                && sib_track.property == key.property
+                && sib_track.channel_index != key.channel_index
+                && let Some(sib_kf) = sib_track
+                    .keyframes
+                    .iter()
+                    .find(|k| (k.local_frame - key.local_frame()).abs() < 1e-6)
+            {
+                let sib_id = GraphKeyId::new(
+                    &sib_track.target_id,
+                    &sib_track.property,
+                    sib_track.channel_index,
+                    sib_kf.local_frame,
+                );
+                let sib_pair = state
+                    .channel_handle_overrides
+                    .get(&sib_id)
+                    .or_else(|| state.handles.get(&sib_id))
+                    .copied()
+                    .unwrap_or(BezierHandlePair {
+                        in_tangent: sib_kf.control_points[0],
+                        out_tangent: sib_kf.control_points[1],
+                        continuous: sib_kf.continuous_tangent,
+                    });
+                state
+                    .channel_handle_overrides
+                    .entry(sib_id.clone())
+                    .or_insert(sib_pair);
+                state.handles.entry(sib_id).or_insert(sib_pair);
+            }
+        }
+        state
+            .channel_handle_overrides
+            .insert(key.clone(), updated_pair);
+        state.last_persisted_cp.insert(
+            (key.target_id.clone(), key.property.clone(), key.frame_bits),
+            (
+                [updated_pair.in_tangent, updated_pair.out_tangent],
+                updated_pair.continuous,
+            ),
+        );
+    }
+    state.handles.insert(key.clone(), updated_pair);
+    session
+        .set_keyframe_bezier_handles(
+            &key.target_id,
+            &key.property,
+            key.local_frame(),
+            [updated_pair.in_tangent, updated_pair.out_tangent],
+            updated_pair.continuous,
+            None,
+        )
+        .is_ok()
+}
+
 pub fn hit_test_keyframe<'a>(
     state: &GraphEditorState,
     tracks: &'a [CurveTrack],
@@ -1724,7 +2118,7 @@ pub fn hit_test_keyframe<'a>(
         for (idx, kf) in track.keyframes.iter().enumerate() {
             let pt = pos2(
                 state.frame_to_screen_x(track.frame_offset + kf.local_frame, rect),
-                state.value_to_screen_y(kf.value, rect),
+                state.track_value_to_screen_y(track, kf.value, rect),
             );
             let d = pointer.distance(pt);
             if d < best_dist {

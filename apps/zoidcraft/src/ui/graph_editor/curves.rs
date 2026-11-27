@@ -12,7 +12,8 @@ use zc_anim::{
 };
 use zc_color::ThemePalette;
 use zc_expr::{
-    CompiledExpr, EvalConfig, ExprContext, ExprError, ExprMode, HandleId, Value as ExprValue,
+    CompiledExpr, EvalConfig, ExprContext, ExprError, ExprMode, HandleId, KeyframeRecord,
+    NameOrIndex, Value as ExprValue,
 };
 use zc_session::{Command, Session, SessionProperty};
 
@@ -168,6 +169,75 @@ impl GraphExprContext<'_> {
         }
         ExprValue::Number(self.track.evaluate_at(local_f, self.handles))
     }
+
+    fn owning_clip(&self) -> Option<&zc_session::SessionClip> {
+        for track in self
+            .doc
+            .video_tracks
+            .iter()
+            .chain(self.doc.audio_tracks.iter())
+        {
+            for clip in &track.clips {
+                if clip.id == self.track.target_id
+                    || clip.objects_3d.iter().any(|o| o.id == self.track.target_id)
+                    || clip.effects.iter().any(|e| e.id == self.track.target_id)
+                {
+                    return Some(clip);
+                }
+            }
+        }
+        None
+    }
+
+    fn find_clip_by_id(&self, clip_id: &str) -> Option<&zc_session::SessionClip> {
+        self.doc
+            .video_tracks
+            .iter()
+            .chain(self.doc.audio_tracks.iter())
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.id == clip_id)
+    }
+
+    fn find_target_prop(&self, target_id: &str, name: &str) -> Option<(&SessionProperty, f64)> {
+        fn lookup<'a>(
+            props: &'a BTreeMap<String, SessionProperty>,
+            name: &str,
+        ) -> Option<&'a SessionProperty> {
+            props.get(name).or_else(|| {
+                props
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v)
+            })
+        }
+        if target_id == "seq" || target_id == "sequence" {
+            return lookup(&self.doc.sequence_properties, name).map(|p| (p, 0.0));
+        }
+        for track in self
+            .doc
+            .video_tracks
+            .iter()
+            .chain(self.doc.audio_tracks.iter())
+        {
+            for clip in &track.clips {
+                if clip.id == target_id {
+                    return lookup(&clip.properties, name).map(|p| (p, clip.start));
+                }
+                if let Some(obj) = clip.objects_3d.iter().find(|o| o.id == target_id) {
+                    return lookup(&obj.properties, name).map(|p| (p, clip.start));
+                }
+                if let Some(fx) = clip.effects.iter().find(|e| e.id == target_id) {
+                    return lookup(&fx.properties, name).map(|p| (p, clip.start));
+                }
+            }
+        }
+        None
+    }
+
+    fn parse_prop_handle(id: &HandleId) -> Option<(&str, &str)> {
+        let rest = id.as_str().strip_prefix("prop:")?;
+        rest.split_once("::")
+    }
 }
 
 impl ExprContext for GraphExprContext<'_> {
@@ -183,29 +253,261 @@ impl ExprContext for GraphExprContext<'_> {
         self.pre_expr_value_at_local_frame(self.local_frame)
     }
 
+    fn this_layer_id(&self) -> Option<HandleId> {
+        self.owning_clip()
+            .map(|c| HandleId::new(format!("clip:{}", c.id)))
+    }
+
+    fn this_clip_id(&self) -> Option<HandleId> {
+        self.this_layer_id()
+    }
+
+    fn this_object_id(&self) -> Option<HandleId> {
+        let clip = self.owning_clip()?;
+        clip.objects_3d
+            .iter()
+            .find(|o| o.id == self.track.target_id)
+            .map(|o| HandleId::new(format!("obj:{}", o.id)))
+    }
+
+    fn this_sequence_id(&self) -> Option<HandleId> {
+        Some(HandleId::new("seq"))
+    }
+
     fn property_address(&self) -> Option<String> {
         Some(format!("{}.{}", self.track.target_id, self.track.property))
     }
 
-    fn property_value_at_time(&self, id: &HandleId, seconds: f64) -> Result<ExprValue, ExprError> {
-        if self.this_property_id().as_ref() == Some(id) {
-            Ok(self.pre_expr_value_at_local_frame(seconds * self.fps))
-        } else {
-            Err(ExprError::NotFound(format!("property '{}'", id.as_str())))
+    fn handle_name(&self, id: &HandleId) -> Option<String> {
+        let s = id.as_str();
+        if s == "seq" {
+            return Some("Sequence".to_owned());
+        }
+        if let Some(cid) = s.strip_prefix("clip:") {
+            return self.find_clip_by_id(cid).map(|c| c.name.clone());
+        }
+        if let Some(oid) = s.strip_prefix("obj:") {
+            for t in &self.doc.video_tracks {
+                for c in &t.clips {
+                    if let Some(o) = c.objects_3d.iter().find(|o| o.id == oid) {
+                        return Some(o.name.clone());
+                    }
+                }
+            }
+        }
+        if let Some(fid) = s.strip_prefix("fx:") {
+            for t in &self.doc.video_tracks {
+                for c in &t.clips {
+                    if let Some(f) = c.effects.iter().find(|f| f.id == fid) {
+                        return Some(f.name.clone());
+                    }
+                }
+            }
+        }
+        if let Some((_, prop)) = Self::parse_prop_handle(id) {
+            return Some(prop.to_owned());
+        }
+        None
+    }
+
+    fn layer(&self, query: &NameOrIndex) -> Result<HandleId, ExprError> {
+        let abs_f = self.track.frame_offset + self.local_frame;
+        match query {
+            NameOrIndex::Index(idx) => {
+                if *idx <= 0 {
+                    return Err(ExprError::NotFound(format!("layer {idx}")));
+                }
+                let track = self
+                    .doc
+                    .video_tracks
+                    .get((*idx - 1) as usize)
+                    .ok_or_else(|| ExprError::NotFound(format!("layer {idx}")))?;
+                let clip = track
+                    .clips
+                    .iter()
+                    .find(|c| abs_f >= c.start && abs_f < c.start + c.length)
+                    .or_else(|| track.clips.first())
+                    .ok_or_else(|| ExprError::NotFound(format!("layer {idx}")))?;
+                Ok(HandleId::new(format!("clip:{}", clip.id)))
+            }
+            NameOrIndex::Name(name) => {
+                for track in &self.doc.video_tracks {
+                    if let Some(clip) = track
+                        .clips
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(name) || c.id == *name)
+                    {
+                        return Ok(HandleId::new(format!("clip:{}", clip.id)));
+                    }
+                }
+                Err(ExprError::NotFound(format!("layer '{name}'")))
+            }
         }
     }
 
-    fn control(&self, name: &str, _stable_id: Option<&str>) -> Result<ExprValue, ExprError> {
+    fn effect(&self, owner: Option<&HandleId>, name: &str) -> Result<HandleId, ExprError> {
+        let clip = match owner.and_then(|h| h.as_str().strip_prefix("clip:")) {
+            Some(cid) => self.find_clip_by_id(cid),
+            None => self.owning_clip(),
+        }
+        .ok_or_else(|| ExprError::NotFound(format!("effect '{name}'")))?;
+        let fx = clip
+            .effects
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(name) || e.kind.eq_ignore_ascii_case(name))
+            .ok_or_else(|| ExprError::NotFound(format!("effect '{name}'")))?;
+        Ok(HandleId::new(format!("fx:{}", fx.id)))
+    }
+
+    fn effect_param(&self, effect_id: &HandleId, param: &str) -> Result<HandleId, ExprError> {
+        let fid = effect_id
+            .as_str()
+            .strip_prefix("fx:")
+            .unwrap_or(effect_id.as_str());
+        if self.find_target_prop(fid, param).is_some() {
+            Ok(HandleId::new(format!("prop:{fid}::{param}")))
+        } else {
+            Err(ExprError::NotFound(format!(
+                "effect '{}'.param('{param}')",
+                effect_id.as_str()
+            )))
+        }
+    }
+
+    fn object(&self, owner: Option<&HandleId>, name: &str) -> Result<HandleId, ExprError> {
+        let clip = match owner.and_then(|h| h.as_str().strip_prefix("clip:")) {
+            Some(cid) => self.find_clip_by_id(cid),
+            None => self.owning_clip(),
+        }
+        .ok_or_else(|| ExprError::NotFound(format!("object '{name}'")))?;
+        let obj = clip
+            .objects_3d
+            .iter()
+            .find(|o| o.name.eq_ignore_ascii_case(name) || o.id == name)
+            .ok_or_else(|| ExprError::NotFound(format!("object '{name}'")))?;
+        Ok(HandleId::new(format!("obj:{}", obj.id)))
+    }
+
+    fn property(&self, owner: Option<&HandleId>, name: &str) -> Result<HandleId, ExprError> {
+        let target_id = match owner.map(HandleId::as_str) {
+            Some("seq") => "sequence",
+            Some(s) => s
+                .strip_prefix("clip:")
+                .or_else(|| s.strip_prefix("obj:"))
+                .or_else(|| s.strip_prefix("fx:"))
+                .unwrap_or(s),
+            None => self.track.target_id.as_str(),
+        };
+        if self.find_target_prop(target_id, name).is_some() {
+            Ok(HandleId::new(format!("prop:{target_id}::{name}")))
+        } else {
+            Err(ExprError::NotFound(format!("property '{name}'")))
+        }
+    }
+
+    fn property_value(&self, id: &HandleId) -> Result<ExprValue, ExprError> {
+        if self.this_property_id().as_ref() == Some(id) {
+            return Ok(self.value());
+        }
+        if let Some((tid, pname)) = Self::parse_prop_handle(id)
+            && let Some((prop, start)) = self.find_target_prop(tid, pname)
+        {
+            let abs_f = self.track.frame_offset + self.local_frame;
+            let val = eval_session_prop_simple(prop, (abs_f - start).max(0.0));
+            return Ok(json_to_expr_value(&val));
+        }
+        Err(ExprError::NotFound(format!("property '{}'", id.as_str())))
+    }
+
+    fn property_value_at_time(&self, id: &HandleId, seconds: f64) -> Result<ExprValue, ExprError> {
+        if self.this_property_id().as_ref() == Some(id) {
+            return Ok(self.pre_expr_value_at_local_frame(seconds * self.fps));
+        }
+        if let Some((tid, pname)) = Self::parse_prop_handle(id)
+            && let Some((prop, _)) = self.find_target_prop(tid, pname)
+        {
+            let val = eval_session_prop_simple(prop, seconds * self.fps);
+            return Ok(json_to_expr_value(&val));
+        }
+        Err(ExprError::NotFound(format!("property '{}'", id.as_str())))
+    }
+
+    fn property_num_keys(&self, id: &HandleId) -> usize {
+        if self.this_property_id().as_ref() == Some(id) {
+            return self.track.keyframes.len();
+        }
+        if let Some((tid, pname)) = Self::parse_prop_handle(id)
+            && let Some((prop, _)) = self.find_target_prop(tid, pname)
+        {
+            return prop.keyframes.len();
+        }
+        0
+    }
+
+    fn property_key(
+        &self,
+        id: &HandleId,
+        index_1based: usize,
+    ) -> Result<KeyframeRecord, ExprError> {
+        if index_1based == 0 {
+            return Err(ExprError::RangeError(
+                "keyframe index 0 out of range".into(),
+            ));
+        }
+        if self.this_property_id().as_ref() == Some(id) {
+            let kf = self.track.keyframes.get(index_1based - 1).ok_or_else(|| {
+                ExprError::RangeError(format!("keyframe {index_1based} out of range"))
+            })?;
+            return Ok(KeyframeRecord {
+                index: index_1based,
+                time: kf.local_frame / self.fps.max(1.0),
+                value: json_to_expr_value(&kf.full_value),
+            });
+        }
+        if let Some((tid, pname)) = Self::parse_prop_handle(id)
+            && let Some((prop, _)) = self.find_target_prop(tid, pname)
+            && let Some(kf) = prop.keyframes.get(index_1based - 1)
+        {
+            return Ok(KeyframeRecord {
+                index: index_1based,
+                time: kf.frame / self.fps.max(1.0),
+                value: json_to_expr_value(&kf.value),
+            });
+        }
+        Err(ExprError::RangeError(format!(
+            "keyframe index {index_1based} out of range on property '{}'",
+            id.as_str()
+        )))
+    }
+
+    fn control(&self, name: &str, stable_id: Option<&str>) -> Result<ExprValue, ExprError> {
         let key = if name.starts_with("ctl_") {
             name.to_owned()
         } else {
             format!("ctl_{name}")
         };
-        let prop = self
-            .doc
-            .sequence_properties
-            .get(&key)
+        let by_stable = stable_id.and_then(|sid| {
+            self.doc
+                .sequence_control_order
+                .iter()
+                .find(|(_, id)| id == sid)
+                .and_then(|(k, _)| self.doc.sequence_properties.get(k))
+        });
+        let prop = by_stable
+            .or_else(|| self.doc.sequence_properties.get(&key))
             .or_else(|| self.doc.sequence_properties.get(name))
+            .or_else(|| {
+                self.doc
+                    .sequence_properties
+                    .iter()
+                    .find(|(k, _)| {
+                        k.eq_ignore_ascii_case(&key)
+                            || k.eq_ignore_ascii_case(name)
+                            || k.strip_prefix("ctl_")
+                                .is_some_and(|stripped| stripped.eq_ignore_ascii_case(name))
+                    })
+                    .map(|(_, v)| v)
+            })
             .ok_or_else(|| ExprError::NotFound(format!("control '{name}'")))?;
         let abs_f = self.track.frame_offset + self.local_frame;
         let val = eval_session_prop_simple(prop, abs_f);
@@ -913,7 +1215,22 @@ pub fn show_curve_canvas(
     // drag_started_by and clicked_by), then hit-test Bezier/Speed handles & keyframe drags.
     let mut hit_handled = false;
     if !(graph_plus && state.pan_tool) && !space_down {
-        if resp.clicked_by(PointerButton::Primary)
+        if resp.double_clicked_by(PointerButton::Primary)
+            && state.plot_mode == GraphPlotMode::Value
+            && let Some(pos) = resp.interact_pointer_pos()
+            && let Some((key_id, _, _, _, _, _, _)) =
+                hit_test_bezier_handle(state, tracks, rect, pos)
+        {
+            if session.begin_transaction("Reset Bezier Handle").is_ok() {
+                let default_pair = BezierHandlePair::default();
+                let ok = persist_graph_handle_edit(session, state, tracks, &key_id, default_pair);
+                let _ = session.commit_transaction(ok);
+                if ok {
+                    action.curves_modified = true;
+                }
+            }
+            hit_handled = true;
+        } else if resp.clicked_by(PointerButton::Primary)
             && let Some(pos) = resp.interact_pointer_pos()
         {
             let hit_kf = match state.plot_mode {
@@ -1006,6 +1323,37 @@ pub fn show_curve_canvas(
             } else if let Some((key_id, is_out, prev_f, next_f, abs_f, val, orig_tangent)) =
                 hit_test_bezier_handle(state, tracks, rect, pos)
             {
+                let mut orig_other_tangents = Vec::new();
+                if state.selected_keys.len() > 1 {
+                    for other_id in &state.selected_keys {
+                        if other_id == &key_id {
+                            continue;
+                        }
+                        if let Some(tr) =
+                            tracks.iter().find(|t| t.track_key == other_id.track_key())
+                            && let Some(kidx) = tr
+                                .keyframes
+                                .iter()
+                                .position(|k| (k.local_frame - other_id.local_frame()).abs() < 1e-6)
+                        {
+                            let oprev = kidx
+                                .checked_sub(1)
+                                .and_then(|p| tr.keyframes.get(p))
+                                .map_or(other_id.local_frame(), |k| k.local_frame);
+                            let onext = tr
+                                .keyframes
+                                .get(kidx + 1)
+                                .map_or(other_id.local_frame(), |k| k.local_frame);
+                            let hp = state.handles.get(other_id).copied().unwrap_or_default();
+                            let ot = if is_out {
+                                hp.out_tangent
+                            } else {
+                                hp.in_tangent
+                            };
+                            orig_other_tangents.push((other_id.clone(), ot, oprev, onext));
+                        }
+                    }
+                }
                 if session.begin_transaction("Edit Bezier Handles").is_ok() {
                     state.drag_state = GraphDragState::DraggingHandle {
                         key: key_id,
@@ -1016,6 +1364,7 @@ pub fn show_curve_canvas(
                         key_value: val,
                         grab_start_pos: pos,
                         orig_tangent,
+                        orig_other_tangents,
                         changed: false,
                     };
                 }
@@ -1111,7 +1460,11 @@ pub fn show_curve_canvas(
                         eval_curve_velocity(track, last.local_frame, fps, &state.handles)
                     }
                 };
-                let ly = state.value_to_screen_y(label_val, rect).clamp(
+                let ly = match state.plot_mode {
+                    GraphPlotMode::Value => state.track_value_to_screen_y(track, label_val, rect),
+                    GraphPlotMode::Speed => state.value_to_screen_y(label_val, rect),
+                }
+                .clamp(
                     rect.top() + 10.0,
                     (rect.bottom() - 10.0).max(rect.top() + 10.0),
                 );
@@ -1396,12 +1749,18 @@ pub fn paint_expression_curve_track(
     if samples.len() < 2 {
         return;
     }
+    let norm_range = if !speed_mode && state.normalize_curves {
+        Some(CurveNormRange::from_samples(&samples))
+    } else {
+        None
+    };
     let pts: Vec<Pos2> = samples
         .into_iter()
         .map(|(f, v)| {
+            let disp_v = norm_range.map_or(v, |r| r.normalize(v));
             pos2(
                 state.frame_to_screen_x(f, rect),
-                state.value_to_screen_y(v, rect),
+                state.value_to_screen_y(disp_v, rect),
             )
         })
         .collect();
@@ -1722,6 +2081,7 @@ pub fn paint_curve_track(
     let stroke_w = if graph_plus { 2.5 } else { 2.0 };
     let stroke = Stroke::new(stroke_w, track.color);
     let ext_stroke = Stroke::new(1.5, track.color.gamma_multiply(0.55));
+    let track_drag_dv = state.raw_delta_from_display(track, drag_dv);
     let mut adjusted: Vec<(CurveKeyframe, f64)> = track
         .keyframes
         .iter()
@@ -1736,7 +2096,7 @@ pub fn paint_curve_track(
             (
                 CurveKeyframe {
                     local_frame: k.local_frame + if sel { drag_df } else { 0.0 },
-                    value: k.value + if sel { drag_dv } else { 0.0 },
+                    value: k.value + if sel { track_drag_dv } else { 0.0 },
                     full_value: k.full_value.clone(),
                     tween: k.tween,
                     control_points: k.control_points,
@@ -1751,7 +2111,7 @@ pub fn paint_curve_track(
     // Leading/trailing constant extensions (dashed when expression-driven).
     let first = &adjusted[0].0;
     let x_first = state.frame_to_screen_x(track.frame_offset + first.local_frame, rect);
-    let y_first = state.value_to_screen_y(first.value, rect);
+    let y_first = state.track_value_to_screen_y(track, first.value, rect);
     if x_first > rect.left() {
         let seg = [pos2(rect.left(), y_first), pos2(x_first, y_first)];
         if track.is_expression {
@@ -1763,7 +2123,7 @@ pub fn paint_curve_track(
 
     let last = &adjusted[adjusted.len() - 1].0;
     let x_last = state.frame_to_screen_x(track.frame_offset + last.local_frame, rect);
-    let y_last = state.value_to_screen_y(last.value, rect);
+    let y_last = state.track_value_to_screen_y(track, last.value, rect);
     if x_last < rect.right() {
         let seg = [pos2(x_last, y_last), pos2(rect.right(), y_last)];
         if track.is_expression {
@@ -1788,15 +2148,15 @@ pub fn paint_curve_track(
             InterpolationMode::Discrete => {
                 let p0 = pos2(
                     state.frame_to_screen_x(track.frame_offset + k0.local_frame, rect),
-                    state.value_to_screen_y(k0.value, rect),
+                    state.track_value_to_screen_y(track, k0.value, rect),
                 );
                 let p_mid = pos2(
                     state.frame_to_screen_x(track.frame_offset + k1.local_frame, rect),
-                    state.value_to_screen_y(k0.value, rect),
+                    state.track_value_to_screen_y(track, k0.value, rect),
                 );
                 let p1 = pos2(
                     state.frame_to_screen_x(track.frame_offset + k1.local_frame, rect),
-                    state.value_to_screen_y(k1.value, rect),
+                    state.track_value_to_screen_y(track, k1.value, rect),
                 );
                 vec![p0, p_mid, p1]
             }
@@ -1811,7 +2171,7 @@ pub fn paint_curve_track(
                     let v = k0.value + (k1.value - k0.value) * e;
                     pts.push(pos2(
                         state.frame_to_screen_x(track.frame_offset + f, rect),
-                        state.value_to_screen_y(v, rect),
+                        state.track_value_to_screen_y(track, v, rect),
                     ));
                 }
                 pts
@@ -1848,7 +2208,7 @@ pub fn paint_curve_track(
                     let v = eval_segment_bezier(seg, f);
                     pts.push(pos2(
                         state.frame_to_screen_x(track.frame_offset + f, rect),
-                        state.value_to_screen_y(v, rect),
+                        state.track_value_to_screen_y(track, v, rect),
                     ));
                 }
                 pts
@@ -1945,6 +2305,7 @@ pub fn paint_keyframes_and_handles(
         if !state.is_track_visible(&track.track_key) {
             continue;
         }
+        let track_drag_dv = state.raw_delta_from_display(track, drag_dv);
         for (idx, kf) in track.keyframes.iter().enumerate() {
             let key_id = GraphKeyId::new(
                 &track.target_id,
@@ -1954,10 +2315,11 @@ pub fn paint_keyframes_and_handles(
             );
             let selected = state.selected_keys.contains(&key_id);
             let abs_f = track.frame_offset + kf.local_frame + if selected { drag_df } else { 0.0 };
-            let val = kf.value + if selected { drag_dv } else { 0.0 };
+            let val = kf.value + if selected { track_drag_dv } else { 0.0 };
+            let disp_val = state.display_value_for_track(track, val);
             let center = pos2(
                 state.frame_to_screen_x(abs_f, rect),
-                state.value_to_screen_y(val, rect),
+                state.value_to_screen_y(disp_val, rect),
             );
             let hp = state.handles.get(&key_id).copied().unwrap_or_default();
 
@@ -1965,8 +2327,9 @@ pub fn paint_keyframes_and_handles(
             if selected && !track.is_expression {
                 // Incoming handle (left).
                 if let Some(eff_in) = effective_in_tangent(state, track, idx, hp) {
+                    let disp_in = [eff_in[0], state.display_delta_for_track(track, eff_in[1])];
                     let handle_pos =
-                        compute_handle_screen_pos(state, rect, abs_f, val, eff_in, false);
+                        compute_handle_screen_pos(state, rect, abs_f, disp_val, disp_in, false);
                     painter.line_segment([center, handle_pos], Stroke::new(1.0, COLOR_HANDLE));
                     painter.circle(
                         handle_pos,
@@ -1982,8 +2345,9 @@ pub fn paint_keyframes_and_handles(
 
                 // Outgoing handle (right).
                 if let Some(eff_out) = effective_out_tangent(state, track, idx, hp) {
+                    let disp_out = [eff_out[0], state.display_delta_for_track(track, eff_out[1])];
                     let handle_pos =
-                        compute_handle_screen_pos(state, rect, abs_f, val, eff_out, true);
+                        compute_handle_screen_pos(state, rect, abs_f, disp_val, disp_out, true);
                     painter.line_segment([center, handle_pos], Stroke::new(1.0, COLOR_HANDLE));
                     painter.circle(
                         handle_pos,

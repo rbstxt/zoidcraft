@@ -1,5 +1,7 @@
 //! `globalThis.__zcWebAudio.start(sampleRate, pull)` opens a stereo output stream
-//! at `sampleRate` and returns a function that stops it and releases `pull`.
+//! at the AudioContext's native sample rate (via `AudioWorkletNode` with automatic
+//! scheduler fallback) and returns a function that stops it and releases `pull`.
+//! `globalThis.__zcWebAudio.sampleRate()` reports the AudioContext's live sample rate.
 //! `pull(frameCount, outputDelaySeconds)` returns interleaved stereo Float32Array samples.
 
 use js_sys::{Float32Array, Function, Reflect};
@@ -20,6 +22,16 @@ impl Drop for WebAudioStream {
     }
 }
 
+fn query_web_audio_sample_rate(bridge: &JsValue) -> u32 {
+    Reflect::get(bridge, &"sampleRate".into())
+        .ok()
+        .and_then(|value| value.dyn_into::<Function>().ok())
+        .and_then(|func| func.call0(bridge).ok())
+        .and_then(|value| value.as_f64())
+        .filter(|sr| sr.is_finite() && (8_000.0..=384_000.0).contains(sr))
+        .map_or(STANDARD_SAMPLE_RATE, |sr| sr.round() as u32)
+}
+
 impl MasterPlaybackClock {
     /// Opens a browser output stream for the supplied timeline window.
     pub fn start_audio_output_windowed(
@@ -32,6 +44,7 @@ impl MasterPlaybackClock {
             .ok()
             .and_then(|value| value.dyn_into::<Function>().ok())
             .ok_or(AudioError::NoOutputDevice)?;
+        let output_sample_rate = query_web_audio_sample_rate(&bridge);
 
         let window_slot = Arc::new(Mutex::new(window.clone()));
         let window_gen = Arc::new(AtomicU64::new(0));
@@ -49,7 +62,7 @@ impl MasterPlaybackClock {
         };
 
         let shared = Arc::clone(&self.shared);
-        let stream_id = shared.attach_hardware_clock(STANDARD_SAMPLE_RATE);
+        let stream_id = shared.attach_hardware_clock(output_sample_rate);
         let pull_shared = Arc::clone(&shared);
         let mut output = Vec::new();
         let pull = Closure::<PullAudio>::new(move |frame_count: u32, delay_secs| {
@@ -77,7 +90,7 @@ impl MasterPlaybackClock {
         });
 
         let stop = start
-            .call2(&bridge, &STANDARD_SAMPLE_RATE.into(), pull.as_ref())
+            .call2(&bridge, &output_sample_rate.into(), pull.as_ref())
             .and_then(JsCast::dyn_into::<Function>);
         let stop = match stop {
             Ok(stop) => stop,
@@ -93,7 +106,7 @@ impl MasterPlaybackClock {
             stream: Some(WebAudioStream { stop, _pull: pull }),
             stream_id,
             shared,
-            sample_rate: STANDARD_SAMPLE_RATE,
+            sample_rate: output_sample_rate,
             channels: 2,
             window_slot,
             window_gen,

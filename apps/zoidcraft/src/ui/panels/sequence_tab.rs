@@ -1,5 +1,9 @@
 use super::media_tab::layout_single_line_ellipsized;
-use super::property_rows::{eval_prop_u32, lookup_session_prop_ref, show_session_number_prop};
+use super::objects_2d::{read_clip_track_matte_mode, show_clip_track_matte_rows};
+use super::property_rows::{
+    eval_prop_u32, find_clip_cached, lookup_session_prop_ref, normalized_kf_frame,
+    open_expression_window, show_session_number_prop,
+};
 use super::shared_widgets::humanize_prop_label;
 use super::state::{
     WidgetTxTracker, apply_widget_tx_command, begin_inspector_tx, clear_inspector_tx_state,
@@ -268,6 +272,12 @@ pub(super) fn show_sequence_tab(
                             )
                         },
                     );
+                    if bg_ev.eyedropper_clicked {
+                        actions.push(PanelAction::EyedropperActivate {
+                            target_id: "sequence".to_owned(),
+                            property: "backgroundColor".to_owned(),
+                        });
+                    }
                     let owns_bg_tx = owns_inspector_tx(state, "sequence", "backgroundColor");
                     let new_bg = [bg_rgba.0[0], bg_rgba.0[1], bg_rgba.0[2], bg_rgba.0[3]];
                     if bg_ev.cancelled {
@@ -379,25 +389,9 @@ pub(super) fn show_sequence_tab(
                         });
                     }
 
-                    // Markers: < ◇ > navigator row (no divider directly below; 33px gap + divider before Motion blur)
-                    let mut prev_marker_frame: Option<f64> = None;
-                    let mut next_marker_frame: Option<f64> = None;
-                    let mut exact_marker_idx: Option<usize> = None;
-                    for (idx, m) in session.project.sequence.markers.iter().enumerate() {
-                        if (m.frame - frame).abs() < 0.5 {
-                            exact_marker_idx = Some(idx);
-                        } else if m.frame < frame - 0.5 {
-                            prev_marker_frame = Some(match prev_marker_frame {
-                                Some(best) => best.max(m.frame),
-                                None => m.frame,
-                            });
-                        } else if m.frame > frame + 0.5 {
-                            next_marker_frame = Some(match next_marker_frame {
-                                Some(best) => best.min(m.frame),
-                                None => m.frame,
-                            });
-                        }
-                    }
+                    // Markers: < ◇ > navigator row (operates on the active sequence / precomp)
+                    let (prev_marker_frame, exact_marker_idx, next_marker_frame) =
+                        find_active_sequence_marker_neighbors(session, frame);
 
                     let total_w = ui.available_width().max(120.0);
                     let (markers_rect, _) =
@@ -483,33 +477,7 @@ pub(super) fn show_sequence_tab(
                         let _ = session.execute(Command::SetFrame { frame: target_f });
                     }
                     if toggle_marker {
-                        let label = if exact_marker_idx.is_some() {
-                            "Remove marker"
-                        } else {
-                            "Add marker"
-                        };
-                        let started_tx = if !session.history.is_in_transaction() {
-                            session.begin_transaction(label).is_ok()
-                        } else {
-                            false
-                        };
-                        if let Some(idx) = exact_marker_idx {
-                            session.project.sequence.markers.remove(idx);
-                        } else {
-                            let f = frame.round().max(0.0);
-                            session.project.sequence.markers.push(Marker {
-                                frame: f,
-                                label: format!("Marker {}", f as u64),
-                            });
-                            session
-                                .project
-                                .sequence
-                                .markers
-                                .sort_by(|a, b| a.frame.total_cmp(&b.frame));
-                        }
-                        if started_tx {
-                            let _ = session.commit_transaction(true);
-                        }
+                        toggle_active_sequence_marker(session, frame);
                     }
 
                     // 1px #242424 divider directly between Markers and Multisample motion blur
@@ -589,6 +557,34 @@ pub(super) fn show_sequence_tab(
                         actions,
                     );
                     state.prop_columns.label_ratio = prev_seq_ratio;
+
+                    // Selected visual clip Track Matte controls (video / image / shape / text / scene)
+                    if let Some(sel_clip_id) = session.selection.clip_ids.first().cloned()
+                        && let Some(sel_clip) = find_clip_cached(session, state, &sel_clip_id)
+                        && sel_clip.kind != "audio"
+                    {
+                        let matte_active = read_clip_track_matte_mode(session, &sel_clip_id) > 0;
+                        cm3_collapsible_section_with_action(
+                            ui,
+                            Id::unique(("seq_selected_track_matte", &sel_clip_id)),
+                            "Track Matte",
+                            matte_active,
+                            true,
+                            state.prop_columns.label_ratio,
+                            None,
+                            theme,
+                            |ui| {
+                                show_clip_track_matte_rows(
+                                    ui,
+                                    session,
+                                    &sel_clip_id,
+                                    viewport_rect,
+                                    state,
+                                    theme,
+                                );
+                            },
+                        );
+                    }
 
                     // Controls nested section (Expressions+): full SequenceControlKind builder
                     // (Slider, Angle, Checkbox, Color, Point2D, Point3D) + legacy ctl_* compatibility.
@@ -763,14 +759,16 @@ fn show_sequence_controls_section(
                         let kind_idx = state.new_seq_control_kind.min(KINDS.len() - 1);
                         let kind = KINDS[kind_idx];
                         let fallback_name =
-                            format!("ctl_{}_{}", KIND_SLUGS[kind_idx], state.seq_control_counter);
-                        let name = sanitize_control_identifier(
-                            &state.new_seq_control_name,
-                            &fallback_name,
-                        );
+                            format!("{} {}", KIND_LABELS[kind_idx], state.seq_control_counter);
+                        let trimmed = state.new_seq_control_name.trim();
+                        let name = if trimmed.is_empty() {
+                            fallback_name
+                        } else {
+                            trimmed.to_owned()
+                        };
                         state.seq_control_counter += 1;
                         state.new_seq_control_name =
-                            format!("ctl_{}_{}", KIND_SLUGS[kind_idx], state.seq_control_counter);
+                            format!("{} {}", KIND_LABELS[kind_idx], state.seq_control_counter);
                         let default_val = match kind {
                             SequenceControlKind::Slider | SequenceControlKind::Angle => {
                                 PropertyValue::Number(0.0)
@@ -794,9 +792,11 @@ fn show_sequence_controls_section(
                     }
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new("Use controls.<name> in expressions")
-                                .font(theme.font(FONT_COMPACT))
-                                .color(TEXT_MUTED),
+                            egui::RichText::new(
+                                "Use control(\"Name\") or controls.<name> in expressions",
+                            )
+                            .font(theme.font(FONT_COMPACT))
+                            .color(TEXT_MUTED),
                         )
                         .wrap(),
                     );
@@ -878,26 +878,75 @@ fn show_sequence_controls_section(
                 });
 
             // Render project SequenceControl items
+            let _ = KIND_SLUGS;
             let controls = session.active_sequence().controls.clone();
             let count = controls.len();
             for (idx, ctl) in controls.into_iter().enumerate() {
-                let min_v = ctl.preserved.get("min").and_then(Value::as_f64);
-                let max_v = ctl.preserved.get("max").and_then(Value::as_f64);
-                let step_v = ctl.preserved.get("step").and_then(Value::as_f64);
+                let mut min_v = ctl.preserved.get("min").and_then(Value::as_f64);
+                let mut max_v = ctl.preserved.get("max").and_then(Value::as_f64);
+                let mut step_v = ctl.preserved.get("step").and_then(Value::as_f64);
                 let mut name_buf = ctl.name.clone();
                 let mut updated_val: Option<PropertyValue> = None;
                 let mut name_changed = false;
+                let mut meta_changed = false;
                 let mut tx_tracker = WidgetTxTracker::default();
+                let mirrored_key = session
+                    .document()
+                    .sequence_control_order
+                    .iter()
+                    .find(|(_, id)| id == &ctl.id)
+                    .map(|(k, _)| k.clone())
+                    .unwrap_or_else(|| {
+                        if ctl.name.starts_with("ctl_") {
+                            ctl.name.clone()
+                        } else {
+                            format!("ctl_{}", ctl.name)
+                        }
+                    });
+                let mirrored_prop = lookup_session_prop_ref(session, "sequence", &mirrored_key);
+                let ctl_animated = mirrored_prop.is_some_and(|p| p.animated);
+                let ctl_expr = mirrored_prop.and_then(|p| p.expression.clone());
+                let ctl_has_expr = ctl_expr.is_some();
+                let mut toggle_ctl_anim = false;
+                let mut open_ctl_expr = false;
 
                 Frame::NONE
                     .inner_margin(egui::Margin::symmetric(6, 3))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 3.0;
+                            let sw_ev = cm3_stopwatch_button(
+                                ui,
+                                &mirrored_key,
+                                ctl_animated,
+                                ctl_has_expr,
+                                theme,
+                            );
+                            if sw_ev.toggled {
+                                toggle_ctl_anim = true;
+                            }
+                            if sw_ev.alt_expression {
+                                open_ctl_expr = true;
+                            }
+                            let fx_color = if ctl_has_expr {
+                                theme.value()
+                            } else {
+                                TEXT_MUTED
+                            };
+                            if cm3_icon_button(
+                                ui,
+                                Cm3Icon::Code,
+                                15.0,
+                                fx_color,
+                                "Edit control expression",
+                                theme,
+                            ) {
+                                open_ctl_expr = true;
+                            }
                             let btn_count =
                                 1usize + usize::from(idx + 1 < count) + usize::from(idx > 0);
                             let btns_reserve = btn_count as f32 * 24.0 + 4.0;
-                            let name_w = (ui.available_width() - btns_reserve).max(64.0);
+                            let name_w = (ui.available_width() - btns_reserve).max(56.0);
                             if ui
                                 .add(
                                     TextEdit::singleline(&mut name_buf)
@@ -907,9 +956,9 @@ fn show_sequence_controls_section(
                                 .lost_focus()
                                 && !name_buf.trim().is_empty()
                             {
-                                let sanitized = sanitize_control_identifier(&name_buf, &ctl.name);
-                                if sanitized != ctl.name {
-                                    name_buf = sanitized;
+                                let trimmed = name_buf.trim().to_owned();
+                                if trimmed != ctl.name {
+                                    name_buf = trimmed;
                                     name_changed = true;
                                 }
                             }
@@ -948,9 +997,9 @@ fn show_sequence_controls_section(
                         match ctl.kind {
                             SequenceControlKind::Slider => {
                                 let mut v = ctl.track.value.as_f64().unwrap_or(0.0);
-                                let lo = min_v.unwrap_or(0.0);
-                                let hi = max_v.unwrap_or(100.0).max(lo + 1e-3);
-                                let st = step_v.unwrap_or(0.1).max(0.001);
+                                let mut lo = min_v.unwrap_or(0.0);
+                                let mut hi = max_v.unwrap_or(100.0).max(lo + 1e-3);
+                                let mut st = step_v.unwrap_or(0.1).max(0.001);
                                 ui.spacing_mut().slider_width =
                                     (ui.available_width() - 68.0).max(64.0);
                                 let resp = ui.add(
@@ -961,6 +1010,45 @@ fn show_sequence_controls_section(
                                 if tx_tracker.observe(&resp) {
                                     updated_val = Some(PropertyValue::Number(v));
                                 }
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    ui.label(
+                                        egui::RichText::new("Min")
+                                            .font(theme.font(FONT_COMPACT))
+                                            .color(TEXT_MUTED),
+                                    );
+                                    let r_lo = ui.add(
+                                        egui::DragValue::new(&mut lo).speed(0.5).max_decimals(3),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("Max")
+                                            .font(theme.font(FONT_COMPACT))
+                                            .color(TEXT_MUTED),
+                                    );
+                                    let r_hi = ui.add(
+                                        egui::DragValue::new(&mut hi).speed(0.5).max_decimals(3),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("Step")
+                                            .font(theme.font(FONT_COMPACT))
+                                            .color(TEXT_MUTED),
+                                    );
+                                    let r_st = ui.add(
+                                        egui::DragValue::new(&mut st)
+                                            .range(0.001..=1000.0)
+                                            .speed(0.05)
+                                            .max_decimals(3),
+                                    );
+                                    if tx_tracker.observe(&r_lo)
+                                        || tx_tracker.observe(&r_hi)
+                                        || tx_tracker.observe(&r_st)
+                                    {
+                                        min_v = Some(lo);
+                                        max_v = Some(hi.max(lo + 1e-3));
+                                        step_v = Some(st.max(0.001));
+                                        meta_changed = true;
+                                    }
+                                });
                             }
                             SequenceControlKind::Angle => {
                                 let mut v = ctl.track.value.as_f64().unwrap_or(0.0);
@@ -1038,7 +1126,40 @@ fn show_sequence_controls_section(
                         }
                     });
 
-                if name_changed || updated_val.is_some() {
+                if toggle_ctl_anim {
+                    let _ = session.execute(Command::TogglePropertyAnimated {
+                        target_id: "sequence".to_owned(),
+                        property: mirrored_key.clone(),
+                        frame: normalized_kf_frame(session, frame),
+                    });
+                }
+                if open_ctl_expr {
+                    let init_code = ctl_expr.unwrap_or_else(|| match &ctl.track.value {
+                        PropertyValue::Number(n) => format!("{n}"),
+                        PropertyValue::Bool(b) => if *b { "1" } else { "0" }.to_owned(),
+                        PropertyValue::Vec2(v) => format!("[{}, {}]", v[0], v[1]),
+                        PropertyValue::Vec3(v) | PropertyValue::Color(v) => {
+                            format!("[{}, {}, {}]", v[0], v[1], v[2])
+                        }
+                        _ => "0".to_owned(),
+                    });
+                    if !ctl_has_expr {
+                        let _ = session.execute(Command::SetExpression {
+                            target_id: "sequence".to_owned(),
+                            property: mirrored_key.clone(),
+                            expression: Some(init_code.clone()),
+                        });
+                    }
+                    open_expression_window(
+                        "sequence",
+                        &mirrored_key,
+                        init_code,
+                        state,
+                        viewport_rect,
+                    );
+                }
+
+                if name_changed || meta_changed || updated_val.is_some() {
                     tx_tracker.changed = true;
                 }
                 let ctl_owner_key = format!("seq_ctl_{}", ctl.id);
@@ -1121,4 +1242,109 @@ pub(super) fn collect_mirrored_sequence_control_keys(session: &Session) -> BTree
         }
     }
     keys
+}
+
+/// Finds `(previous_marker_frame, exact_marker_idx, next_marker_frame)` on the currently active
+/// sequence or nested precomp around `frame`.
+pub(super) fn find_active_sequence_marker_neighbors(
+    session: &Session,
+    frame: f64,
+) -> (Option<f64>, Option<usize>, Option<f64>) {
+    let mut prev_marker_frame: Option<f64> = None;
+    let mut next_marker_frame: Option<f64> = None;
+    let mut exact_marker_idx: Option<usize> = None;
+    for (idx, m) in session.active_sequence().markers.iter().enumerate() {
+        if (m.frame - frame).abs() < 0.5 {
+            exact_marker_idx = Some(idx);
+        } else if m.frame < frame - 0.5 {
+            prev_marker_frame = Some(match prev_marker_frame {
+                Some(best) => best.max(m.frame),
+                None => m.frame,
+            });
+        } else if m.frame > frame + 0.5 {
+            next_marker_frame = Some(match next_marker_frame {
+                Some(best) => best.min(m.frame),
+                None => m.frame,
+            });
+        }
+    }
+    (prev_marker_frame, exact_marker_idx, next_marker_frame)
+}
+
+/// Adds or removes a marker at `frame` on the currently active sequence / nested precomp
+/// inside an undoable transaction.
+pub(super) fn toggle_active_sequence_marker(session: &mut Session, frame: f64) {
+    let (_, exact_marker_idx, _) = find_active_sequence_marker_neighbors(session, frame);
+    let label = if exact_marker_idx.is_some() {
+        "Remove marker"
+    } else {
+        "Add marker"
+    };
+    let started_tx = if !session.history.is_in_transaction() {
+        session.begin_transaction(label).is_ok()
+    } else {
+        false
+    };
+    if let Some(idx) = exact_marker_idx {
+        session.active_sequence_mut().markers.remove(idx);
+    } else {
+        let f = frame.round().max(0.0);
+        session.active_sequence_mut().markers.push(Marker {
+            frame: f,
+            label: format!("Marker {}", f as u64),
+        });
+        session
+            .active_sequence_mut()
+            .markers
+            .sort_by(|a, b| a.frame.total_cmp(&b.frame));
+    }
+    if started_tx && session.history.is_in_transaction() {
+        let _ = session.commit_transaction(true);
+    }
+}
+
+#[cfg(test)]
+mod sequence_marker_tests {
+    use super::{find_active_sequence_marker_neighbors, toggle_active_sequence_marker};
+    use zc_project::Uuid;
+    use zc_session::{Command, Session};
+
+    #[test]
+    fn active_precomp_markers_do_not_mutate_root_sequence() {
+        let mut session = Session::new();
+        let created = session
+            .execute(Command::CreateComposition {
+                name: "Precomp Markers".to_owned(),
+                resolution: [1280, 720],
+                fps: 30,
+                length_frames: 120,
+            })
+            .expect("create precomp");
+        let comp_id =
+            Uuid::parse_str(created["comp_id"].as_str().expect("comp_id")).expect("comp uuid");
+
+        session
+            .execute(Command::SetActiveComposition {
+                comp_id: Some(comp_id),
+            })
+            .expect("activate precomp");
+
+        toggle_active_sequence_marker(&mut session, 24.0);
+        assert!(
+            session.project.sequence.markers.is_empty(),
+            "root sequence markers must remain untouched when editing a precomp"
+        );
+        assert_eq!(session.active_sequence().markers.len(), 1);
+        assert_eq!(
+            find_active_sequence_marker_neighbors(&session, 24.0),
+            (None, Some(0), None)
+        );
+        assert_eq!(
+            find_active_sequence_marker_neighbors(&session, 10.0),
+            (None, None, Some(24.0))
+        );
+
+        toggle_active_sequence_marker(&mut session, 24.0);
+        assert!(session.active_sequence().markers.is_empty());
+    }
 }

@@ -97,7 +97,7 @@ impl EffectRegistry {
         Ok(())
     }
 
-    /// 2-pass macroblock SAD motion field + warp pipeline for `datamosh`.
+    /// 2-pass multi-scale macroblock SAD motion field + warp pipeline for `datamosh`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_datamosh(
         &mut self,
@@ -113,20 +113,22 @@ impl EffectRegistry {
         let _ = self.ensure_pipeline_for_format(device, "datamosh", false, hdr_fmt)?;
 
         let mut u_warp = pack_effect_uniforms("datamosh", params, targets.aux.is_some(), false);
-        let algorithm = u_warp.p1[0];
         let mut owned_mv: Option<ScratchTarget> = None;
 
-        if algorithm < 0.5 && targets.aux.is_some() {
+        // Estimate real macroblock-aligned (8x8 / 16x16) multi-scale motion vectors whenever
+        // a previous/anchor frame (`targets.aux`) is present — for algorithm==0 AND default modes!
+        if targets.aux.is_some() {
             let bs = u_warp.p0[2].max(2.0);
-            let gw = ((width as f32) / bs).ceil().clamp(1.0, 256.0) as u32;
-            let gh = ((height as f32) / bs).ceil().clamp(1.0, 256.0) as u32;
+            let mv_bs = if bs <= 12.0 { 8.0_f32 } else { 16.0_f32 };
+            let gw = ((width as f32) / mv_bs).ceil().clamp(1.0, 256.0) as u32;
+            let gh = ((height as f32) / mv_bs).ceil().clamp(1.0, 256.0) as u32;
             let mv_tex = self.create_temp_target_with_format(device, gw, gh, hdr_fmt, "zc-dm-mv");
 
             let mut u0 = u_warp;
             u0.pass = 0;
             u0.p3[0] = gw as f32;
             u0.p3[1] = gh as f32;
-            u0.p3[2] = params.float_or("spacing", 4.0).clamp(1.0, 32.0);
+            u0.p3[2] = mv_bs;
             self.encode_pass(
                 device,
                 encoder,
@@ -138,6 +140,7 @@ impl EffectRegistry {
                 None,
                 wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
             );
+            u_warp.p3[0] = mv_bs;
             u_warp.flags |= 1u32 << 1;
             owned_mv = Some(mv_tex);
         }
@@ -160,7 +163,85 @@ impl EffectRegistry {
         Ok(())
     }
 
-    /// 2-pass key-mask extraction + feature overlay pipeline for `tracery`.
+    /// 2-pass optical-flow motion estimation + bilateral spatial flow smoothing & blur gather
+    /// for `smartmotionblur` / `smart-motion-blur-lite`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_smart_motion_blur(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        effect_id: &str,
+        params: &EffectParams,
+        targets: &EffectTargets<'_>,
+        width: u32,
+        height: u32,
+    ) -> Result<(), EffectError> {
+        let canonical = self.ensure_pipeline(device, "smartmotionblur", false)?;
+        let base_u = pack_effect_uniforms(
+            effect_id,
+            params,
+            targets.aux.is_some(),
+            targets.aux2.is_some(),
+        );
+
+        // Single-frame fast path when neither previous nor next frame is bound.
+        if targets.aux.is_none() && targets.aux2.is_none() {
+            let mut u1 = base_u;
+            u1.pass = 1;
+            self.encode_pass(
+                device,
+                encoder,
+                (canonical, false, self.format),
+                &u1,
+                targets.input,
+                targets.output,
+                None,
+                None,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            );
+            return Ok(());
+        }
+
+        let hdr_fmt = wgpu::TextureFormat::Rgba16Float;
+        let _ = self.ensure_pipeline_for_format(device, "smartmotionblur", false, hdr_fmt)?;
+        let flow_tex =
+            self.create_temp_target_with_format(device, width, height, hdr_fmt, "zc-smb-flow");
+
+        // Pass 0: Dynamic multi-scale optical flow estimation -> Rgba16Float (vel_x, vel_y, conf, 1)
+        let mut u0 = base_u;
+        u0.pass = 0;
+        self.encode_pass(
+            device,
+            encoder,
+            (canonical, false, hdr_fmt),
+            &u0,
+            targets.input,
+            &flow_tex.view,
+            targets.aux,
+            targets.aux2,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+
+        // Pass 1: Bilateral spatial flow smoothing (honoring `smoothness`) + directional blur gather
+        let mut u1 = base_u;
+        u1.pass = 1;
+        self.encode_pass(
+            device,
+            encoder,
+            (canonical, false, self.format),
+            &u1,
+            targets.input,
+            targets.output,
+            Some(&flow_tex.view),
+            None,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+        self.release_temp_target(flow_tex);
+        Ok(())
+    }
+
+    /// Key-mask extraction (+ optional separable Gaussian pre-detection blur) + feature overlay
+    /// pipeline for `tracery`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_tracery(
         &mut self,
@@ -187,6 +268,39 @@ impl EffectRegistry {
             None,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         );
+
+        // Real pre-detection separable Gaussian blur when blurStrength > 0
+        let blur_px = (u0.extra >> 24) & 0xFF;
+        if blur_px > 0 {
+            let blur_tmp = self.create_temp_target(device, width, height, "zc-tracery-blur");
+            let mut u_bh = u0;
+            u_bh.pass = 2;
+            self.encode_pass(
+                device,
+                encoder,
+                (canonical, false, self.format),
+                &u_bh,
+                &mask_tex.view,
+                &blur_tmp.view,
+                None,
+                None,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            );
+            let mut u_bv = u0;
+            u_bv.pass = 3;
+            self.encode_pass(
+                device,
+                encoder,
+                (canonical, false, self.format),
+                &u_bv,
+                &blur_tmp.view,
+                &mask_tex.view,
+                None,
+                None,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            );
+            self.release_temp_target(blur_tmp);
+        }
 
         let mut u1 = u0;
         u1.pass = 1;
@@ -603,7 +717,7 @@ impl EffectRegistry {
         let stroke_col = params.vec4_or("strokeColor", [0.0, 0.0, 0.0, 1.0]);
         let box_on = is_timecode && params.bool_or("showBox", true);
         let box_rgb = params.vec3_or("boxColor", [0.0, 0.0, 0.0]);
-        let box_op_raw = params.float_or("boxOpacity", 60.0);
+        let box_op_raw = params.float_or("boxOpacity", 100.0);
         let box_op = if box_op_raw > 1.0 {
             (box_op_raw / 100.0).clamp(0.0, 1.0)
         } else {
@@ -611,6 +725,8 @@ impl EffectRegistry {
         } * tc_opacity;
         let comp_orig = if is_timecode && params.values.contains_key("renderOnOriginal") {
             params.bool_or("renderOnOriginal", true)
+        } else if params.values.contains_key("compositeOnOriginal") {
+            params.bool_or("compositeOnOriginal", true)
         } else {
             params.bool_or("compositeOriginal", true)
         };
@@ -1273,7 +1389,15 @@ pub(crate) fn has_magic_looks_chain(params: &EffectParams) -> bool {
     {
         return true;
     }
-    params.values.keys().any(|k| k.starts_with("ml_"))
+    params.values.keys().any(|k| {
+        k.starts_with("ml_")
+            || (k.ends_with("Enable")
+                && match params.values.get(k) {
+                    Some(EffectParamValue::Bool(true)) | Some(EffectParamValue::Int(1..)) => true,
+                    Some(EffectParamValue::Float(f)) => *f > 0.5,
+                    _ => false,
+                })
+    })
 }
 
 pub(crate) fn parse_hex_color(hex: &str) -> Option<[f32; 3]> {
@@ -1440,6 +1564,33 @@ pub(crate) fn canonical_magic_looks_tool_mode(raw: &str) -> Option<u32> {
     }
 }
 
+pub(crate) fn json_wheel_color(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+    triples: &[(&str, &str, &str)],
+    default: [f32; 3],
+) -> [f32; 4] {
+    for k in keys {
+        if obj.contains_key(*k) {
+            return json_color(obj, &[*k], default);
+        }
+    }
+    for (rk, gk, bk) in triples {
+        if obj.contains_key(*rk) || obj.contains_key(*gk) || obj.contains_key(*bk) {
+            let mut rgb = [
+                json_f32(obj, &[*rk], default[0]),
+                json_f32(obj, &[*gk], default[1]),
+                json_f32(obj, &[*bk], default[2]),
+            ];
+            if rgb[0] > 1.5 || rgb[1] > 1.5 || rgb[2] > 1.5 {
+                rgb = [rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0];
+            }
+            return [rgb[0], rgb[1], rgb[2], 1.0];
+        }
+    }
+    [default[0], default[1], default[2], 1.0]
+}
+
 pub(crate) fn build_magic_looks_tool_spec(
     mode: u32,
     cfg: &serde_json::Map<String, serde_json::Value>,
@@ -1463,7 +1614,7 @@ pub(crate) fn build_magic_looks_tool_spec(
             spec.p0 = [
                 json_f32(cfg, &["ccPivot", "pivot"], 0.18),
                 json_f32(cfg, &["ccExposure", "exposure"], 0.0),
-                0.0,
+                json_f32(cfg, &["ccContrast", "contrast"], 0.37),
                 0.0,
             ];
             spec.c0 = json_color(cfg, &["ccColor", "color"], [1.0, 1.0, 1.0]);
@@ -1471,28 +1622,28 @@ pub(crate) fn build_magic_looks_tool_spec(
         1 => {
             // hsl-colors
             spec.p0 = [
-                json_f32(cfg, &["hslRedSat", "redSat"], 0.0),
-                json_f32(cfg, &["hslOrangeSat", "orangeSat"], 0.0),
-                json_f32(cfg, &["hslYellowSat", "yellowSat"], 0.0),
-                json_f32(cfg, &["hslGreenSat", "greenSat"], 0.0),
+                json_f32(cfg, &["hslRedSat", "hslSat0", "redSat"], 0.0),
+                json_f32(cfg, &["hslOrangeSat", "hslSat1", "orangeSat"], 0.0),
+                json_f32(cfg, &["hslYellowSat", "hslSat2", "yellowSat"], 0.0),
+                json_f32(cfg, &["hslGreenSat", "hslSat3", "greenSat"], 0.0),
             ];
             spec.p1 = [
-                json_f32(cfg, &["hslCyanSat", "cyanSat"], 0.0),
-                json_f32(cfg, &["hslBlueSat", "blueSat"], 0.0),
-                json_f32(cfg, &["hslPurpleSat", "purpleSat"], 0.0),
-                json_f32(cfg, &["hslMagentaSat", "magentaSat"], 0.0),
+                json_f32(cfg, &["hslCyanSat", "hslSat4", "cyanSat"], 0.0),
+                json_f32(cfg, &["hslBlueSat", "hslSat5", "blueSat"], 0.0),
+                json_f32(cfg, &["hslPurpleSat", "hslSat6", "purpleSat"], 0.0),
+                json_f32(cfg, &["hslMagentaSat", "hslSat7", "magentaSat"], 0.0),
             ];
             spec.p2 = [
-                json_f32(cfg, &["hslRedLight", "redLight"], 0.0),
-                json_f32(cfg, &["hslOrangeLight", "orangeLight"], 0.0),
-                json_f32(cfg, &["hslYellowLight", "yellowLight"], 0.0),
-                json_f32(cfg, &["hslGreenLight", "greenLight"], 0.0),
+                json_f32(cfg, &["hslRedLight", "hslLight0", "redLight"], 0.0),
+                json_f32(cfg, &["hslOrangeLight", "hslLight1", "orangeLight"], 0.0),
+                json_f32(cfg, &["hslYellowLight", "hslLight2", "yellowLight"], 0.0),
+                json_f32(cfg, &["hslGreenLight", "hslLight3", "greenLight"], 0.0),
             ];
             spec.p3 = [
-                json_f32(cfg, &["hslCyanLight", "cyanLight"], 0.0),
-                json_f32(cfg, &["hslBlueLight", "blueLight"], 0.0),
-                json_f32(cfg, &["hslPurpleLight", "purpleLight"], 0.0),
-                json_f32(cfg, &["hslMagentaLight", "magentaLight"], 0.0),
+                json_f32(cfg, &["hslCyanLight", "hslLight4", "cyanLight"], 0.0),
+                json_f32(cfg, &["hslBlueLight", "hslLight5", "blueLight"], 0.0),
+                json_f32(cfg, &["hslPurpleLight", "hslLight6", "purpleLight"], 0.0),
+                json_f32(cfg, &["hslMagentaLight", "hslLight7", "magentaLight"], 0.0),
             ];
         }
         2 => {
@@ -1524,27 +1675,27 @@ pub(crate) fn build_magic_looks_tool_spec(
         3 => {
             // crush
             spec.p0 = [
-                json_f32(cfg, &["crGamma", "gamma"], 1.2),
-                json_f32(cfg, &["crExposure", "exposure"], 0.0),
+                json_f32(cfg, &["cruGamma", "crGamma", "gamma"], 1.2),
+                json_f32(cfg, &["cruExposure", "crExposure", "exposure"], 0.0),
                 0.0,
                 0.0,
             ];
-            spec.c0 = json_color(cfg, &["crColor", "color"], [1.0, 1.0, 1.0]);
+            spec.c0 = json_color(cfg, &["cruColor", "crColor", "color"], [1.0, 1.0, 1.0]);
         }
         4 => {
             // contrast
             spec.p0 = [
-                json_f32(cfg, &["ctContrast", "contrast"], 0.25),
-                json_f32(cfg, &["ctPivot", "pivot"], 0.18),
-                json_f32(cfg, &["ctExposure", "exposure"], 0.0),
+                json_f32(cfg, &["conContrast", "ctContrast", "contrast"], 0.25),
+                json_f32(cfg, &["conPivot", "ctPivot", "pivot"], 0.18),
+                json_f32(cfg, &["conExposure", "ctExposure", "exposure"], 0.0),
                 0.0,
             ];
         }
         5 => {
             // color-reversal
             spec.p0 = [
-                json_f32(cfg, &["rvStrength", "strength"], 1.0),
-                json_f32(cfg, &["rvExposure", "exposure"], 0.0),
+                json_f32(cfg, &["crevStrength", "rvStrength", "strength"], 1.0),
+                json_f32(cfg, &["crevExposure", "rvExposure", "exposure"], 0.0),
                 0.0,
                 0.0,
             ];
@@ -1552,8 +1703,8 @@ pub(crate) fn build_magic_looks_tool_spec(
         6 => {
             // three-strip
             spec.p0 = [
-                json_f32(cfg, &["tsStrength", "strength"], 1.0),
-                json_f32(cfg, &["tsExposure", "exposure"], 0.0),
+                json_f32(cfg, &["stripStrength", "tsStrength", "strength"], 1.0),
+                json_f32(cfg, &["stripExposure", "tsExposure", "exposure"], 0.0),
                 0.0,
                 0.0,
             ];
@@ -1566,29 +1717,69 @@ pub(crate) fn build_magic_looks_tool_spec(
                 json_f32(cfg, &["lggExposure", "exposure"], 0.0),
                 0.0,
             ];
-            spec.c0 = json_color(cfg, &["lggLift", "lift"], [1.0, 1.0, 1.0]);
-            spec.c1 = json_color(cfg, &["lggGamma", "gamma"], [1.0, 1.0, 1.0]);
-            spec.c2 = json_color(cfg, &["lggGain", "gain"], [1.0, 1.0, 1.0]);
+            spec.c0 = json_wheel_color(
+                cfg,
+                &["lggLift", "lift"],
+                &[
+                    ("lggLiftR", "lggLiftG", "lggLiftB"),
+                    ("liftR", "liftG", "liftB"),
+                ],
+                [1.0, 1.0, 1.0],
+            );
+            spec.c1 = json_wheel_color(
+                cfg,
+                &["lggGamma", "gamma"],
+                &[
+                    ("lggGammaR", "lggGammaG", "lggGammaB"),
+                    ("gammaR", "gammaG", "gammaB"),
+                ],
+                [1.0, 1.0, 1.0],
+            );
+            spec.c2 = json_wheel_color(
+                cfg,
+                &["lggGain", "gain"],
+                &[
+                    ("lggGainR", "lggGainG", "lggGainB"),
+                    ("gainR", "gainG", "gainB"),
+                ],
+                [1.0, 1.0, 1.0],
+            );
         }
         8 => {
             // ranged-saturation
             spec.p0 = [
-                json_f32(cfg, &["rsSatHighlight", "satHighlight"], 1.0),
-                json_f32(cfg, &["rsSatMidtone", "satMidtone"], 1.0),
-                json_f32(cfg, &["rsSatShadow", "satShadow"], 1.0),
-                json_f32(cfg, &["rsExposure", "exposure"], 0.0),
+                json_f32(
+                    cfg,
+                    &["rsatSatHighlight", "rsSatHighlight", "satHighlight"],
+                    1.0,
+                ),
+                json_f32(cfg, &["rsatSatMidtone", "rsSatMidtone", "satMidtone"], 1.0),
+                json_f32(cfg, &["rsatSatShadow", "rsSatShadow", "satShadow"], 1.0),
+                json_f32(cfg, &["rsatExposure", "rsExposure", "exposure"], 0.0),
             ];
             spec.p1 = [
-                json_f32(cfg, &["rsThHighlight", "thHighlight"], 0.75),
-                json_f32(cfg, &["rsThMidtone", "thMidtone"], 0.5),
-                json_f32(cfg, &["rsThShadow", "thShadow"], 0.25),
-                if json_bool(cfg, &["rsShowThreshold", "showThreshold"], false) {
+                json_f32(
+                    cfg,
+                    &["rsatThHighlight", "rsThHighlight", "thHighlight"],
+                    0.75,
+                ),
+                json_f32(cfg, &["rsatThMidtone", "rsThMidtone", "thMidtone"], 0.5),
+                json_f32(cfg, &["rsatThShadow", "rsThShadow", "thShadow"], 0.25),
+                if json_bool(
+                    cfg,
+                    &["rsatShowThreshold", "rsShowThreshold", "showThreshold"],
+                    false,
+                ) {
                     1.0
                 } else {
                     0.0
                 },
             ];
-            spec.c0 = json_color(cfg, &["rsBalance", "balance"], [1.0, 1.0, 1.0]);
+            spec.c0 = json_color(
+                cfg,
+                &["rsatBalance", "rsBalance", "balance"],
+                [1.0, 1.0, 1.0],
+            );
         }
         9 => {
             // warm-cool
@@ -1602,45 +1793,93 @@ pub(crate) fn build_magic_looks_tool_spec(
         10 => {
             // four-way
             spec.p0 = [
-                json_f32(cfg, &["fwExposure", "exposure"], 0.0),
-                json_f32(cfg, &["fwContrast", "contrast"], 0.0),
-                json_f32(cfg, &["fwStrength", "strength"], 1.0),
-                if json_bool(cfg, &["fwPreview", "preview"], false) {
+                json_f32(cfg, &["fw4Exposure", "fwExposure", "exposure"], 0.0),
+                json_f32(cfg, &["fw4Contrast", "fwContrast", "contrast"], 0.0),
+                json_f32(cfg, &["fw4Strength", "fwStrength", "strength"], 1.0),
+                if json_bool(cfg, &["fw4Preview", "fwPreview", "preview"], false) {
                     1.0
                 } else {
                     0.0
                 },
             ];
-            spec.c0 = json_color(cfg, &["fwShadows", "shadows"], [1.0, 1.0, 1.0]);
-            spec.c1 = json_color(cfg, &["fwMidtones", "midtones"], [1.0, 1.0, 1.0]);
-            spec.c2 = json_color(cfg, &["fwHighlights", "highlights"], [1.0, 1.0, 1.0]);
-            spec.c3 = json_color(cfg, &["fwGlobal", "global"], [1.0, 1.0, 1.0]);
+            spec.c0 = json_wheel_color(
+                cfg,
+                &["fw4Shadows", "fwShadows", "shadows"],
+                &[
+                    ("fw4ShadowsR", "fw4ShadowsG", "fw4ShadowsB"),
+                    ("fwShadowsR", "fwShadowsG", "fwShadowsB"),
+                ],
+                [1.0, 1.0, 1.0],
+            );
+            spec.c1 = json_wheel_color(
+                cfg,
+                &["fw4Midtones", "fwMidtones", "midtones"],
+                &[
+                    ("fw4MidtonesR", "fw4MidtonesG", "fw4MidtonesB"),
+                    ("fwMidtonesR", "fwMidtonesG", "fwMidtonesB"),
+                ],
+                [1.0, 1.0, 1.0],
+            );
+            spec.c2 = json_wheel_color(
+                cfg,
+                &["fw4Highlights", "fwHighlights", "highlights"],
+                &[
+                    ("fw4HighlightsR", "fw4HighlightsG", "fw4HighlightsB"),
+                    ("fwHighlightsR", "fwHighlightsG", "fwHighlightsB"),
+                ],
+                [1.0, 1.0, 1.0],
+            );
+            spec.c3 = json_wheel_color(
+                cfg,
+                &["fw4Global", "fwGlobal", "global"],
+                &[
+                    ("fw4GlobalR", "fw4GlobalG", "fw4GlobalB"),
+                    ("fwGlobalR", "fwGlobalG", "fwGlobalB"),
+                ],
+                [1.0, 1.0, 1.0],
+            );
         }
         11 => {
             // mojo
             spec.p0 = [
-                json_f32(cfg, &["mjMojo", "mojo"], 0.5),
-                json_f32(cfg, &["mjPunch", "punch"], 0.2),
-                json_f32(cfg, &["mjBleach", "bleach"], 0.0),
-                json_f32(cfg, &["mjFade", "fade"], 0.0),
+                json_f32(cfg, &["mojoMojo", "mjMojo", "mojo"], 0.5),
+                json_f32(cfg, &["mojoPunch", "mjPunch", "punch"], 0.2),
+                json_f32(cfg, &["mojoBleach", "mjBleach", "bleach"], 0.0),
+                json_f32(cfg, &["mojoFade", "mjFade", "fade"], 0.0),
             ];
             spec.p1 = [
-                json_f32(cfg, &["mjBlueSqueeze", "blueSqueeze"], 0.0),
-                json_f32(cfg, &["mjSkinSqueeze", "skinSqueeze"], 0.0),
-                json_f32(cfg, &["mjExposure", "exposure"], 0.0),
-                json_f32(cfg, &["mjCoolWarm", "coolWarm"], 0.0),
+                json_f32(
+                    cfg,
+                    &["mojoBlueSqueeze", "mjBlueSqueeze", "blueSqueeze"],
+                    0.0,
+                ),
+                json_f32(
+                    cfg,
+                    &["mojoSkinSqueeze", "mjSkinSqueeze", "skinSqueeze"],
+                    0.0,
+                ),
+                json_f32(cfg, &["mojoExposure", "mjExposure", "exposure"], 0.0),
+                json_f32(cfg, &["mojoCoolWarm", "mjCoolWarm", "coolWarm"], 0.0),
             ];
             spec.p2 = [
-                json_f32(cfg, &["mjGreenMagenta", "greenMagenta"], 0.0),
-                json_f32(cfg, &["mjSkinYP", "skinYP"], 0.0),
-                json_f32(cfg, &["mjStrength", "strength"], 1.0),
+                json_f32(
+                    cfg,
+                    &["mojoGreenMagenta", "mjGreenMagenta", "greenMagenta"],
+                    0.0,
+                ),
+                json_f32(
+                    cfg,
+                    &["mojoSkinYellowPink", "mjSkinYP", "skinYP", "skinYellowPink"],
+                    0.0,
+                ),
+                json_f32(cfg, &["mojoStrength", "mjStrength", "strength"], 1.0),
                 0.0,
             ];
         }
         12 => {
             // auto-shoulder
             spec.p0 = [
-                json_f32(cfg, &["asStrength", "strength"], 0.5),
+                json_f32(cfg, &["ashStrength", "asStrength", "strength"], 0.5),
                 0.0,
                 0.0,
                 0.0,
@@ -1649,10 +1888,22 @@ pub(crate) fn build_magic_looks_tool_spec(
         13 => {
             // curves
             spec.aux_json = json_string(cfg, &["curvCurvesJson", "curvesJson", "curves"]);
+            spec.p0 = [
+                json_f32(cfg, &["curvShadowLift", "shadowLift"], 0.0),
+                json_f32(cfg, &["curvMidGamma", "midGamma"], 1.0),
+                json_f32(cfg, &["curvHighlightGain", "highlightGain"], 1.0),
+                0.0,
+            ];
         }
         14 => {
             // s-curve
             spec.aux_json = json_string(cfg, &["scvScurveJson", "scurveJson", "scurve", "points"]);
+            spec.p0 = [
+                json_f32(cfg, &["scvStrength", "strength"], 0.35),
+                json_f32(cfg, &["scvPivot", "pivot"], 0.5),
+                0.0,
+                0.0,
+            ];
         }
         15 => {
             // lut
@@ -1666,18 +1917,18 @@ pub(crate) fn build_magic_looks_tool_spec(
         16 => {
             // lightflex
             spec.p0 = [
-                json_f32(cfg, &["lfBoost", "boost"], 1.0),
-                json_f32(cfg, &["lfExposure", "exposure"], 0.0),
+                json_f32(cfg, &["lflBoost", "lfBoost", "boost"], 1.0),
+                json_f32(cfg, &["lflExposure", "lfExposure", "exposure"], 0.0),
                 0.0,
                 0.0,
             ];
-            spec.c0 = json_color(cfg, &["lfColor", "color"], [1.0, 0.95, 0.85]);
+            spec.c0 = json_color(cfg, &["lflColor", "lfColor", "color"], [1.0, 0.95, 0.85]);
         }
         17 => {
             // deflare
             spec.p0 = [
-                json_f32(cfg, &["dfStrength", "strength"], 0.5),
-                json_f32(cfg, &["dfExposure", "exposure"], 0.0),
+                json_f32(cfg, &["dflStrength", "dfStrength", "strength"], 0.5),
+                json_f32(cfg, &["dflExposure", "dfExposure", "exposure"], 0.0),
                 0.0,
                 0.0,
             ];
@@ -1685,38 +1936,46 @@ pub(crate) fn build_magic_looks_tool_spec(
         18 => {
             // vignette
             spec.p0 = [
-                json_f32(cfg, &["vgCenterX", "centerX"], 0.0),
-                json_f32(cfg, &["vgCenterY", "centerY"], 0.0),
-                json_f32(cfg, &["vgRadius", "radius"], 0.75),
-                json_f32(cfg, &["vgAspect", "aspect"], 1.0),
+                json_f32(cfg, &["vigCenterX", "vgCenterX", "centerX"], 0.0),
+                json_f32(cfg, &["vigCenterY", "vgCenterY", "centerY"], 0.0),
+                json_f32(cfg, &["vigRadius", "vgRadius", "radius"], 0.75),
+                json_f32(cfg, &["vigAspect", "vgAspect", "aspect"], 1.0),
             ];
             spec.p1 = [
-                json_f32(cfg, &["vgSpread", "spread"], 0.5),
-                json_f32(cfg, &["vgFalloff", "falloff"], 0.5),
-                json_f32(cfg, &["vgStrength", "strength"], 0.5),
-                json_f32(cfg, &["vgExposure", "exposure"], 0.0),
+                json_f32(cfg, &["vigSpread", "vgSpread", "spread"], 0.5),
+                json_f32(cfg, &["vigFalloff", "vgFalloff", "falloff"], 0.5),
+                json_f32(cfg, &["vigStrength", "vgStrength", "strength"], 0.5),
+                json_f32(cfg, &["vigExposure", "vgExposure", "exposure"], 0.0),
             ];
-            spec.c0 = json_color(cfg, &["vgColor", "color"], [0.0, 0.0, 0.0]);
+            spec.c0 = json_color(cfg, &["vigColor", "vgColor", "color"], [1.0, 1.0, 1.0]);
         }
         19 => {
             // haze-flare
             spec.p0 = [
-                json_f32(cfg, &["hfSpillage", "spillage"], 0.35),
-                json_f32(cfg, &["hfSoftness", "softness"], 0.5),
-                json_f32(cfg, &["hfReach", "reach"], 0.5),
-                json_f32(cfg, &["hfExposure", "exposure"], 0.0),
+                json_f32(cfg, &["hazeSpillage", "hfSpillage", "spillage"], 0.35),
+                json_f32(cfg, &["hazeSoftness", "hfSoftness", "softness"], 0.5),
+                json_f32(cfg, &["hazeReach", "hfReach", "reach"], 0.5),
+                json_f32(cfg, &["hazeExposure", "hfExposure", "exposure"], 0.0),
             ];
             spec.p1 = [
-                json_f32(cfg, &["hfReflExposure", "reflExposure"], 0.0),
-                if json_bool(cfg, &["hfReflection", "reflection"], false) {
-                    1.0
-                } else {
-                    0.0
-                },
-                json_f32(cfg, &["hfMatteSize", "matteSize"], 0.9),
-                json_f32(cfg, &["hfMatteShade", "matteShade"], 0.0),
+                json_f32(
+                    cfg,
+                    &["hazeReflectionExposure", "hfReflExposure", "reflExposure"],
+                    0.0,
+                ),
+                json_f32(cfg, &["hazeReflection", "hfReflection", "reflection"], 0.0),
+                json_f32(cfg, &["hazeMatteBoxSize", "hfMatteSize", "matteSize"], 0.9),
+                json_f32(
+                    cfg,
+                    &["hazeMatteBoxShade", "hfMatteShade", "matteShade"],
+                    0.0,
+                ),
             ];
-            spec.c0 = json_color(cfg, &["hfColor", "color"], [1.0, 0.92, 0.8]);
+            spec.c0 = json_color(
+                cfg,
+                &["hazeTint", "hazeColor", "hfColor", "color"],
+                [1.0, 0.92, 0.8],
+            );
         }
         20 => {
             // pop
@@ -1730,63 +1989,88 @@ pub(crate) fn build_magic_looks_tool_spec(
         21 => {
             // diffusion
             spec.p0 = [
-                json_f32(cfg, &["diffSize", "size"], 0.5),
-                json_f32(cfg, &["diffGrade", "grade"], 1.0),
-                json_f32(cfg, &["diffGlow", "glow"], 0.5),
-                json_f32(cfg, &["diffHighlightsOnly", "highlightsOnly"], 0.3),
+                json_f32(cfg, &["difSize", "diffSize", "size"], 0.5),
+                json_f32(cfg, &["difGrade", "diffGrade", "grade"], 1.0),
+                json_f32(cfg, &["difGlow", "diffGlow", "glow"], 0.5),
+                json_f32(
+                    cfg,
+                    &["difHighlightsOnly", "diffHighlightsOnly", "highlightsOnly"],
+                    0.3,
+                ),
             ];
             spec.p1 = [
-                json_f32(cfg, &["diffHighlightBias", "highlightBias"], 0.0),
-                json_f32(cfg, &["diffExposure", "exposure"], 0.0),
+                json_f32(
+                    cfg,
+                    &["difHighlightBias", "diffHighlightBias", "highlightBias"],
+                    0.0,
+                ),
+                json_f32(cfg, &["difExposure", "diffExposure", "exposure"], 0.0),
                 0.0,
                 0.0,
             ];
-            spec.c0 = json_color(cfg, &["diffColor", "color"], [1.0, 1.0, 1.0]);
+            spec.c0 = json_color(cfg, &["difColor", "diffColor", "color"], [1.0, 1.0, 1.0]);
         }
         22 => {
             // star-filter
             spec.p0 = [
-                json_f32(cfg, &["sfSize", "size"], 0.5),
-                json_f32(cfg, &["sfBoost", "boost"], 1.0),
-                json_f32(cfg, &["sfThreshold", "threshold"], 0.65),
-                if json_bool(cfg, &["sfShowThreshold", "showThreshold"], false) {
-                    1.0
-                } else {
-                    0.0
-                },
-            ];
-            spec.p1 = [json_f32(cfg, &["sfAngle", "angle"], 45.0), 0.0, 0.0, 0.0];
-            spec.c0 = json_color(cfg, &["sfColor", "color"], [1.0, 0.96, 0.85]);
-        }
-        23 => {
-            // anamorphic-flare
-            spec.p0 = [
-                json_f32(cfg, &["afSize", "size"], 0.5),
-                json_f32(cfg, &["afBoost", "boost"], 1.0),
-                json_f32(cfg, &["afThreshold", "threshold"], 0.65),
-                if json_bool(cfg, &["afShowThreshold", "showThreshold"], false) {
+                json_f32(cfg, &["starSize", "sfSize", "size"], 0.5),
+                json_f32(cfg, &["starBoost", "sfBoost", "boost"], 1.0),
+                json_f32(cfg, &["starThreshold", "sfThreshold", "threshold"], 0.65),
+                if json_bool(
+                    cfg,
+                    &["starShowThreshold", "sfShowThreshold", "showThreshold"],
+                    false,
+                ) {
                     1.0
                 } else {
                     0.0
                 },
             ];
             spec.p1 = [
-                if json_bool(cfg, &["afReflection", "reflection"], false) {
+                json_f32(cfg, &["starAngle", "sfAngle", "angle"], 45.0),
+                0.0,
+                0.0,
+                0.0,
+            ];
+            spec.c0 = json_color(cfg, &["starColor", "sfColor", "color"], [1.0, 0.96, 0.85]);
+        }
+        23 => {
+            // anamorphic-flare
+            spec.p0 = [
+                json_f32(cfg, &["anaSize", "afSize", "size"], 0.5),
+                json_f32(cfg, &["anaBoost", "afBoost", "boost"], 1.0),
+                json_f32(cfg, &["anaThreshold", "afThreshold", "threshold"], 0.65),
+                if json_bool(
+                    cfg,
+                    &["anaShowThreshold", "afShowThreshold", "showThreshold"],
+                    false,
+                ) {
                     1.0
                 } else {
                     0.0
                 },
-                json_f32(cfg, &["afReflBoost", "reflBoost"], 0.5),
+            ];
+            spec.p1 = [
+                json_f32(cfg, &["anaReflection", "afReflection", "reflection"], 0.0),
+                json_f32(
+                    cfg,
+                    &["anaReflectionBoost", "afReflBoost", "reflBoost"],
+                    0.5,
+                ),
                 0.0,
                 0.0,
             ];
-            spec.c0 = json_color(cfg, &["afColor", "color"], [0.4, 0.7, 1.0]);
+            spec.c0 = json_color(cfg, &["anaColor", "afColor", "color"], [0.4, 0.7, 1.0]);
         }
         24 => {
             // lens-distortion
             spec.p0 = [
-                json_f32(cfg, &["ldDistortion", "distortion"], 0.1),
-                json_f32(cfg, &["ldFlatness", "flatness"], 1.0),
+                json_f32(cfg, &["lensDistortion", "ldDistortion", "distortion"], 0.1),
+                json_f32(
+                    cfg,
+                    &["lensFlatten", "lensFlatness", "ldFlatness", "flatness"],
+                    1.0,
+                ),
                 0.0,
                 0.0,
             ];
@@ -1794,24 +2078,24 @@ pub(crate) fn build_magic_looks_tool_spec(
         25 => {
             // shutter-streak
             spec.p0 = [
-                json_f32(cfg, &["ssSize", "size"], 0.5),
-                json_f32(cfg, &["ssBoost", "boost"], 0.5),
-                json_f32(cfg, &["ssFalloff", "falloff"], 0.5),
+                json_f32(cfg, &["shutSize", "ssSize", "size"], 0.5),
+                json_f32(cfg, &["shutBoost", "ssBoost", "boost"], 0.5),
+                json_f32(cfg, &["shutFalloff", "ssFalloff", "falloff"], 0.5),
                 0.0,
             ];
         }
         26 => {
             // edge-softness
             spec.p0 = [
-                json_f32(cfg, &["esBlurSize", "blurSize"], 0.02),
-                json_f32(cfg, &["esQuality", "quality"], 2.0),
-                json_f32(cfg, &["esCenterX", "centerX"], 0.0),
-                json_f32(cfg, &["esCenterY", "centerY"], 0.0),
+                json_f32(cfg, &["edgeBlurSize", "esBlurSize", "blurSize"], 0.02),
+                json_f32(cfg, &["edgeQuality", "esQuality", "quality"], 2.0),
+                json_f32(cfg, &["edgeCenterX", "esCenterX", "centerX"], 0.0),
+                json_f32(cfg, &["edgeCenterY", "esCenterY", "centerY"], 0.0),
             ];
             spec.p1 = [
-                json_f32(cfg, &["esRadius", "radius"], 0.5),
-                json_f32(cfg, &["esAspect", "aspect"], 1.0),
-                json_f32(cfg, &["esSpread", "spread"], 0.35),
+                json_f32(cfg, &["edgeRadius", "esRadius", "radius"], 0.5),
+                json_f32(cfg, &["edgeAspect", "esAspect", "aspect"], 1.0),
+                json_f32(cfg, &["edgeSpread", "esSpread", "spread"], 0.35),
                 0.0,
             ];
         }
@@ -1827,9 +2111,9 @@ pub(crate) fn build_magic_looks_tool_spec(
         28 => {
             // telecine-net
             spec.p0 = [
-                json_f32(cfg, &["tnSize", "size"], 0.04),
-                json_f32(cfg, &["tnStrength", "strength"], 0.5),
-                json_f32(cfg, &["tnExposure", "exposure"], 0.0),
+                json_f32(cfg, &["teleSize", "tnSize", "size"], 0.04),
+                json_f32(cfg, &["teleStrength", "tnStrength", "strength"], 0.5),
+                json_f32(cfg, &["teleExposure", "tnExposure", "exposure"], 0.0),
                 0.0,
             ];
         }
@@ -1837,6 +2121,41 @@ pub(crate) fn build_magic_looks_tool_spec(
     }
 
     spec
+}
+
+fn magic_looks_flat_enable_keys(mode: u32) -> &'static [&'static str] {
+    match mode {
+        0 => &["ccEnable"],
+        1 => &["hslEnable"],
+        2 => &["crEnable"],
+        3 => &["cruEnable"],
+        4 => &["conEnable", "ctEnable"],
+        5 => &["crevEnable", "rvEnable"],
+        6 => &["stripEnable", "tsEnable"],
+        7 => &["lggEnable"],
+        8 => &["rsatEnable", "rsEnable"],
+        9 => &["wcEnable"],
+        10 => &["fw4Enable", "fwEnable"],
+        11 => &["mojoEnable", "mjEnable"],
+        12 => &["ashEnable", "asEnable"],
+        13 => &["curvEnable"],
+        14 => &["scvEnable"],
+        15 => &["lutEnable"],
+        16 => &["lflEnable", "lfEnable"],
+        17 => &["dflEnable", "dfEnable"],
+        18 => &["vigEnable", "vgEnable"],
+        19 => &["hazeEnable", "hfEnable"],
+        20 => &["popEnable"],
+        21 => &["difEnable", "diffEnable"],
+        22 => &["starEnable", "sfEnable"],
+        23 => &["anaEnable", "afEnable"],
+        24 => &["lensEnable", "ldEnable"],
+        25 => &["shutEnable", "ssEnable"],
+        26 => &["edgeEnable", "esEnable"],
+        27 => &["caEnable"],
+        28 => &["teleEnable", "tnEnable"],
+        _ => &[],
+    }
 }
 
 pub(crate) fn parse_magic_looks_chain(params: &EffectParams) -> Vec<MagicLooksToolSpec> {
@@ -1910,6 +2229,34 @@ pub(crate) fn parse_magic_looks_chain(params: &EffectParams) -> Vec<MagicLooksTo
         }
         for name in names {
             if let Some(mode) = canonical_magic_looks_tool_mode(&name) {
+                let en_keys = magic_looks_flat_enable_keys(mode);
+                let explicitly_present = en_keys.iter().any(|k| flat_map.contains_key(*k));
+                if explicitly_present && !json_bool(&flat_map, en_keys, true) {
+                    continue;
+                }
+                out.push(build_magic_looks_tool_spec(mode, &flat_map));
+            }
+        }
+    } else {
+        // 3. Fallback: Zoidium flat-param `<pfx>Enable` flags without explicit `chainOrder`
+        let mut flat_map = serde_json::Map::new();
+        for (k, v) in &params.values {
+            let jv = match v {
+                EffectParamValue::Float(f) => serde_json::json!(*f),
+                EffectParamValue::Int(i) => serde_json::json!(*i),
+                EffectParamValue::Bool(b) => serde_json::json!(*b),
+                EffectParamValue::String(s) => serde_json::json!(s),
+                EffectParamValue::Vec3(c) => serde_json::json!([c[0], c[1], c[2]]),
+                EffectParamValue::Vec4(c) => serde_json::json!([c[0], c[1], c[2], c[3]]),
+                _ => continue,
+            };
+            flat_map.insert(k.clone(), jv);
+        }
+        for mode in 0..=28u32 {
+            let en_keys = magic_looks_flat_enable_keys(mode);
+            if en_keys.iter().any(|k| flat_map.contains_key(*k))
+                && json_bool(&flat_map, en_keys, false)
+            {
                 out.push(build_magic_looks_tool_spec(mode, &flat_map));
             }
         }
@@ -1922,8 +2269,43 @@ pub(crate) fn parse_magic_looks_chain(params: &EffectParams) -> Vec<MagicLooksTo
 // Text Field Formatter & Single-Stroke Polyline Rasterizer (`numbers`/`timecode`)
 // ============================================================================
 
+/// Converts a Gregorian `(year, month, day)` date to days since 1970-01-01.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = year - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let m = i64::from(month);
+    let d = i64::from(day);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Converts days since 1970-01-01 to exact Gregorian `(year, month 1..=12, day 1..=31)`,
+/// handling exact month lengths and leap years (divisible by 4, except 100 unless 400).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(m <= 2);
+    (year, m as u32, d as u32)
+}
+
+fn gregorian_date_from_offset_days(days_offset: u32) -> (i64, u32, u32) {
+    let epoch_2026 = days_from_civil(2026, 1, 1);
+    civil_from_days(epoch_2026 + i64::from(days_offset))
+}
+
 pub(crate) fn format_numbers_text(params: &EffectParams) -> String {
-    let raw_val = if params.bool_or("randomValues", false) {
+    let raw_val = if params.bool_or("currentTime", false) {
+        params.time
+    } else if params.bool_or("randomValues", false) {
         let seed = params.float_or("seed", 1.0);
         let h = ((params.frame * 12.9898 + seed * 78.233).sin() * 43_758.547)
             .fract()
@@ -1934,7 +2316,9 @@ pub(crate) fn format_numbers_text(params: &EffectParams) -> String {
         params.float_or("value", 0.0)
     };
     let decimals = params.int_or("decimalPlaces", 0).clamp(0, 6) as usize;
-    let format_mode = params.int_or("format", 0).clamp(0, 7);
+    // Zoidium `numbers.js:109`: 0=Number, 1=Leading Zeros, 2=TC30, 3=TC25, 4=TC24,
+    // 5=Time, 6=Numerical Date, 7=Short Date, 8=Long Date, 9=Hex.
+    let format_mode = params.int_or("format", 0).clamp(0, 9);
     match format_mode {
         1 => {
             // Number with leading zeroes
@@ -1949,8 +2333,8 @@ pub(crate) fn format_numbers_text(params: &EffectParams) -> String {
         }
         2..=4 => {
             let fps = match format_mode {
-                3 => 24,
-                4 => 25,
+                3 => 25,
+                4 => 24,
                 _ => 30,
             };
             format_smpte_from_seconds(raw_val.max(0.0), fps, false)
@@ -1964,14 +2348,28 @@ pub(crate) fn format_numbers_text(params: &EffectParams) -> String {
             format!("{hh:02}:{mm:02}:{ss:02}")
         }
         6 => {
-            // Short date MM/DD/YY deterministic from value days
-            let days = raw_val.max(0.0).floor() as u32;
-            let mm = (days % 12) + 1;
-            let dd = ((days / 12) % 28) + 1;
-            let yy = (26 + (days / 365)) % 100;
-            format!("{mm:02}/{dd:02}/{yy:02}")
+            // Numerical Date YYYY-MM-DD using exact Gregorian calendar arithmetic
+            let days = raw_val.max(0.0).floor().min(3_650_000.0) as u32;
+            let (yy, mm, dd) = gregorian_date_from_offset_days(days);
+            format!("{yy:04}-{mm:02}-{dd:02}")
         }
         7 => {
+            // Short date MM/DD/YY using exact Gregorian calendar arithmetic
+            let days = raw_val.max(0.0).floor().min(3_650_000.0) as u32;
+            let (yy, mm, dd) = gregorian_date_from_offset_days(days);
+            format!("{mm:02}/{dd:02}/{:02}", yy.rem_euclid(100))
+        }
+        8 => {
+            // Long date e.g. JAN 01, 2026 using exact Gregorian calendar arithmetic
+            const MONTHS: [&str; 12] = [
+                "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+            ];
+            let days = raw_val.max(0.0).floor().min(3_650_000.0) as u32;
+            let (yy, mm, dd) = gregorian_date_from_offset_days(days);
+            let month_name = MONTHS[(mm.saturating_sub(1) as usize).min(11)];
+            format!("{month_name} {dd:02}, {yy:04}")
+        }
+        9 => {
             // Hexadecimal
             format!("{:X}", raw_val.round().max(0.0) as u64)
         }
@@ -1979,33 +2377,66 @@ pub(crate) fn format_numbers_text(params: &EffectParams) -> String {
     }
 }
 
-pub(crate) fn format_smpte_from_seconds(sec: f32, fps: u32, drop_frame: bool) -> String {
+/// Formats an integer frame count as SMPTE timecode, applying exact SMPTE ST 12-1
+/// Drop-Frame math for 29.97 DF (`fps == 30`, dropping frames 00, 01) and 59.94 DF
+/// (`fps == 60`, dropping frames 00..03) at the start of every minute except minutes
+/// 0, 10, 20, 30, 40, 50.
+pub(crate) fn format_smpte_from_frames(total_frames: u64, fps: u32, drop_frame: bool) -> String {
     let fps_u = fps.max(1);
-    let total_frames = (sec.max(0.0) * (fps_u as f32) + 1e-4).floor() as u64;
-    let f = total_frames % u64::from(fps_u);
-    let total_sec = total_frames / u64::from(fps_u);
+    let fps_64 = u64::from(fps_u);
+    if drop_frame && (fps_u == 30 || fps_u == 60) {
+        let drop_frames: u64 = if fps_u == 60 { 4 } else { 2 };
+        let frames_per_10_min = fps_64 * 600 - drop_frames * 9;
+        let frames_per_min = fps_64 * 60 - drop_frames;
+        let frames_per_24h = frames_per_10_min * 144;
+        let wrapped = total_frames % frames_per_24h;
+        let d = wrapped / frames_per_10_min;
+        let m_rem = wrapped % frames_per_10_min;
+        let dropped = if m_rem >= drop_frames {
+            drop_frames * 9 * d + drop_frames * ((m_rem - drop_frames) / frames_per_min)
+        } else {
+            drop_frames * 9 * d
+        };
+        let fn_adj = wrapped + dropped;
+        let f = fn_adj % fps_64;
+        let total_sec = fn_adj / fps_64;
+        let s = total_sec % 60;
+        let m = (total_sec / 60) % 60;
+        let h = (total_sec / 3600) % 24;
+        return format!("{h:02}:{m:02}:{s:02};{f:02}");
+    }
+    let f = total_frames % fps_64;
+    let total_sec = total_frames / fps_64;
     let s = total_sec % 60;
     let m = (total_sec / 60) % 60;
     let h = (total_sec / 3600) % 24;
-    let sep = if drop_frame && fps_u == 30 { ';' } else { ':' };
-    format!("{h:02}:{m:02}:{s:02}{sep}{f:02}")
+    format!("{h:02}:{m:02}:{s:02}:{f:02}")
+}
+
+pub(crate) fn format_smpte_from_seconds(sec: f32, fps: u32, drop_frame: bool) -> String {
+    let fps_u = fps.max(1);
+    let total_frames = (sec.max(0.0) * (fps_u as f32) + 1e-4).floor() as u64;
+    format_smpte_from_frames(total_frames, fps_u, drop_frame)
 }
 
 pub(crate) fn format_timecode_text(params: &EffectParams) -> String {
-    let fps = params.int_or("timeUnits", 30).clamp(1, 240) as u32;
-    let start_frame = params.int_or("startingFrame", 0).max(0) as u64;
+    let fps = params.float_or("timeUnits", 30.0).round().clamp(1.0, 240.0) as u32;
+    let start_frame = i64::from(params.int_or("startingFrame", 0));
+    // Zoidium `timecode.js`: 0=Layer Source, 1=Composition, 2=Custom
     let time_source = params.int_or("timeSource", 0);
     let t_sec = if params.values.contains_key("time") {
         params.float_or("time", params.time)
-    } else if time_source == 0 && params.values.contains_key("_absTime") {
+    } else if time_source == 1 && params.values.contains_key("_absTime") {
         params.float_or("_absTime", params.time)
     } else {
         params.time
     };
-    let total_frames = start_frame + (t_sec.max(0.0) * (fps as f32) + 1e-4).floor() as u64;
+    let raw_frames = start_frame + (t_sec * (fps as f32) + 1e-4).floor() as i64;
+    let neg = raw_frames < 0;
+    let total_frames = raw_frames.unsigned_abs();
     let display_fmt = params.int_or("displayFormat", 0).clamp(0, 3);
     let drop_frame = params.bool_or("dropFrame", false);
-    match display_fmt {
+    let body = match display_fmt {
         1 => format!("{total_frames:05}"),
         2 => {
             // Feet + Frames 35mm (16 frames/ft)
@@ -2019,8 +2450,9 @@ pub(crate) fn format_timecode_text(params: &EffectParams) -> String {
             let rem = total_frames % 40;
             format!("{feet:04}+{rem:02}")
         }
-        _ => format_smpte_from_seconds((total_frames as f32) / (fps as f32), fps, drop_frame),
-    }
+        _ => format_smpte_from_frames(total_frames, fps, drop_frame),
+    };
+    if neg { format!("-{body}") } else { body }
 }
 
 pub(crate) struct TextFieldRaster {
@@ -2136,6 +2568,121 @@ pub(crate) fn glyph_segments(ch: char) -> &'static [([f32; 2], [f32; 2])] {
             ([0.20, 0.08], [0.20, 0.92]),
             ([0.20, 0.48], [0.70, 0.48]),
         ],
+        'G' => &[
+            ([0.82, 0.14], [0.24, 0.14]),
+            ([0.24, 0.14], [0.18, 0.50]),
+            ([0.18, 0.50], [0.24, 0.88]),
+            ([0.24, 0.88], [0.82, 0.88]),
+            ([0.82, 0.88], [0.82, 0.52]),
+            ([0.82, 0.52], [0.52, 0.52]),
+        ],
+        'H' => &[
+            ([0.20, 0.08], [0.20, 0.92]),
+            ([0.80, 0.08], [0.80, 0.92]),
+            ([0.20, 0.48], [0.80, 0.48]),
+        ],
+        'I' => &[
+            ([0.28, 0.08], [0.72, 0.08]),
+            ([0.50, 0.08], [0.50, 0.92]),
+            ([0.28, 0.92], [0.72, 0.92]),
+        ],
+        'J' => &[
+            ([0.30, 0.08], [0.82, 0.08]),
+            ([0.66, 0.08], [0.66, 0.76]),
+            ([0.66, 0.76], [0.46, 0.92]),
+            ([0.46, 0.92], [0.20, 0.82]),
+            ([0.20, 0.82], [0.18, 0.68]),
+        ],
+        'K' => &[
+            ([0.20, 0.08], [0.20, 0.92]),
+            ([0.82, 0.08], [0.20, 0.52]),
+            ([0.34, 0.42], [0.84, 0.92]),
+        ],
+        'L' => &[([0.20, 0.08], [0.20, 0.92]), ([0.20, 0.92], [0.82, 0.92])],
+        'M' => &[
+            ([0.16, 0.92], [0.16, 0.08]),
+            ([0.16, 0.08], [0.50, 0.56]),
+            ([0.50, 0.56], [0.84, 0.08]),
+            ([0.84, 0.08], [0.84, 0.92]),
+        ],
+        'N' => &[
+            ([0.18, 0.92], [0.18, 0.08]),
+            ([0.18, 0.08], [0.82, 0.92]),
+            ([0.82, 0.92], [0.82, 0.08]),
+        ],
+        'O' => &[
+            ([0.26, 0.08], [0.74, 0.08]),
+            ([0.74, 0.08], [0.84, 0.24]),
+            ([0.84, 0.24], [0.84, 0.76]),
+            ([0.84, 0.76], [0.74, 0.92]),
+            ([0.74, 0.92], [0.26, 0.92]),
+            ([0.26, 0.92], [0.16, 0.76]),
+            ([0.16, 0.76], [0.16, 0.24]),
+            ([0.16, 0.24], [0.26, 0.08]),
+        ],
+        'P' => &[
+            ([0.20, 0.92], [0.20, 0.08]),
+            ([0.20, 0.08], [0.72, 0.08]),
+            ([0.72, 0.08], [0.82, 0.24]),
+            ([0.82, 0.24], [0.82, 0.38]),
+            ([0.82, 0.38], [0.72, 0.52]),
+            ([0.72, 0.52], [0.20, 0.52]),
+        ],
+        'Q' => &[
+            ([0.26, 0.08], [0.74, 0.08]),
+            ([0.74, 0.08], [0.84, 0.24]),
+            ([0.84, 0.24], [0.84, 0.76]),
+            ([0.84, 0.76], [0.74, 0.92]),
+            ([0.74, 0.92], [0.26, 0.92]),
+            ([0.26, 0.92], [0.16, 0.76]),
+            ([0.16, 0.76], [0.16, 0.24]),
+            ([0.16, 0.24], [0.26, 0.08]),
+            ([0.56, 0.68], [0.86, 0.96]),
+        ],
+        'R' => &[
+            ([0.20, 0.92], [0.20, 0.08]),
+            ([0.20, 0.08], [0.72, 0.08]),
+            ([0.72, 0.08], [0.82, 0.24]),
+            ([0.82, 0.24], [0.82, 0.38]),
+            ([0.82, 0.38], [0.72, 0.52]),
+            ([0.72, 0.52], [0.20, 0.52]),
+            ([0.54, 0.52], [0.84, 0.92]),
+        ],
+        'S' => &[
+            ([0.80, 0.14], [0.28, 0.10]),
+            ([0.28, 0.10], [0.18, 0.26]),
+            ([0.18, 0.26], [0.24, 0.44]),
+            ([0.24, 0.44], [0.76, 0.56]),
+            ([0.76, 0.56], [0.82, 0.74]),
+            ([0.82, 0.74], [0.70, 0.90]),
+            ([0.70, 0.90], [0.18, 0.88]),
+        ],
+        'T' => &[([0.14, 0.08], [0.86, 0.08]), ([0.50, 0.08], [0.50, 0.92])],
+        'U' => &[
+            ([0.18, 0.08], [0.18, 0.76]),
+            ([0.18, 0.76], [0.30, 0.92]),
+            ([0.30, 0.92], [0.70, 0.92]),
+            ([0.70, 0.92], [0.82, 0.76]),
+            ([0.82, 0.76], [0.82, 0.08]),
+        ],
+        'V' => &[([0.14, 0.08], [0.50, 0.92]), ([0.50, 0.92], [0.86, 0.08])],
+        'W' => &[
+            ([0.12, 0.08], [0.30, 0.92]),
+            ([0.30, 0.92], [0.50, 0.44]),
+            ([0.50, 0.44], [0.70, 0.92]),
+            ([0.70, 0.92], [0.88, 0.08]),
+        ],
+        'X' => &[([0.16, 0.08], [0.84, 0.92]), ([0.84, 0.08], [0.16, 0.92])],
+        'Y' => &[
+            ([0.16, 0.08], [0.50, 0.50]),
+            ([0.84, 0.08], [0.50, 0.50]),
+            ([0.50, 0.50], [0.50, 0.92]),
+        ],
+        'Z' => &[
+            ([0.16, 0.08], [0.84, 0.08]),
+            ([0.84, 0.08], [0.16, 0.92]),
+            ([0.16, 0.92], [0.84, 0.92]),
+        ],
         ':' => &[([0.48, 0.28], [0.52, 0.34]), ([0.48, 0.70], [0.52, 0.76])],
         ';' => &[([0.48, 0.28], [0.52, 0.34]), ([0.52, 0.70], [0.42, 0.88])],
         '.' => &[([0.48, 0.84], [0.52, 0.90])],
@@ -2186,7 +2733,7 @@ pub(crate) fn rasterize_text_field_coverage(
     let mut segs: Vec<[f32; 4]> = Vec::new();
     let mut advances: Vec<f32> = Vec::with_capacity(chars.len());
     for &ch in &chars {
-        let adv = if proportional && matches!(ch, ':' | ';' | '.' | ',' | '\'' | '1') {
+        let adv = if proportional && matches!(ch, ':' | ';' | '.' | ',' | '\'' | '1' | 'I' | 'i') {
             base_w * 0.55
         } else {
             base_w

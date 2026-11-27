@@ -97,7 +97,12 @@ pub(crate) fn collect_keyframe_rows(session: &Session) -> Vec<KeyframeLaneRow> {
                     }
                 }
                 if !has_obj_sel && !has_fx_sel && track.kind == TrackKind::Video {
-                    collect_mask_and_shape_plus_keyframe_rows(&mut rows, session, clip);
+                    collect_mask_and_shape_plus_keyframe_rows(
+                        &mut rows,
+                        session,
+                        clip,
+                        track.locked,
+                    );
                 }
                 break;
             }
@@ -121,6 +126,7 @@ pub(crate) fn collect_mask_and_shape_plus_keyframe_rows(
     out: &mut Vec<KeyframeLaneRow>,
     session: &Session,
     clip: &SessionClip,
+    track_locked: bool,
 ) {
     let Ok(clip_uuid) = zc_project::Uuid::parse_str(&clip.id) else {
         return;
@@ -163,7 +169,7 @@ pub(crate) fn collect_mask_and_shape_plus_keyframe_rows(
                     property: "path".to_string(),
                     display_label: format!("Mask:{mask_name}.path"),
                     frame_offset: clip.start,
-                    locked: true,
+                    locked: track_locked,
                     keyframes,
                 });
             }
@@ -174,7 +180,7 @@ pub(crate) fn collect_mask_and_shape_plus_keyframe_rows(
                         property: prop_key.clone(),
                         display_label: format!("Mask:{mask_name}.{prop_key}"),
                         frame_offset: clip.start,
-                        locked: true,
+                        locked: track_locked,
                         keyframes: kfs,
                     });
                 }
@@ -189,18 +195,18 @@ pub(crate) fn collect_mask_and_shape_plus_keyframe_rows(
     } = &vc.layer.kind
         && plugin_type.contains("shape-plus")
     {
-        collect_shape_plus_payload_rows(out, &clip.id, clip.start, payload, 0);
+        collect_shape_plus_payload_rows(out, &clip.id, clip.start, track_locked, payload, 0);
     }
     for (key, val) in &vc.layer.preserved {
         if key == "shapePlus" {
-            collect_shape_plus_payload_rows(out, &clip.id, clip.start, val, 0);
+            collect_shape_plus_payload_rows(out, &clip.id, clip.start, track_locked, val, 0);
         } else if let Some(kfs) = extract_json_keyframes(val) {
             out.push(KeyframeLaneRow {
                 target_id: format!("preserved:{}", clip.id),
                 property: key.clone(),
                 display_label: format!("Layer.{key}"),
                 frame_offset: clip.start,
-                locked: true,
+                locked: track_locked,
                 keyframes: kfs,
             });
         }
@@ -211,6 +217,7 @@ pub(crate) fn collect_shape_plus_payload_rows(
     out: &mut Vec<KeyframeLaneRow>,
     clip_id: &str,
     frame_offset: f64,
+    track_locked: bool,
     payload: &Value,
     depth: usize,
 ) {
@@ -241,14 +248,501 @@ pub(crate) fn collect_shape_plus_payload_rows(
                         property: prop_name.clone(),
                         display_label: format!("Shape+:{item_name}.{prop_name}"),
                         frame_offset,
-                        locked: true,
+                        locked: track_locked,
                         keyframes: kfs,
                     });
                 }
             }
         }
-        collect_shape_plus_payload_rows(out, clip_id, frame_offset, item, depth + 1);
+        collect_shape_plus_payload_rows(out, clip_id, frame_offset, track_locked, item, depth + 1);
     }
+}
+
+#[must_use]
+pub(crate) fn is_custom_keyframe_target(target_id: &str) -> bool {
+    target_id.starts_with("mask:")
+        || target_id.starts_with("shape_plus:")
+        || target_id.starts_with("preserved:")
+}
+
+fn parse_prefixed_clip_and_item<'a>(
+    target_id: &'a str,
+    prefix: &str,
+) -> Option<(zc_project::Uuid, &'a str)> {
+    let rest = target_id.strip_prefix(prefix)?;
+    let (clip_str, item_id) = rest.split_once(':')?;
+    let clip_uuid = zc_project::Uuid::parse_str(clip_str).ok()?;
+    Some((clip_uuid, item_id))
+}
+
+fn find_shape_item<'a>(node: &'a Value, item_id: &str, depth: usize) -> Option<&'a Value> {
+    if depth > 16 {
+        return None;
+    }
+    let contents = node.get("contents")?.as_array()?;
+    for item in contents {
+        if item.get("id").and_then(Value::as_str) == Some(item_id) {
+            return Some(item);
+        }
+        if let Some(found) = find_shape_item(item, item_id, depth + 1) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn find_shape_item_mut<'a>(
+    node: &'a mut Value,
+    item_id: &str,
+    depth: usize,
+) -> Option<&'a mut Value> {
+    if depth > 16 {
+        return None;
+    }
+    let contents = node.get_mut("contents")?.as_array_mut()?;
+    for item in contents {
+        if item.get("id").and_then(Value::as_str) == Some(item_id) {
+            return Some(item);
+        }
+        if let Some(found) = find_shape_item_mut(item, item_id, depth + 1) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn json_keyframes_contain_frame(prop_val: &Value, frame: f64) -> bool {
+    prop_val
+        .get("keyframes")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| {
+            arr.iter().any(|k| {
+                k.get("frame")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|f| (f - frame).abs() < 1e-4)
+            })
+        })
+}
+
+fn move_json_keyframe_in_prop(prop_val: &mut Value, old_frame: f64, new_frame: f64) -> bool {
+    let Some(arr) = prop_val.get_mut("keyframes").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let Some(src_idx) = arr.iter().position(|k| {
+        k.get("frame")
+            .and_then(Value::as_f64)
+            .is_some_and(|f| (f - old_frame).abs() < 1e-4)
+    }) else {
+        return false;
+    };
+    let mut moved = arr.remove(src_idx);
+    arr.retain(|k| {
+        !k.get("frame")
+            .and_then(Value::as_f64)
+            .is_some_and(|f| (f - new_frame).abs() < 1e-4)
+    });
+    if let Some(obj) = moved.as_object_mut() {
+        obj.insert("frame".to_owned(), Value::from(new_frame));
+    }
+    arr.push(moved);
+    arr.sort_by(|a, b| {
+        let fa = a.get("frame").and_then(Value::as_f64).unwrap_or(0.0);
+        let fb = b.get("frame").and_then(Value::as_f64).unwrap_or(0.0);
+        fa.total_cmp(&fb)
+    });
+    true
+}
+
+fn delete_json_keyframe_in_prop(prop_val: &mut Value, frame: f64) -> Result<bool, String> {
+    let Some(arr) = prop_val.get_mut("keyframes").and_then(Value::as_array_mut) else {
+        return Ok(false);
+    };
+    if arr.len() <= 1 {
+        return Err("cannot delete the sole remaining keyframe".to_owned());
+    }
+    let before = arr.len();
+    arr.retain(|k| {
+        !k.get("frame")
+            .and_then(Value::as_f64)
+            .is_some_and(|f| (f - frame).abs() < 1e-4)
+    });
+    Ok(arr.len() < before)
+}
+
+#[must_use]
+pub(crate) fn mask_or_shape_keyframe_exists(
+    session: &Session,
+    target_id: &str,
+    property: &str,
+    frame: f64,
+) -> bool {
+    let seq = session.active_sequence();
+    if let Some((clip_uuid, mask_id)) = parse_prefixed_clip_and_item(target_id, "mask:") {
+        let Some(vc) = seq
+            .video_tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.id == clip_uuid)
+        else {
+            return false;
+        };
+        let Some(mask) = seq
+            .layer_masks
+            .get(&vc.layer.id)
+            .and_then(|masks| masks.iter().find(|m| m.id == mask_id))
+        else {
+            return false;
+        };
+        if property == "path" {
+            return mask
+                .path
+                .keyframes
+                .iter()
+                .any(|k| (k.frame - frame).abs() < 1e-4);
+        }
+        return mask
+            .preserved
+            .get(property)
+            .is_some_and(|v| json_keyframes_contain_frame(v, frame));
+    }
+    if let Some((clip_uuid, item_id)) = parse_prefixed_clip_and_item(target_id, "shape_plus:") {
+        let Some(vc) = seq
+            .video_tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.id == clip_uuid)
+        else {
+            return false;
+        };
+        if let zc_project::LayerKind::Plugin {
+            plugin_type,
+            payload,
+        } = &vc.layer.kind
+            && plugin_type.contains("shape-plus")
+            && let Some(item) = find_shape_item(payload, item_id, 0)
+            && let Some(prop_val) = item.get("properties").and_then(|p| p.get(property))
+        {
+            return json_keyframes_contain_frame(prop_val, frame);
+        }
+        if let Some(payload) = vc.layer.preserved.get("shapePlus")
+            && let Some(item) = find_shape_item(payload, item_id, 0)
+            && let Some(prop_val) = item.get("properties").and_then(|p| p.get(property))
+        {
+            return json_keyframes_contain_frame(prop_val, frame);
+        }
+        return false;
+    }
+    if let Some(clip_str) = target_id.strip_prefix("preserved:")
+        && let Ok(clip_uuid) = zc_project::Uuid::parse_str(clip_str)
+        && let Some(vc) = seq
+            .video_tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.id == clip_uuid)
+        && let Some(prop_val) = vc.layer.preserved.get(property)
+    {
+        return json_keyframes_contain_frame(prop_val, frame);
+    }
+    false
+}
+
+pub(crate) fn move_mask_or_shape_keyframe(
+    session: &mut Session,
+    target_id: &str,
+    property: &str,
+    old_frame: f64,
+    new_frame: f64,
+) -> Result<bool, String> {
+    if !new_frame.is_finite() || (new_frame - old_frame).abs() <= 1e-6 {
+        return Ok(false);
+    }
+    if let Some((clip_uuid, mask_id)) = parse_prefixed_clip_and_item(target_id, "mask:") {
+        let mask_id_owned = mask_id.to_owned();
+        let mut mask = {
+            let seq = session.active_sequence();
+            let vc = seq
+                .video_tracks
+                .iter()
+                .flat_map(|t| t.clips.iter())
+                .find(|c| c.id == clip_uuid)
+                .ok_or_else(|| format!("clip '{clip_uuid}' not found"))?;
+            seq.layer_masks
+                .get(&vc.layer.id)
+                .and_then(|masks| masks.iter().find(|m| m.id == mask_id_owned))
+                .cloned()
+                .ok_or_else(|| format!("mask '{mask_id_owned}' not found"))?
+        };
+        let moved = if property == "path" {
+            if let Some(idx) = mask
+                .path
+                .keyframes
+                .iter()
+                .position(|k| (k.frame - old_frame).abs() < 1e-4)
+            {
+                let mut kf = mask.path.keyframes.remove(idx);
+                mask.path
+                    .keyframes
+                    .retain(|k| (k.frame - new_frame).abs() >= 1e-4);
+                kf.frame = new_frame;
+                mask.path.keyframes.push(kf);
+                mask.path
+                    .keyframes
+                    .sort_by(|a, b| a.frame.total_cmp(&b.frame));
+                true
+            } else {
+                false
+            }
+        } else if let Some(prop_val) = mask.preserved.get_mut(property) {
+            move_json_keyframe_in_prop(prop_val, old_frame, new_frame)
+        } else {
+            false
+        };
+        if !moved {
+            return Ok(false);
+        }
+        session
+            .execute(Command::UpdateLayerMask {
+                clip_id: clip_uuid,
+                mask_id: mask_id_owned,
+                mask,
+            })
+            .map(|_| true)
+            .map_err(|err| err.to_string())
+    } else if let Some((clip_uuid, item_id)) =
+        parse_prefixed_clip_and_item(target_id, "shape_plus:")
+    {
+        let item_id_owned = item_id.to_owned();
+        let plugin_payload = {
+            let seq = session.active_sequence();
+            seq.video_tracks
+                .iter()
+                .flat_map(|t| t.clips.iter())
+                .find(|c| c.id == clip_uuid)
+                .and_then(|vc| match &vc.layer.kind {
+                    zc_project::LayerKind::Plugin {
+                        plugin_type,
+                        payload,
+                    } if plugin_type.contains("shape-plus") => Some(payload.clone()),
+                    _ => None,
+                })
+        };
+        if let Some(mut payload) = plugin_payload {
+            let moved = find_shape_item_mut(&mut payload, &item_id_owned, 0)
+                .and_then(|item| item.get_mut("properties"))
+                .and_then(|p| p.get_mut(property))
+                .is_some_and(|prop_val| move_json_keyframe_in_prop(prop_val, old_frame, new_frame));
+            if !moved {
+                return Ok(false);
+            }
+            return session
+                .execute(Command::UpdateShapePlusPayload {
+                    clip_id: clip_uuid,
+                    payload,
+                })
+                .map(|_| true)
+                .map_err(|err| err.to_string());
+        }
+        Ok(false)
+    } else {
+        Ok(false)
+    }
+}
+
+pub(crate) fn delete_mask_or_shape_keyframe(
+    session: &mut Session,
+    target_id: &str,
+    property: &str,
+    frame: f64,
+) -> Result<bool, String> {
+    if let Some((clip_uuid, mask_id)) = parse_prefixed_clip_and_item(target_id, "mask:") {
+        let mask_id_owned = mask_id.to_owned();
+        let mut mask = {
+            let seq = session.active_sequence();
+            let vc = seq
+                .video_tracks
+                .iter()
+                .flat_map(|t| t.clips.iter())
+                .find(|c| c.id == clip_uuid)
+                .ok_or_else(|| format!("clip '{clip_uuid}' not found"))?;
+            seq.layer_masks
+                .get(&vc.layer.id)
+                .and_then(|masks| masks.iter().find(|m| m.id == mask_id_owned))
+                .cloned()
+                .ok_or_else(|| format!("mask '{mask_id_owned}' not found"))?
+        };
+        let removed = if property == "path" {
+            if mask.path.keyframes.len() <= 1 {
+                return Err("cannot delete the sole remaining keyframe".to_owned());
+            }
+            let before = mask.path.keyframes.len();
+            mask.path
+                .keyframes
+                .retain(|k| (k.frame - frame).abs() >= 1e-4);
+            mask.path.keyframes.len() < before
+        } else if let Some(prop_val) = mask.preserved.get_mut(property) {
+            delete_json_keyframe_in_prop(prop_val, frame)?
+        } else {
+            false
+        };
+        if !removed {
+            return Ok(false);
+        }
+        session
+            .execute(Command::UpdateLayerMask {
+                clip_id: clip_uuid,
+                mask_id: mask_id_owned,
+                mask,
+            })
+            .map(|_| true)
+            .map_err(|err| err.to_string())
+    } else if let Some((clip_uuid, item_id)) =
+        parse_prefixed_clip_and_item(target_id, "shape_plus:")
+    {
+        let item_id_owned = item_id.to_owned();
+        let plugin_payload = {
+            let seq = session.active_sequence();
+            seq.video_tracks
+                .iter()
+                .flat_map(|t| t.clips.iter())
+                .find(|c| c.id == clip_uuid)
+                .and_then(|vc| match &vc.layer.kind {
+                    zc_project::LayerKind::Plugin {
+                        plugin_type,
+                        payload,
+                    } if plugin_type.contains("shape-plus") => Some(payload.clone()),
+                    _ => None,
+                })
+        };
+        if let Some(mut payload) = plugin_payload {
+            let removed = match find_shape_item_mut(&mut payload, &item_id_owned, 0)
+                .and_then(|item| item.get_mut("properties"))
+                .and_then(|p| p.get_mut(property))
+            {
+                Some(prop_val) => delete_json_keyframe_in_prop(prop_val, frame)?,
+                None => false,
+            };
+            if !removed {
+                return Ok(false);
+            }
+            return session
+                .execute(Command::UpdateShapePlusPayload {
+                    clip_id: clip_uuid,
+                    payload,
+                })
+                .map(|_| true)
+                .map_err(|err| err.to_string());
+        }
+        Ok(false)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Commits a released timeline keyframe drag when any dragged keyframe belongs to a Mask or
+/// Shape+ track (which require `UpdateLayerMask` / `UpdateShapePlusPayload` instead of
+/// `Command::SetKeyframe`). Returns `true` when it consumed the release.
+pub(crate) fn maybe_commit_custom_keyframe_drag(
+    ui: &Ui,
+    session: &mut Session,
+    state: &mut TimelineViewState,
+    action: &mut TimelineAction,
+) -> bool {
+    let primary_down = ui.input(|i| i.pointer.primary_down());
+    if primary_down {
+        return false;
+    }
+    let has_custom = matches!(
+        &state.drag_state,
+        TimelineDragState::DraggingKeyframe(drag)
+            if drag.keyframes.iter().any(|kf| is_custom_keyframe_target(&kf.target_id))
+    );
+    if !has_custom {
+        return false;
+    }
+    let TimelineDragState::DraggingKeyframe(drag) = std::mem::take(&mut state.drag_state) else {
+        return false;
+    };
+    if drag.moved
+        && drag.preview_delta_frames.abs() > 1e-6
+        && session.begin_transaction("Move Keyframes").is_ok()
+    {
+        let mut new_selection = Vec::new();
+        let mut changed = false;
+        let mut standard_moved = Vec::new();
+        for kf in &drag.keyframes {
+            let new_frame = kf.orig_local_frame + drag.preview_delta_frames;
+            if is_custom_keyframe_target(&kf.target_id) {
+                if move_mask_or_shape_keyframe(
+                    session,
+                    &kf.target_id,
+                    &kf.property,
+                    kf.orig_local_frame,
+                    new_frame,
+                )
+                .unwrap_or(false)
+                {
+                    changed = true;
+                    new_selection.push(KeyframeRef::new(
+                        &kf.target_id,
+                        &kf.property,
+                        None,
+                        new_frame,
+                    ));
+                }
+            } else if session
+                .execute(Command::SetKeyframe {
+                    target_id: kf.target_id.clone(),
+                    property: kf.property.clone(),
+                    frame: new_frame,
+                    value: kf.value.clone(),
+                    tween: Some(kf.tween),
+                })
+                .is_ok()
+            {
+                let _ = session.set_keyframe_bezier_handles(
+                    &kf.target_id,
+                    &kf.property,
+                    new_frame,
+                    kf.control_points,
+                    kf.continuous_tangent,
+                    Some(kf.tween),
+                );
+                changed = true;
+                standard_moved.push(kf);
+                new_selection.push(KeyframeRef::new(
+                    &kf.target_id,
+                    &kf.property,
+                    None,
+                    new_frame,
+                ));
+            }
+        }
+        if !standard_moved.is_empty() {
+            for kf in &standard_moved {
+                let still_occupied = standard_moved.iter().any(|other| {
+                    other.target_id == kf.target_id
+                        && other.property == kf.property
+                        && ((other.orig_local_frame + drag.preview_delta_frames)
+                            - kf.orig_local_frame)
+                            .abs()
+                            < 1e-6
+                });
+                if !still_occupied {
+                    let _ = session.execute(Command::DeleteKeyframe {
+                        target_id: kf.target_id.clone(),
+                        property: kf.property.clone(),
+                        frame: kf.orig_local_frame,
+                    });
+                }
+            }
+        }
+        if changed {
+            session.selection.keyframes = new_selection;
+            action.clips_modified = true;
+        }
+        let _ = session.commit_transaction(changed);
+    }
+    true
 }
 
 pub(crate) fn extract_json_keyframes(val: &Value) -> Option<Vec<KeyframeLaneItem>> {
@@ -515,11 +1009,7 @@ pub(crate) fn paint_and_interact_keyframes(
             if kf_resp.clicked_by(PointerButton::Primary) {
                 clicked_any_diamond = true;
                 state.focused = true;
-                if row.locked
-                    && (row.target_id.starts_with("mask:")
-                        || row.target_id.starts_with("shape_plus:")
-                        || row.target_id.starts_with("preserved:"))
-                {
+                if row.locked {
                     let target_f = (row.frame_offset + local_frame).round().max(0.0);
                     let _ = session.execute(Command::SetFrame { frame: target_f });
                     action.playhead_scrubbed = true;

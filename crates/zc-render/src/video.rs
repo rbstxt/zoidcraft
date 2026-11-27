@@ -12,8 +12,9 @@ mod web;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{
-    VideoDecoderPool, VideoStreamSession, ffprobe_binary_available, probe_video_metadata,
-    resolve_ffmpeg_binary_path, resolve_ffprobe_binary_path,
+    VideoDecoderPool, VideoStreamSession, default_managed_tools_dir, derive_sibling_ffprobe_path,
+    ffprobe_binary_available, probe_video_metadata, refresh_media_tool_cache,
+    resolve_ffmpeg_binary_path, resolve_ffprobe_binary_path, set_custom_media_tool_paths,
 };
 #[cfg(target_arch = "wasm32")]
 pub use web::{

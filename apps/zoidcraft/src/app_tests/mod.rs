@@ -47,6 +47,7 @@ fn make_headless_app_for_test() -> ZoidCraftApp {
         last_audio_fps: fps,
         last_audio_seq_len: seq_len,
         ffmpeg_probe_rx: None,
+        ffmpeg_setup: FfmpegSetupState::default(),
         pending_media_imports: Vec::new(),
         active_export: None,
         retired_exports: Vec::new(),

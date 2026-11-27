@@ -14,6 +14,7 @@ use super::objects3d::{SceneConstraintExportCtx, serialize_object3d, serialize_o
 use super::tracks::{
     finite_f64, remap_json_value, remap_str, serialize_dynamic_group, serialize_dynamic_track,
     serialize_keyframe, serialize_property_track, serialize_property_value,
+    serialize_static_or_animated_track,
 };
 
 pub(super) fn serialize_markers_track(seq: &Sequence) -> Value {
@@ -782,7 +783,7 @@ pub(super) fn serialize_layer(
                 );
                 child_props.insert(
                     "zoidiumBackdropOpacity".to_owned(),
-                    serialize_property_value(&bd.opacity.value, remap),
+                    serialize_static_or_animated_track(&bd.opacity, remap),
                 );
             }
             let constraint_ctx = SceneConstraintExportCtx::from_objects(objects);
@@ -989,7 +990,8 @@ pub(super) fn serialize_mask_path_track(
     }
 
     let mut obj = Map::new();
-    obj.insert("animated".to_owned(), Value::Bool(track.animated));
+    let is_animated = track.animated || track.keyframes.len() > 1;
+    obj.insert("animated".to_owned(), Value::Bool(is_animated));
     if let Some(expr) = &track.expression {
         obj.insert("expression".to_owned(), Value::String(expr.clone()));
     }

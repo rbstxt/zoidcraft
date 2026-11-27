@@ -39,12 +39,15 @@ pub struct Scene3DRenderer {
     pub(crate) dof_composite_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     pub(crate) optical_flare_bgl: wgpu::BindGroupLayout,
     pub(crate) optical_flare_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    pub(crate) cube_to_equirect_bgl: wgpu::BindGroupLayout,
+    pub(crate) cube_to_equirect_pipeline: wgpu::RenderPipeline,
     pub(crate) custom_material_shaders: HashMap<String, wgpu::ShaderModule>,
     pub(crate) custom_material_pipelines: HashMap<CustomMaterialPipelineKey, wgpu::RenderPipeline>,
     pub(crate) glsl_custom_xform_bgl: wgpu::BindGroupLayout,
     pub(crate) glsl_custom_shaders: HashMap<String, RegisteredGlslCustom3D>,
     pub(crate) glsl_custom_pipelines: HashMap<CustomMaterialPipelineKey, wgpu::RenderPipeline>,
     pub(crate) shadow_map_size_2d: u32,
+    pub(crate) point_shadow_map_size: u32,
     pub(crate) _shadow_maps_2d_tex: wgpu::Texture,
     pub(crate) shadow_maps_2d_array_view: wgpu::TextureView,
     pub(crate) shadow_maps_2d_layer_views: Vec<wgpu::TextureView>,
@@ -122,6 +125,12 @@ impl Scene3DRenderer {
                 label: Some("zc-render scene3d optical flare wgsl"),
                 source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(OPTICAL_FLARE_WGSL)),
             });
+        let cube_to_equirect_shader =
+            ctx.device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("zc-render scene3d cube to equirect wgsl"),
+                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(CUBE_TO_EQUIRECT_WGSL)),
+                });
 
         let shadow_pipeline_current =
             create_shadow_pipeline(ctx, &shadow_shader, CompatMode::Current);
@@ -151,6 +160,49 @@ impl Scene3DRenderer {
         );
         let dof_composite_bgl = create_dof_composite_bind_group_layout(ctx);
         let optical_flare_bgl = create_optical_flare_bind_group_layout(ctx);
+        let cube_face_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let cube_to_equirect_bgl =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("zc-render cube to equirect bgl"),
+                    entries: &[
+                        cube_face_entry(0),
+                        cube_face_entry(1),
+                        cube_face_entry(2),
+                        cube_face_entry(3),
+                        cube_face_entry(4),
+                        cube_face_entry(5),
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 6,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+        let cube_to_equirect_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("zc-render cube to equirect pipeline layout"),
+                    bind_group_layouts: &[Some(&cube_to_equirect_bgl)],
+                    immediate_size: 0,
+                });
+        let cube_to_equirect_pipeline = create_fullscreen_pipeline(
+            ctx,
+            Some(&cube_to_equirect_layout),
+            &cube_to_equirect_shader,
+            wgpu::TextureFormat::Rgba8Unorm,
+            "zc-render cube to equirect pipeline",
+        );
         let glsl_custom_xform_bgl =
             ctx.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -168,6 +220,7 @@ impl Scene3DRenderer {
                 });
 
         let initial_shadow_size = clamp_shadow_map_size(ctx, SHADOW_MAP_SIZE);
+        let initial_point_shadow_size = clamp_shadow_map_size(ctx, POINT_SHADOW_MAP_SIZE).min(2048);
         let (shadow_maps_2d_tex, shadow_maps_2d_array_view, shadow_maps_2d_layer_views) =
             create_depth_array_texture(
                 ctx,
@@ -178,7 +231,7 @@ impl Scene3DRenderer {
         let (point_shadow_maps_tex, point_shadow_maps_array_view, point_shadow_maps_layer_views) =
             create_depth_array_texture(
                 ctx,
-                POINT_SHADOW_MAP_SIZE,
+                initial_point_shadow_size,
                 (MAX_POINT_SHADOW_LIGHTS * 6) as u32,
                 "zc-render point shadow map array",
             );
@@ -367,12 +420,15 @@ impl Scene3DRenderer {
             dof_composite_pipelines: HashMap::new(),
             optical_flare_bgl,
             optical_flare_pipelines: HashMap::new(),
+            cube_to_equirect_bgl,
+            cube_to_equirect_pipeline,
             custom_material_shaders: HashMap::new(),
             custom_material_pipelines: HashMap::new(),
             glsl_custom_xform_bgl,
             glsl_custom_shaders: HashMap::new(),
             glsl_custom_pipelines: HashMap::new(),
             shadow_map_size_2d: initial_shadow_size,
+            point_shadow_map_size: initial_point_shadow_size,
             _shadow_maps_2d_tex: shadow_maps_2d_tex,
             shadow_maps_2d_array_view,
             shadow_maps_2d_layer_views,
@@ -404,10 +460,12 @@ impl Scene3DRenderer {
         self.shadow_map_size_2d
     }
 
-    /// Dynamically resizes the 2D directional/spot shadow map texture array (`0` resets to
-    /// [`SHADOW_MAP_SIZE`]; values are safely clamped to `[256, min(4096, max_texture_dimension_2d)]`).
+    /// Dynamically resizes the 2D directional/spot shadow map texture array AND the omni
+    /// PointLight cube-face shadow array (`0` resets to [`SHADOW_MAP_SIZE`] / [`POINT_SHADOW_MAP_SIZE`];
+    /// values are safely clamped to `[256, min(4096, max_texture_dimension_2d)]` for 2D and
+    /// `[256, min(2048, max_texture_dimension_2d)]` per cube face for point lights).
     pub fn set_shadow_map_size(&mut self, ctx: &GpuContext, requested_size: u32) {
-        let target = clamp_shadow_map_size(
+        let target_2d = clamp_shadow_map_size(
             ctx,
             if requested_size == 0 {
                 SHADOW_MAP_SIZE
@@ -415,21 +473,45 @@ impl Scene3DRenderer {
                 requested_size
             },
         );
-        if target == self.shadow_map_size_2d {
-            return;
-        }
-        let (tex, array_view, layer_views) = create_depth_array_texture(
+        let target_point = clamp_shadow_map_size(
             ctx,
-            target,
-            MAX_SHADOW_MAPS_2D as u32,
-            "zc-render 2d shadow map array",
-        );
-        self._shadow_maps_2d_tex = tex;
-        self.shadow_maps_2d_array_view = array_view;
-        self.shadow_maps_2d_layer_views = layer_views;
-        self.shadow_map_size_2d = target;
-        self.shadow_initialized = false;
-        self.shadow_2d_dirty = [false; MAX_SHADOW_MAPS_2D];
+            if requested_size == 0 {
+                POINT_SHADOW_MAP_SIZE
+            } else {
+                requested_size
+            },
+        )
+        .min(2048);
+
+        if target_2d != self.shadow_map_size_2d {
+            let (tex, array_view, layer_views) = create_depth_array_texture(
+                ctx,
+                target_2d,
+                MAX_SHADOW_MAPS_2D as u32,
+                "zc-render 2d shadow map array",
+            );
+            self._shadow_maps_2d_tex = tex;
+            self.shadow_maps_2d_array_view = array_view;
+            self.shadow_maps_2d_layer_views = layer_views;
+            self.shadow_map_size_2d = target_2d;
+            self.shadow_initialized = false;
+            self.shadow_2d_dirty = [false; MAX_SHADOW_MAPS_2D];
+        }
+
+        if target_point != self.point_shadow_map_size {
+            let (tex, array_view, layer_views) = create_depth_array_texture(
+                ctx,
+                target_point,
+                (MAX_POINT_SHADOW_LIGHTS * 6) as u32,
+                "zc-render point shadow map array",
+            );
+            self._point_shadow_maps_tex = tex;
+            self.point_shadow_maps_array_view = array_view;
+            self.point_shadow_maps_layer_views = layer_views;
+            self.point_shadow_map_size = target_point;
+            self.shadow_initialized = false;
+            self.point_shadow_dirty = [false; MAX_POINT_SHADOW_LIGHTS];
+        }
     }
 
     /// Renders a 3D scene into premultiplied RGBA `color_target` with
@@ -518,6 +600,28 @@ impl Scene3DRenderer {
         ext: &Scene3DExtendedOptions<'_>,
         preserve_depth: bool,
     ) -> Result<(), RenderError> {
+        self.render_scene_with_aabbs(
+            ctx,
+            color_target,
+            depth_target,
+            input,
+            ext,
+            &[],
+            preserve_depth,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_scene_with_aabbs(
+        &mut self,
+        ctx: &GpuContext,
+        color_target: &RenderTarget,
+        depth_target: &RenderTarget,
+        input: &Scene3DPassInput<'_>,
+        ext: &Scene3DExtendedOptions<'_>,
+        mesh_world_aabbs: &[([f32; 3], [f32; 3])],
+        preserve_depth: bool,
+    ) -> Result<(), RenderError> {
         let options = &ext.base;
         if depth_target.format != wgpu::TextureFormat::Depth32Float {
             return Err(RenderError::UnsupportedFormat(depth_target.format));
@@ -533,9 +637,14 @@ impl Scene3DRenderer {
             self.set_shadow_map_size(ctx, ext.shadow_map_size);
         }
 
-        let dof_active = options
-            .dof
-            .filter(|d| d.enabled && d.aperture > 0.0 && !input.editing_camera);
+        let dof_active = options.dof.filter(|d| {
+            d.enabled
+                && d.aperture.is_finite()
+                && d.aperture > 0.0
+                && ((d.near_blur_level.is_finite() && d.near_blur_level > 0.0)
+                    || (d.far_blur_level.is_finite() && d.far_blur_level > 0.0))
+                && !input.editing_camera
+        });
         if dof_active.is_some() {
             self.ensure_dof_targets(
                 ctx,
@@ -589,7 +698,12 @@ impl Scene3DRenderer {
         }
 
         // Assign up to MAX_SHADOW_MAPS_2D Spot/Directional and MAX_POINT_SHADOW_LIGHTS Point casters.
-        let shadow_assign = assign_shadow_lights(input.lights, input.meshes, input.compat_mode);
+        let shadow_assign = assign_shadow_lights_with_aabbs(
+            input.lights,
+            input.meshes,
+            mesh_world_aabbs,
+            input.compat_mode,
+        );
 
         let mut encoder = ctx
             .device
@@ -695,12 +809,13 @@ impl Scene3DRenderer {
         }
 
         // Build scene uniform buffer shared across all mesh draw calls.
-        let scene_uniforms = build_scene_uniforms(
+        let scene_uniforms = build_scene_uniforms_with_sizes(
             &input.camera,
             input.lights,
             &shadow_assign,
             options.linear_lighting,
             self.shadow_map_size_2d,
+            self.point_shadow_map_size,
         );
         let scene_ubo = create_uniform_buffer(
             ctx,
@@ -1223,6 +1338,77 @@ impl Scene3DRenderer {
         self.msaa_attachments = None;
     }
 
+    /// Converts 6 rendered cube-face textures (`+X, -X, +Y, -Y, +Z, -Z`) into a single
+    /// equirectangular environment map (`Rgba8Unorm`) matching `SCENE3D_WGSL` reflection UVs.
+    pub(crate) fn render_cube_faces_to_equirect(
+        &self,
+        ctx: &GpuContext,
+        faces: [&RenderTarget; 6],
+        dst: &RenderTarget,
+    ) {
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zc-render cube to equirect bg"),
+            layout: &self.cube_to_equirect_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&faces[0].view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&faces[1].view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&faces[2].view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&faces[3].view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&faces[4].view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&faces[5].view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.clamp_sampler),
+                },
+            ],
+        });
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("zc-render cube to equirect encoder"),
+            });
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("zc-render cube to equirect pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &dst.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rpass.set_pipeline(&self.cube_to_equirect_pipeline);
+            rpass.set_bind_group(0, &bg, &[]);
+            rpass.draw(0..3, 0..1);
+        }
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+    }
+
     fn ensure_msaa_attachments(&mut self, ctx: &GpuContext, width: u32, height: u32) {
         let size = wgpu::Extent3d {
             width,
@@ -1562,6 +1748,31 @@ impl Scene3DRenderer {
         shader_key: &str,
         draw: &GlslCustomMaterial3DDrawCall<'_>,
     ) -> Result<(), RenderError> {
+        let empty: BTreeMap<String, &wgpu::TextureView> = BTreeMap::new();
+        self.render_glsl_custom_material_mesh_with_textures(
+            ctx,
+            color_target,
+            depth_target,
+            camera,
+            shader_key,
+            draw,
+            &empty,
+        )
+    }
+
+    /// Draws a 3D mesh using a registered GLSL ES 1.00 custom material shader with explicit
+    /// named `sampler2D` texture bindings (falling back to `fallback_white` only when unbound).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_glsl_custom_material_mesh_with_textures(
+        &mut self,
+        ctx: &GpuContext,
+        color_target: &RenderTarget,
+        depth_target: &RenderTarget,
+        camera: &CameraParams,
+        shader_key: &str,
+        draw: &GlslCustomMaterial3DDrawCall<'_>,
+        textures: &BTreeMap<String, &wgpu::TextureView>,
+    ) -> Result<(), RenderError> {
         if depth_target.format != wgpu::TextureFormat::Depth32Float {
             return Err(RenderError::UnsupportedFormat(depth_target.format));
         }
@@ -1609,9 +1820,19 @@ impl Scene3DRenderer {
             });
         }
         for tb in &entry.texture_bindings {
+            let resolved_view = textures
+                .get(&tb.name)
+                .copied()
+                .or_else(|| {
+                    textures
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&tb.name))
+                        .map(|(_, v)| *v)
+                })
+                .unwrap_or(&self.fallback_white.view);
             frag_bg_entries.push(wgpu::BindGroupEntry {
                 binding: tb.texture_binding,
-                resource: wgpu::BindingResource::TextureView(&self.fallback_white.view),
+                resource: wgpu::BindingResource::TextureView(resolved_view),
             });
             frag_bg_entries.push(wgpu::BindGroupEntry {
                 binding: tb.sampler_binding,
@@ -2167,6 +2388,30 @@ impl Scene3DRenderer {
                 },
                 alpha: wgpu::BlendComponent {
                     src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+            ParticleBlend::Subtractive => wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::ReverseSubtract,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+            ParticleBlend::Multiply => wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Dst,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
                     dst_factor: wgpu::BlendFactor::One,
                     operation: wgpu::BlendOperation::Add,
                 },

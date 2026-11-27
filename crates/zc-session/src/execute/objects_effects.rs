@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
+use zc_plugin::catalog::ShaderPackParamKind;
 
 use crate::Session;
 use crate::commands::Command;
@@ -10,11 +11,11 @@ use crate::document::{
 };
 use crate::plugin_defaults::{
     canonicalize_object_3d_kind, default_particles_data, insert_default_expresstext_properties,
-    insert_default_optical_flare_properties, insert_default_repeater_properties,
-    insert_default_text_plus_properties, insert_default_trapcode_properties,
-    is_3d_camera_plus_kind, is_3d_container_kind, is_3d_expresstext_plus_kind,
-    is_3d_optical_flare_kind, is_3d_repeater_kind, is_3d_text_plus_kind, is_3d_trapcode_kind,
-    plugin_light_kind,
+    insert_default_geometry_plus_properties, insert_default_optical_flare_properties,
+    insert_default_repeater_properties, insert_default_text_plus_properties,
+    insert_default_trapcode_properties, is_3d_camera_plus_kind, is_3d_container_kind,
+    is_3d_expresstext_plus_kind, is_3d_optical_flare_kind, is_3d_repeater_kind,
+    is_3d_text_plus_kind, is_3d_trapcode_kind, plugin_light_kind,
 };
 use crate::property_conv::property_track_to_session;
 use crate::sync_from_project::effect_kind_to_session_id;
@@ -437,6 +438,7 @@ impl Session {
                             }
                             _ => {}
                         }
+                        insert_default_geometry_plus_properties(&canonical_kind, &mut properties);
                         if let Some(shape_idx) = poly_shape_opt {
                             properties.insert(
                                 "polyhedron.shape".to_string(),
@@ -727,13 +729,19 @@ impl Session {
                 let is_effect_group = kind_trimmed.eq_ignore_ascii_case("group")
                     || kind_trimmed.eq_ignore_ascii_case("effectgroup")
                     || kind_trimmed.eq_ignore_ascii_case("effect_group");
-                let template = if is_custom_shader || is_effect_group {
+                let shader_pack_fx = if is_custom_shader || is_effect_group {
+                    None
+                } else {
+                    self.plugins.find_shader_pack_effect(kind_trimmed)
+                };
+                let template = if is_custom_shader || is_effect_group || shader_pack_fx.is_some() {
                     None
                 } else {
                     zc_project::create_effect_by_id(kind_trimmed)
                 };
                 if !is_custom_shader
                     && !is_effect_group
+                    && shader_pack_fx.is_none()
                     && template.is_none()
                     && !is_valid_namespaced_plugin_effect_id(kind_trimmed)
                 {
@@ -742,13 +750,10 @@ impl Session {
                     )));
                 }
                 let new_fx_id = self.alloc_uuid_id();
-                let (track, clip_idx) = self
-                    .document
-                    .find_clip_mut(&clip_id)
-                    .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
-                let clip = &mut track.clips[clip_idx];
                 let fx_name = name.unwrap_or_else(|| {
-                    if is_custom_shader {
+                    if let Some(pack_fx) = shader_pack_fx {
+                        pack_fx.name.to_owned()
+                    } else if is_custom_shader {
                         "Custom Shader".to_owned()
                     } else if is_effect_group {
                         "Effect Group".to_owned()
@@ -763,7 +768,7 @@ impl Session {
                         .map_or_else(|| kind_trimmed.to_owned(), |d| d.display_name.to_owned())
                     }
                 });
-                let mut resolved_kind = if is_custom_shader {
+                let mut resolved_kind = if is_custom_shader || shader_pack_fx.is_some() {
                     "customshader".to_owned()
                 } else if is_effect_group {
                     "effectgroup".to_owned()
@@ -771,11 +776,68 @@ impl Session {
                     kind_trimmed.to_owned()
                 };
                 let mut properties = BTreeMap::new();
+                let mut pack_meta: Vec<(String, BTreeMap<String, Value>)> = Vec::new();
                 properties.insert(
                     "enabled".to_string(),
                     SessionProperty::static_value(json!(1)),
                 );
-                if is_custom_shader {
+                if let Some(pack_fx) = shader_pack_fx {
+                    properties.insert(
+                        "fragShader".to_string(),
+                        SessionProperty::static_value_with_kind(
+                            json!(pack_fx.frag_shader),
+                            SessionValueKind::Text,
+                        ),
+                    );
+                    for param in pack_fx.params {
+                        let (val_kind, shader_kind_str) = match param.kind {
+                            ShaderPackParamKind::Float => (SessionValueKind::Number, "slider"),
+                            ShaderPackParamKind::Int => (SessionValueKind::Number, "int"),
+                            ShaderPackParamKind::Bool => (SessionValueKind::Bool, "toggle"),
+                            ShaderPackParamKind::Vec2 => (SessionValueKind::Vec2, "vec2"),
+                            ShaderPackParamKind::Vec3 => (SessionValueKind::Vec3, "vec3"),
+                            ShaderPackParamKind::Vec4 => (SessionValueKind::Vec4, "vec4"),
+                            ShaderPackParamKind::Color => (SessionValueKind::Color, "color"),
+                            ShaderPackParamKind::Angle => (SessionValueKind::Number, "angle"),
+                            ShaderPackParamKind::Option => (SessionValueKind::Option, "dropdown"),
+                        };
+                        let mut prop = SessionProperty::static_value_with_kind(
+                            param.default.to_json(),
+                            val_kind,
+                        );
+                        prop.expression = param.expression.map(str::to_owned);
+                        properties.insert(param.name.to_owned(), prop);
+
+                        let mut z_shader = serde_json::Map::new();
+                        z_shader.insert("kind".to_owned(), json!(shader_kind_str));
+                        z_shader.insert("label".to_owned(), json!(param.label));
+                        if let Some(min) = param.min {
+                            z_shader.insert("min".to_owned(), json!(min));
+                        }
+                        if let Some(max) = param.max {
+                            z_shader.insert("max".to_owned(), json!(max));
+                            if param.kind == ShaderPackParamKind::Option
+                                && max.is_finite()
+                                && (1.0..=16.0).contains(&max)
+                            {
+                                let count = max.round() as usize + 1;
+                                let opt_items: Vec<String> =
+                                    (0..count).map(|i| format!("Mode {i}")).collect();
+                                z_shader.insert("items".to_owned(), json!(opt_items));
+                            }
+                        }
+                        let mut meta = BTreeMap::new();
+                        meta.insert("label".to_owned(), json!(param.label));
+                        meta.insert(
+                            "type".to_owned(),
+                            json!({
+                                "dynamic": true,
+                                "zoidiumShader": Value::Object(z_shader),
+                            }),
+                        );
+                        pack_meta.push((param.name.to_owned(), meta));
+                    }
+                } else if is_custom_shader {
                     let default_frag = "uniform sampler2D tDiffuse;\nvarying vec2 vUv;\n\nvoid main() {\n    gl_FragColor = texture2D(tDiffuse, vUv);\n}\n";
                     properties.insert(
                         "fragShader".to_string(),
@@ -790,16 +852,29 @@ impl Session {
                         properties.insert(k.clone(), property_track_to_session(tr));
                     }
                 }
-                clip.effects.push(SessionEffect {
-                    id: new_fx_id.clone(),
-                    kind: resolved_kind.clone(),
-                    name: fx_name.clone(),
-                    source_id: None,
-                    properties,
-                });
+                {
+                    let (track, clip_idx) = self
+                        .document
+                        .find_clip_mut(&clip_id)
+                        .ok_or_else(|| SessionError::NotFound(format!("clip '{clip_id}'")))?;
+                    let clip = &mut track.clips[clip_idx];
+                    clip.effects.push(SessionEffect {
+                        id: new_fx_id.clone(),
+                        kind: resolved_kind.clone(),
+                        name: fx_name.clone(),
+                        source_id: None,
+                        properties,
+                    });
+                }
+                for (prop_name, meta) in pack_meta {
+                    self.document
+                        .set_property_metadata(new_fx_id.clone(), prop_name, meta);
+                }
                 // Auto-enable required built-in plugin atomically inside this undo snapshot
                 // (matching `clipboard.paste_pz_json`).
-                let required_plugin: Option<String> = if let Some(rest) = resolved_kind
+                let required_plugin: Option<String> = if let Some(pack_fx) = shader_pack_fx {
+                    Some(pack_fx.plugin_id.to_owned())
+                } else if let Some(rest) = resolved_kind
                     .strip_prefix("zoidium:")
                     .or_else(|| resolved_kind.strip_prefix("zoidcraft:"))
                 {
@@ -902,5 +977,126 @@ impl Session {
             }
             _ => unreachable!("dispatched by execute_inner"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_object_3d_populates_geometry_plus_lathe_and_superquadric_defaults() {
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+
+        let lathe_res = session
+            .execute(Command::AddObject3D {
+                clip_id: clip_id.clone(),
+                parent_id: None,
+                kind: "zoidium:geometry-plus/lathe".to_owned(),
+                name: Some("Vase".to_owned()),
+            })
+            .expect("add lathe");
+        let lathe_id = lathe_res["object_id"].as_str().expect("lathe id");
+
+        let sq_res = session
+            .execute(Command::AddObject3D {
+                clip_id: clip_id.clone(),
+                parent_id: None,
+                kind: "zoidium:geometry-plus/superquadric".to_owned(),
+                name: Some("Superball".to_owned()),
+            })
+            .expect("add superquadric");
+        let sq_id = sq_res["object_id"].as_str().expect("sq id");
+
+        let clip = &session.document().video_tracks[0].clips[0];
+        let lathe = clip
+            .objects_3d
+            .iter()
+            .find(|o| o.id == lathe_id)
+            .expect("lathe object");
+        assert!(lathe.properties.contains_key("lathe.points"));
+        assert_eq!(lathe.properties["lathe.segments"].default_value, json!(24));
+        assert_eq!(
+            lathe.properties["lathe.phiLength"].default_value,
+            json!(360.0)
+        );
+        assert!(lathe.properties.contains_key("material.color"));
+
+        let sq = clip
+            .objects_3d
+            .iter()
+            .find(|o| o.id == sq_id)
+            .expect("superquadric object");
+        assert_eq!(
+            sq.properties["superquadric.radius"].default_value,
+            json!([10.0, 10.0, 10.0])
+        );
+        assert_eq!(
+            sq.properties["superquadric.eastWest"].default_value,
+            json!(1.0)
+        );
+        assert_eq!(
+            sq.properties["superquadric.northSouth"].default_value,
+            json!(1.0)
+        );
+        assert!(sq.properties.contains_key("material.color"));
+    }
+
+    #[test]
+    fn add_effect_instantiates_enabled_shader_pack_effect_with_glsl_params_and_metadata() {
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+
+        // Disabled Shader Pack effect (bare ID) is rejected before enabling the pack.
+        let disabled_err = session.execute(Command::AddEffect {
+            clip_id: clip_id.clone(),
+            kind: "afterclip-warp-wavy-extended".to_owned(),
+            name: None,
+        });
+        assert!(
+            disabled_err.is_err(),
+            "bare Shader Pack ID must fail while its pack plugin is disabled"
+        );
+
+        // Enable `afterclip` and instantiate via namespaced ID.
+        session
+            .execute(Command::EnablePlugin {
+                plugin_id: "afterclip".to_owned(),
+            })
+            .expect("enable afterclip");
+
+        let res = session
+            .execute(Command::AddEffect {
+                clip_id: clip_id.clone(),
+                kind: "zoidcraft:afterclip/afterclip-warp-wavy-extended".to_owned(),
+                name: None,
+            })
+            .expect("add afterclip shader pack effect");
+        assert_eq!(res["kind"], json!("customshader"));
+        let fx_id = res["effect_id"].as_str().expect("effect id").to_owned();
+
+        let fx = session.document().video_tracks[0].clips[0]
+            .effects
+            .iter()
+            .find(|e| e.id == fx_id)
+            .expect("created effect");
+        assert_eq!(fx.kind, "customshader");
+        let frag = fx.properties["fragShader"]
+            .default_value
+            .as_str()
+            .expect("fragShader string");
+        assert!(frag.contains("gl_FragColor"));
+        assert_eq!(
+            fx.properties["Time"].expression.as_deref(),
+            Some("time"),
+            "Shader Pack parameter expression must be populated"
+        );
+        let time_meta = session
+            .document()
+            .property_metadata(&fx_id, "Time")
+            .expect("Time metadata");
+        assert_eq!(time_meta["label"], json!("Time"));
+        assert_eq!(time_meta["type"]["zoidiumShader"]["kind"], json!("slider"));
     }
 }

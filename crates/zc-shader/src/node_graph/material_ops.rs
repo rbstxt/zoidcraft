@@ -409,6 +409,7 @@ pub(super) struct FractalParams {
     pub(super) seed: i32,
     pub(super) brightness: f64,
     pub(super) contrast: f64,
+    pub(super) roughness: f64,
     pub(super) transform: u8,
 }
 
@@ -482,7 +483,7 @@ pub(super) fn eval_fractal_buffer(
             }
         }
         total += amp;
-        amp *= 0.5;
+        amp *= fp.roughness.clamp(0.05, 0.99);
         freq_x = freq_x.saturating_mul(2);
         freq_y = freq_y.saturating_mul(2);
     }
@@ -524,7 +525,7 @@ pub(super) fn eval_voronoi_buffers(
     tracker: &Arc<BakeMemoryTracker>,
 ) -> Result<(MatBuf, MatBuf, MatBuf), String> {
     let scale = param_f64(params, &["scale"], 5.0).clamp(0.01, 64.0);
-    let randomness = param_f64(params, &["randomness"], 1.0).clamp(0.0, 1.0);
+    let randomness = param_f64(params, &["randomness", "jitter"], 1.0).clamp(0.0, 1.0);
     let seed = param_f64(params, &["seed"], 1.0).round() as i32;
     let feature = if let Some(s) = param_str(params, &["feature", "mode"]) {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -799,6 +800,7 @@ pub(super) fn normalize_material_node_type(raw: &str) -> String {
         "randomcolor" | "random_color" => "randomColor".to_string(),
         "bump" | "heighttonormal" | "height_to_normal" => "bump".to_string(),
         "fresnel" => "fresnel".to_string(),
+        "image" | "imagetexture" | "image_texture" | "texture" => "image".to_string(),
         other => other.to_string(),
     }
 }

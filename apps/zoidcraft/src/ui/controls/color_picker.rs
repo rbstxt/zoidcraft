@@ -1,8 +1,8 @@
 //! HSVA color picker popover.
 
 use crate::ui::theme::{
-    BG_INPUT, BG_PANEL, BORDER_CONTROL, Cm3Icon, Cm3Theme, FONT_BODY, TEXT_BRIGHT, TEXT_PRIMARY,
-    rgb_to_color32, rgba_to_color32,
+    BG_INPUT, BG_PANEL, BORDER_CONTROL, Cm3Icon, Cm3Theme, FONT_BODY, FONT_COMPACT, TEXT_BRIGHT,
+    TEXT_MUTED, TEXT_PRIMARY, rgb_to_color32, rgba_to_color32,
 };
 use egui::{
     Area, Color32, CornerRadius, CursorIcon, Frame, Id, Key, Mesh, Order, Painter, Pos2, Rect,
@@ -89,6 +89,59 @@ pub fn read_recent_swatches(ui: &mut Ui) -> Vec<Rgb> {
     ui.data_mut(|d| d.get_persisted::<Vec<Rgb>>(key))
         .filter(|v| v.len() == 36)
         .unwrap_or_else(default_recent_swatches)
+}
+
+const EYEDROPPER_LAST_SAMPLED_KEY: &str = "zc_eyedropper_last_sampled_color_v1";
+
+/// Stores the most recently sampled eyedropper color in egui memory so any color picker
+/// across panels or floating pro editors can reuse it immediately.
+pub fn store_sampled_eyedropper_color(ctx: &egui::Context, color: Rgba) {
+    ctx.data_mut(|d| {
+        d.insert_temp(Id::unique(EYEDROPPER_LAST_SAMPLED_KEY), color);
+    });
+}
+
+/// Reads the most recently sampled eyedropper color from shared egui memory.
+#[must_use]
+pub fn read_last_sampled_eyedropper_color(ctx: &egui::Context) -> Option<Rgba> {
+    ctx.data(|d| d.get_temp::<Rgba>(Id::unique(EYEDROPPER_LAST_SAMPLED_KEY)))
+}
+
+/// Delivers a sampled color to a specific [`cm3_hsva_color_picker`] instance ID so it is applied
+/// automatically on its next frame.
+pub fn deliver_eyedropper_sample(ctx: &egui::Context, picker_id: Id, color: Rgba) {
+    store_sampled_eyedropper_color(ctx, color);
+    ctx.data_mut(|d| {
+        d.insert_temp(picker_id.with("eyedropper_delivered_color"), color);
+    });
+}
+
+/// Consumes any pending delivered eyedropper sample for `picker_id`.
+pub fn take_eyedropper_sample(ctx: &egui::Context, picker_id: Id) -> Option<Rgba> {
+    let slot = picker_id.with("eyedropper_delivered_color");
+    ctx.data_mut(|d| {
+        let val = d.get_temp::<Rgba>(slot);
+        if val.is_some() {
+            d.remove_temp::<Rgba>(slot);
+        }
+        val
+    })
+}
+
+/// Opens the built-in interactive eyedropper sampler popover for `picker_id`.
+/// Useful for callers that wire `ev.eyedropper_clicked` without viewport pixel capture.
+pub fn request_eyedropper_sampler(ctx: &egui::Context, picker_id: Id) {
+    ctx.data_mut(|d| {
+        d.insert_temp(picker_id.with("eyedropper_sampler_open"), true);
+    });
+}
+
+/// Marks that an external caller (e.g. viewport pixel eyedropper) already took ownership of the
+/// eyedropper interaction for `picker_id` so the built-in fallback popover stays closed.
+pub fn dismiss_eyedropper_sampler(ctx: &egui::Context, picker_id: Id) {
+    ctx.data_mut(|d| {
+        d.insert_temp(picker_id.with("eyedropper_sampler_open"), false);
+    });
 }
 
 pub fn format_picker_css(c: Rgba, has_alpha: bool) -> String {
@@ -252,6 +305,11 @@ pub fn cm3_hsva_color_picker(
     CM3_ROW_HAS_COLOR_PICKER.with(|f| f.set(true));
     let mut ev = ColorPickerEvent::default();
     let popup_id = id.with("hsva_popup");
+    let sampler_open_id = id.with("eyedropper_sampler_open");
+    let mut sampler_open = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(sampler_open_id))
+        .unwrap_or(false);
     let mut state = ui
         .data_mut(|d| d.get_temp::<ColorPopupState>(popup_id))
         .unwrap_or_else(|| ColorPopupState {
@@ -263,11 +321,29 @@ pub fn cm3_hsva_color_picker(
             dirty: false,
         });
 
+    // Apply any externally delivered eyedropper sample for this picker ID.
+    if !read_only && let Some(delivered) = take_eyedropper_sample(ui.ctx(), id) {
+        *color = if has_alpha {
+            delivered
+        } else {
+            delivered.rgb().with_alpha(1.0)
+        };
+        state.hsv = color.rgb().to_hsv();
+        state.alpha = if has_alpha { color.a() } else { 1.0 };
+        state.hex_buf = format_picker_css(*color, has_alpha);
+        state.dirty = false;
+        sampler_open = false;
+        push_recent_swatch(ui, color.rgb());
+        ev.changed = true;
+        ev.committed = true;
+    }
+
     // If read_only (e.g. expression toggled on) flips true while the popup is open,
     // immediately close, restore initial color if dirty, and emit cancelled so any open tx closes.
-    if read_only && state.open {
+    if read_only && (state.open || sampler_open) {
         let was_dirty = state.dirty;
         state.open = false;
+        sampler_open = false;
         if was_dirty {
             *color = state.initial;
             state.hsv = state.initial.rgb().to_hsv();
@@ -282,6 +358,8 @@ pub fn cm3_hsva_color_picker(
     }
 
     let mut swatch_rect = Rect::NOTHING;
+    let mut eyedropper_rect = Rect::NOTHING;
+    let mut opened_sampler_this_frame = false;
 
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -317,6 +395,7 @@ pub fn cm3_hsva_color_picker(
             if !read_only {
                 let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
                 if resp.clicked() {
+                    sampler_open = false;
                     if !state.open {
                         state.open = true;
                         state.initial = *color;
@@ -338,15 +417,28 @@ pub fn cm3_hsva_color_picker(
                 }
 
                 // Eyedropper (17x17 px, 9px right of swatch)
+                let eye_origin = ui.cursor().min;
+                eyedropper_rect = Rect::from_min_size(eye_origin, Vec2::splat(17.0));
                 if cm3_icon_button(
                     ui,
                     Cm3Icon::Eyedropper,
                     17.0,
-                    TEXT_PRIMARY,
-                    "pick color from viewport",
+                    if sampler_open {
+                        theme.accent()
+                    } else {
+                        TEXT_PRIMARY
+                    },
+                    "pick color from viewport or sampler",
                     theme,
                 ) {
                     ev.eyedropper_clicked = true;
+                    sampler_open = !sampler_open;
+                    opened_sampler_this_frame = sampler_open;
+                    if sampler_open {
+                        state.open = false;
+                    } else {
+                        clear_transient_popover_open_if_stale(ui.ctx());
+                    }
                 }
             }
         });
@@ -686,10 +778,280 @@ pub fn cm3_hsva_color_picker(
         }
     }
 
-    if state.open && !read_only {
+    // Built-in interactive eyedropper sampler popover (recent colors, active palette,
+    // shared last-sampled color, and interactive continuous spectrum strip).
+    if sampler_open && !read_only && swatch_rect != Rect::NOTHING {
+        let sampler_area_id = id.with("eyedropper_sampler_area");
+        let last_sampled = read_last_sampled_eyedropper_color(ui.ctx());
+        let swatches = read_recent_swatches(ui);
+        let has_last = last_sampled.is_some();
+        let popup_size = Vec2::new(236.0, if has_last { 164.0 } else { 140.0 });
+        let pos = clamp_popup_pos(swatch_rect, popup_size, viewport_rect);
+        let mut picked_rgb: Option<Rgb> = None;
+        let mut hovered_rgb: Option<Rgb> = None;
+        let mut close_sampler = false;
+
+        let area_resp = Area::new(sampler_area_id)
+            .order(Order::Foreground)
+            .fixed_pos(pos)
+            .interactable(true)
+            .show(ui.ctx(), |ui| {
+                let outer_rect = Rect::from_min_size(pos, popup_size);
+                let _ = ui.allocate_space(popup_size);
+                ui.painter()
+                    .rect_filled(outer_rect, CornerRadius::ZERO, BG_PANEL);
+
+                let content_rect = outer_rect.shrink(6.0);
+                let mut content_ui = ui.new_child(
+                    UiBuilder::new()
+                        .id_salt(sampler_area_id.with("content"))
+                        .max_rect(content_rect)
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                );
+                content_ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+
+                // Header: Title + live preview hex + close
+                content_ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Eyedropper Sampler")
+                            .font(theme.font(FONT_COMPACT))
+                            .color(TEXT_BRIGHT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").clicked() {
+                            close_sampler = true;
+                        }
+                        let [r, g, b] = color.rgb().to_u8();
+                        ui.label(
+                            egui::RichText::new(format!("#{r:02x}{g:02x}{b:02x}"))
+                                .font(theme.font(FONT_COMPACT))
+                                .color(TEXT_MUTED),
+                        );
+                    });
+                });
+
+                // Optional shared last-sampled pill
+                if let Some(last) = last_sampled {
+                    let lrgb = last.rgb();
+                    let (row_r, row_resp) = content_ui
+                        .allocate_exact_size(Vec2::new(content_rect.width(), 18.0), Sense::click());
+                    let sw_r = Rect::from_min_size(
+                        Pos2::new(row_r.left(), row_r.top() + 2.0),
+                        Vec2::new(26.0, 14.0),
+                    );
+                    content_ui.painter().rect_filled(
+                        sw_r,
+                        CornerRadius::ZERO,
+                        rgb_to_color32(lrgb),
+                    );
+                    paint_crisp_border_1px(
+                        content_ui.painter(),
+                        sw_r,
+                        if row_resp.hovered() {
+                            TEXT_BRIGHT
+                        } else {
+                            BORDER_CONTROL
+                        },
+                    );
+                    let [r, g, b] = lrgb.to_u8();
+                    content_ui.painter().text(
+                        Pos2::new(sw_r.right() + 6.0, row_r.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        format!("Last sampled  #{r:02x}{g:02x}{b:02x}"),
+                        theme.font(FONT_COMPACT),
+                        if row_resp.hovered() {
+                            TEXT_BRIGHT
+                        } else {
+                            TEXT_PRIMARY
+                        },
+                    );
+                    let row_resp = row_resp.on_hover_cursor(CursorIcon::PointingHand);
+                    if row_resp.hovered() {
+                        hovered_rgb = Some(lrgb);
+                    }
+                    if row_resp.clicked() {
+                        picked_rgb = Some(lrgb);
+                    }
+                }
+
+                // Continuous horizontal spectrum strip (click or drag to sample any hue/brightness)
+                let (strip_raw, strip_resp) = content_ui.allocate_exact_size(
+                    Vec2::new(content_rect.width(), 22.0),
+                    Sense::click_and_drag(),
+                );
+                let strip_rect = snap_rect_px(strip_raw);
+                let stops = [
+                    Color32::from_rgb(255, 0, 0),
+                    Color32::from_rgb(255, 255, 0),
+                    Color32::from_rgb(0, 255, 0),
+                    Color32::from_rgb(0, 255, 255),
+                    Color32::from_rgb(0, 0, 255),
+                    Color32::from_rgb(255, 0, 255),
+                    Color32::from_rgb(255, 0, 0),
+                ];
+                let mut mesh = Mesh::default();
+                let seg_w = strip_rect.width() / 6.0;
+                for i in 0..6 {
+                    let x0 = strip_rect.left() + seg_w * i as f32;
+                    let x1 = strip_rect.left() + seg_w * (i + 1) as f32;
+                    let tl = mesh.vertices.len() as u32;
+                    mesh.colored_vertex(Pos2::new(x0, strip_rect.top()), stops[i]);
+                    let tr = mesh.vertices.len() as u32;
+                    mesh.colored_vertex(Pos2::new(x1, strip_rect.top()), stops[i + 1]);
+                    let br = mesh.vertices.len() as u32;
+                    mesh.colored_vertex(Pos2::new(x1, strip_rect.bottom()), stops[i + 1]);
+                    let bl = mesh.vertices.len() as u32;
+                    mesh.colored_vertex(Pos2::new(x0, strip_rect.bottom()), stops[i]);
+                    mesh.add_triangle(tl, tr, br);
+                    mesh.add_triangle(tl, br, bl);
+                }
+                content_ui.painter().add(Shape::mesh(mesh));
+                paint_crisp_border_1px(content_ui.painter(), strip_rect, BORDER_CONTROL);
+                let strip_resp = strip_resp.on_hover_cursor(CursorIcon::Crosshair);
+                if let Some(p) = strip_resp
+                    .hover_pos()
+                    .or_else(|| strip_resp.interact_pointer_pos())
+                    && strip_rect.contains(p)
+                {
+                    let h = ((p.x - strip_rect.left()) / strip_rect.width().max(1.0))
+                        .clamp(0.0, 0.9999);
+                    let v = (1.0
+                        - ((p.y - strip_rect.top()) / strip_rect.height().max(1.0)) * 0.45)
+                        .clamp(0.2, 1.0);
+                    let sampled = Rgb::from_hsv(Hsv { h, s: 0.9, v });
+                    hovered_rgb = Some(sampled);
+                    if strip_resp.clicked() || strip_resp.drag_stopped() {
+                        picked_rgb = Some(sampled);
+                    }
+                }
+
+                // Recent colors row (12 slots from swatches[24..36])
+                content_ui.label(
+                    egui::RichText::new("Recent & Active Palette")
+                        .font(theme.font(FONT_COMPACT))
+                        .color(TEXT_MUTED),
+                );
+                let draw_swatch_row =
+                    |ui: &mut Ui,
+                     row_tag: &str,
+                     slice: &[Rgb],
+                     hovered_rgb: &mut Option<Rgb>,
+                     picked_rgb: &mut Option<Rgb>| {
+                        let count = slice.len().max(1);
+                        let gap = 2.0_f32;
+                        let total_w = content_rect.width();
+                        let cell_w =
+                            ((total_w - gap * (count as f32 - 1.0)) / count as f32).max(10.0);
+                        let (row_rect, _) =
+                            ui.allocate_exact_size(Vec2::new(total_w, 18.0), Sense::hover());
+                        for (idx, &sw_rgb) in slice.iter().enumerate() {
+                            let x0 = (row_rect.left() + idx as f32 * (cell_w + gap)).round();
+                            let s_rect = Rect::from_min_size(
+                                Pos2::new(x0, row_rect.top()),
+                                Vec2::new(cell_w.round().max(8.0), 18.0),
+                            );
+                            let s_resp = ui
+                                .interact(
+                                    s_rect,
+                                    sampler_area_id.with((row_tag, idx)),
+                                    Sense::click(),
+                                )
+                                .on_hover_cursor(CursorIcon::PointingHand);
+                            ui.painter().rect_filled(
+                                s_rect,
+                                CornerRadius::ZERO,
+                                rgb_to_color32(sw_rgb),
+                            );
+                            if s_resp.hovered() {
+                                paint_crisp_border_1px(ui.painter(), s_rect, TEXT_BRIGHT);
+                                *hovered_rgb = Some(sw_rgb);
+                            }
+                            if s_resp.clicked() {
+                                *picked_rgb = Some(sw_rgb);
+                            }
+                        }
+                    };
+                if swatches.len() >= 36 {
+                    draw_swatch_row(
+                        &mut content_ui,
+                        "recent",
+                        &swatches[24..36],
+                        &mut hovered_rgb,
+                        &mut picked_rgb,
+                    );
+                    draw_swatch_row(
+                        &mut content_ui,
+                        "hues",
+                        &swatches[0..12],
+                        &mut hovered_rgb,
+                        &mut picked_rgb,
+                    );
+                    draw_swatch_row(
+                        &mut content_ui,
+                        "grays",
+                        &swatches[12..24],
+                        &mut hovered_rgb,
+                        &mut picked_rgb,
+                    );
+                }
+
+                if let Some(hrgb) = hovered_rgb {
+                    let chip_rect = Rect::from_min_size(
+                        Pos2::new(outer_rect.right() - 78.0, outer_rect.top() + 7.0),
+                        Vec2::new(12.0, 12.0),
+                    );
+                    ui.painter()
+                        .rect_filled(chip_rect, CornerRadius::ZERO, rgb_to_color32(hrgb));
+                    paint_crisp_border_1px(ui.painter(), chip_rect, TEXT_BRIGHT);
+                }
+
+                paint_crisp_border_1px(ui.painter(), outer_rect, theme.accent());
+            });
+
+        if let Some(rgb) = picked_rgb {
+            state.hsv = rgb.to_hsv();
+            *color = rgb.with_alpha(if has_alpha { state.alpha } else { 1.0 });
+            state.hex_buf = format_picker_css(*color, has_alpha);
+            state.dirty = false;
+            sampler_open = false;
+            push_recent_swatch(ui, rgb);
+            store_sampled_eyedropper_color(ui.ctx(), *color);
+            clear_transient_popover_open_if_stale(ui.ctx());
+            ev.changed = true;
+            ev.committed = true;
+        } else {
+            let mut cancel_sampler = false;
+            ui.input(|i| {
+                if i.key_pressed(Key::Escape) {
+                    cancel_sampler = true;
+                } else if !opened_sampler_this_frame
+                    && i.pointer.primary_pressed()
+                    && i.pointer.interact_pos().is_some_and(|p| {
+                        !area_resp.response.rect.contains(p)
+                            && !swatch_rect.contains(p)
+                            && !eyedropper_rect.contains(p)
+                    })
+                {
+                    close_sampler = true;
+                }
+            });
+            if cancel_sampler {
+                sampler_open = false;
+                ev.cancelled = true;
+                consume_transient_popover_escape(ui.ctx());
+            } else if close_sampler {
+                sampler_open = false;
+                clear_transient_popover_open_if_stale(ui.ctx());
+            }
+        }
+    }
+
+    if (state.open || sampler_open) && !read_only {
         mark_transient_popover_open(ui.ctx());
     }
 
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(sampler_open_id, sampler_open));
     ui.data_mut(|d| d.insert_temp(popup_id, state));
     ev
 }

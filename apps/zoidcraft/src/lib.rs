@@ -10,6 +10,8 @@
 
 mod audio_playback;
 mod export_worker;
+#[cfg(not(target_arch = "wasm32"))]
+mod ffmpeg_setup;
 mod media_import;
 mod preferences;
 mod project_io;
@@ -23,6 +25,8 @@ mod web;
 
 use audio_playback::*;
 use export_worker::*;
+#[cfg(not(target_arch = "wasm32"))]
+use ffmpeg_setup::*;
 use media_import::*;
 use preferences::{
     UserPreferences, apply_default_project_fps, default_preferences_path, preferences_fingerprint,
@@ -93,9 +97,9 @@ use zc_project::{export_pz, import_pz, load_zcraft, save_zcraft, write_atomic};
 
 use zc_render::scene3d::mat4_perspective_rh;
 
-use zc_render::{
-    CameraParams, ProjectRenderEngine, RenderError, RenderOverrides, RenderTarget, encode_png,
-};
+#[cfg(any(test, target_arch = "wasm32"))]
+use zc_render::encode_png;
+use zc_render::{CameraParams, ProjectRenderEngine, RenderError, RenderOverrides, RenderTarget};
 
 #[cfg(not(target_arch = "wasm32"))]
 use zc_render::{readback_rgba8, unpremultiply_rgba8};
@@ -177,6 +181,9 @@ struct ZoidCraftApp {
     /// Non-blocking startup `ffmpeg -version` probe channel.
     #[cfg(not(target_arch = "wasm32"))]
     ffmpeg_probe_rx: Option<Receiver<Result<String, ExportError>>>,
+    /// On-demand "No FFmpeg Inside" setup banner, modal dialog, and background installer state.
+    #[cfg(not(target_arch = "wasm32"))]
+    ffmpeg_setup: FfmpegSetupState,
     /// In-flight background video imports processed off the UI thread.
     pending_media_imports: Vec<PendingMediaImport>,
     #[cfg(target_arch = "wasm32")]
@@ -294,7 +301,11 @@ impl eframe::App for ZoidCraftApp {
         }
         self.workspace.suppress_shortcuts = self.pending_unsaved_dialog.is_some();
         #[cfg(not(target_arch = "wasm32"))]
-        self.poll_ffmpeg_probe(&ctx);
+        {
+            self.workspace.suppress_shortcuts |= self.ffmpeg_setup.open;
+            self.poll_ffmpeg_probe(&ctx);
+            self.poll_ffmpeg_install(&ctx);
+        }
         #[cfg(target_arch = "wasm32")]
         self.poll_web_tasks(&ctx);
         self.poll_pending_media_imports(&ctx);
@@ -387,23 +398,26 @@ impl eframe::App for ZoidCraftApp {
                     }
                 }
             } else {
-                // Guard unmodified `C` and `L` when Timeline has focus so Timeline-scoped
-                // shortcuts are not hijacked by global playback/camera bindings.
+                // Guard unmodified `C` when Timeline has focus (and Graph Editor is not focused)
+                // so Timeline's razor/cut shortcut is not hijacked by the global Editing Camera toggle.
+                let graph_editor_focused =
+                    self.graph_editor.open && self.graph_editor.window_focused;
                 let stashed_timeline_keys = if self.workspace.focused_panel == PanelFocus::Timeline
+                    && !graph_editor_focused
                 {
                     let mut stashed = Vec::new();
                     ctx.input_mut(|i| {
                         i.events.retain(|ev| {
-                            let is_unmodified_cl = matches!(
+                            let is_unmodified_c = matches!(
                                 ev,
                                 egui::Event::Key {
-                                    key: Key::C | Key::L,
+                                    key: Key::C,
                                     pressed: true,
                                     modifiers,
                                     ..
                                 } if !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift
                             );
-                            if is_unmodified_cl {
+                            if is_unmodified_c {
                                 stashed.push(ev.clone());
                                 false
                             } else {
@@ -475,6 +489,8 @@ impl eframe::App for ZoidCraftApp {
             [0; 9]
         };
         let pre_ui_preview_quality = self.workspace.player_plus.preview_quality;
+        let pre_ui_exact_effects = self.workspace.player_plus.exact_effects;
+        let pre_ui_sharp_upscale = self.workspace.player_plus.sharp_upscale;
         let pre_ui_selection_hash = compute_editing_selection_hash(&self.session);
         let pre_ui_selected_scene3d = selected_single_scene3d_clip_uuid(&self.session);
 
@@ -504,6 +520,9 @@ impl eframe::App for ZoidCraftApp {
         let draw_tool_before_ui = self.viewport.active_draw_tool;
         self.workspace.viewport_draw_tool = draw_tool_before_ui;
         self.workspace.external_shortcuts_dispatched = true;
+        let fps_overlay_before_ui = self.workspace.panels.app_settings.show_fps_overlay;
+        self.viewport.show_fps_overlay = fps_overlay_before_ui;
+        let graph_focused_for_timeline = self.graph_editor.open && self.graph_editor.window_focused;
 
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(BG_SUNKEN))
@@ -511,8 +530,6 @@ impl eframe::App for ZoidCraftApp {
                 let palette = self.theme.palette;
                 self.viewport.transparency_grid = self.workspace.transparency_grid;
                 self.viewport.motion_path_visible = self.workspace.motion_path_visible;
-                self.viewport.show_fps_overlay =
-                    self.workspace.panels.app_settings.show_fps_overlay;
                 self.workspace.graph_open = self.graph_editor.open;
                 let viewport_state = &mut self.viewport;
                 let timeline_state = &mut self.timeline;
@@ -530,7 +547,8 @@ impl eframe::App for ZoidCraftApp {
                             viewport_force_refresh = true;
                         }
                     },
-                    |tl_ui, _tl_rect, _focused, session| {
+                    |tl_ui, _tl_rect, focused, session| {
+                        timeline_state.focused = focused && !graph_focused_for_timeline;
                         let tl_action = show_timeline(tl_ui, session, timeline_state, &palette);
                         if tl_action.open_graph_editor_for.is_some() {
                             open_graph_target = tl_action.open_graph_editor_for;
@@ -549,6 +567,16 @@ impl eframe::App for ZoidCraftApp {
             .commit_default_fps_on_blur(&ctx, &mut self.session, settings_visible);
         if viewport_force_refresh {
             self.force_single_render = true;
+        }
+
+        // Bidirectional FPS badge sync: Settings toggle propagates into viewport, while clicking
+        // the viewport FPS badge to hide it propagates back into AppSettings (and persists via save_user_preferences).
+        if self.workspace.panels.app_settings.show_fps_overlay != fps_overlay_before_ui {
+            self.viewport.show_fps_overlay = self.workspace.panels.app_settings.show_fps_overlay;
+            ctx.request_repaint();
+        } else if self.viewport.show_fps_overlay != fps_overlay_before_ui {
+            self.workspace.panels.app_settings.show_fps_overlay = self.viewport.show_fps_overlay;
+            ctx.request_repaint();
         }
 
         // Bidirectional draw-tool sync: toolbar clicks propagate into viewport; viewport mutations propagate back.
@@ -622,6 +650,14 @@ impl eframe::App for ZoidCraftApp {
                 #[cfg(not(target_arch = "wasm32"))]
                 UiAction::OpenOutputFolder(path) => self.handle_open_output_folder(&path),
                 #[cfg(not(target_arch = "wasm32"))]
+                UiAction::OpenFfmpegSetup => self.open_ffmpeg_setup_modal(),
+                #[cfg(not(target_arch = "wasm32"))]
+                UiAction::BrowseFfmpegBinary => self.handle_browse_ffmpeg_binary(),
+                #[cfg(not(target_arch = "wasm32"))]
+                UiAction::ClearFfmpegBinary => self.handle_clear_ffmpeg_binary(),
+                #[cfg(not(target_arch = "wasm32"))]
+                UiAction::ReprobeFfmpeg => self.trigger_ffmpeg_reprobe(),
+                #[cfg(not(target_arch = "wasm32"))]
                 UiAction::SaveRecoverySnapshotNow => self.handle_save_recovery_snapshot_now(),
                 #[cfg(not(target_arch = "wasm32"))]
                 UiAction::RestoreRecoverySnapshot(path) => {
@@ -687,6 +723,9 @@ impl eframe::App for ZoidCraftApp {
                 &mut self.workspace.panels.floating_windows,
                 &mut self.workspace.panels.node_graph_editor,
                 &mut self.workspace.panels.looks_editor,
+                &mut self.workspace.panels.effect_setup_editor,
+                &mut self.workspace.panels.lens_flare_options,
+                &mut self.workspace.panels.particle_designer,
                 &mut self.session,
                 &self.theme,
             );
@@ -727,6 +766,8 @@ impl eframe::App for ZoidCraftApp {
             && (!pre_ui_editing_camera
                 || pack_camera_bits(&self.viewport.camera) == pre_ui_camera_bits)
             && self.workspace.player_plus.preview_quality == pre_ui_preview_quality
+            && self.workspace.player_plus.exact_effects == pre_ui_exact_effects
+            && self.workspace.player_plus.sharp_upscale == pre_ui_sharp_upscale
             && compute_editing_selection_hash(&self.session) == pre_ui_selection_hash
             && selected_single_scene3d_clip_uuid(&self.session) == pre_ui_selected_scene3d;
         let needs_viewport_repaint = if single_requested {
@@ -750,6 +791,11 @@ impl eframe::App for ZoidCraftApp {
         // `self.viewport.show_fps_overlay`.)
         self.show_unsaved_changes_modal(&ctx);
         self.show_status_overlays(&ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.show_ffmpeg_setup_banner(&ctx);
+            self.show_ffmpeg_setup_modal(&ctx);
+        }
         self.update_window_title(&ctx);
         self.save_user_preferences(false);
         #[cfg(target_arch = "wasm32")]
@@ -872,6 +918,23 @@ impl ZoidCraftApp {
 
         #[cfg(not(target_arch = "wasm32"))]
         let probe_rx = {
+            let custom_ffmpeg = workspace
+                .panels
+                .app_settings
+                .ffmpeg_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+            let custom_ffprobe = workspace
+                .panels
+                .app_settings
+                .ffprobe_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+            zc_render::video::set_custom_media_tool_paths(custom_ffmpeg, custom_ffprobe);
             workspace.panels.export_status.ffmpeg_available = false;
             workspace.panels.export_status.ffmpeg_version = "checking...".to_owned();
             let (tx, rx) = mpsc::channel::<Result<String, ExportError>>();
@@ -918,6 +981,9 @@ impl ZoidCraftApp {
         #[cfg(target_arch = "wasm32")]
         let startup_recovery_banner = None;
 
+        let mut viewport = ViewportState::new();
+        viewport.show_fps_overlay = workspace.panels.app_settings.show_fps_overlay;
+
         Self {
             session,
             theme: theme.clone(),
@@ -925,7 +991,7 @@ impl ZoidCraftApp {
             workspace,
             timeline: TimelineViewState::new(),
             graph_editor: GraphEditorState::new(),
-            viewport: ViewportState::new(),
+            viewport,
             renderer,
             current_file: None,
             preferences_path: Some(preferences_path),
@@ -953,6 +1019,8 @@ impl ZoidCraftApp {
             last_audio_seq_len: init_seq_len,
             #[cfg(not(target_arch = "wasm32"))]
             ffmpeg_probe_rx: Some(probe_rx),
+            #[cfg(not(target_arch = "wasm32"))]
+            ffmpeg_setup: FfmpegSetupState::default(),
             pending_media_imports: Vec::new(),
             #[cfg(target_arch = "wasm32")]
             web: web::AppState::default(),

@@ -5,6 +5,7 @@ pub(super) struct UniformDecl {
     pub(super) name: String,
     pub(super) ty: UniformType,
     pub(super) array_len: Option<u32>,
+    pub(super) default_value: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -340,6 +341,7 @@ fn flatten_struct_uniform_fields(
                     name: member_prefix,
                     ty,
                     array_len: field.array_len,
+                    default_value: None,
                 });
             }
         } else if struct_defs.contains_key(&field.ty_name) {
@@ -460,6 +462,54 @@ fn parse_varying_decl(
     ))
 }
 
+fn format_initializer_tokens(tokens: &[Token]) -> String {
+    let mut out = String::new();
+    let mut prev: Option<&Token> = None;
+    for tok in tokens {
+        match tok {
+            Token::Newline | Token::Preprocessor(_) => {}
+            Token::Ident(s) | Token::Number(s) => {
+                if let Some(p) = prev {
+                    match p {
+                        Token::Ident(_) | Token::Number(_) => out.push(' '),
+                        Token::Punct(ps)
+                            if !matches!(ps.as_str(), "." | "(" | "[" | "!" | "~" | "-" | "+") =>
+                        {
+                            out.push(' ');
+                        }
+                        _ => {}
+                    }
+                }
+                out.push_str(s);
+                prev = Some(tok);
+            }
+            Token::Punct(s) => {
+                if let Some(p) = prev {
+                    let is_unary_sign = (s == "-" || s == "+")
+                        && matches!(p, Token::Punct(ps) if matches!(ps.as_str(), "(" | "[" | ","));
+                    let need_space = if is_unary_sign {
+                        matches!(p, Token::Punct(ps) if ps == ",")
+                    } else {
+                        match (p, s.as_str()) {
+                            (_, "." | ";" | "," | ")" | "]" | "(" | "[") => false,
+                            (Token::Punct(ps), _) if matches!(ps.as_str(), "." | "(" | "[") => {
+                                false
+                            }
+                            _ => true,
+                        }
+                    };
+                    if need_space {
+                        out.push(' ');
+                    }
+                }
+                out.push_str(s);
+                prev = Some(tok);
+            }
+        }
+    }
+    out.trim().to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_uniform_decl(
     tokens: &[Token],
@@ -520,18 +570,31 @@ fn parse_uniform_decl(
             i = next_non_newline(tokens, after_bracket);
         }
 
-        // Skip optional non-standard initializer `= ...` up to `,` or `;`
+        // Parse optional non-standard initializer `= ...` up to `,` or `;`
+        let mut default_value: Option<String> = None;
         if matches!(tokens.get(i), Some(Token::Punct(p)) if p == "=") {
-            i += 1;
+            i = next_non_newline(tokens, i + 1);
+            let expr_start = i;
             let mut paren_depth: usize = 0;
+            let mut bracket_depth: usize = 0;
             while i < tokens.len() {
                 match &tokens[i] {
                     Token::Punct(p) if p == "(" => paren_depth += 1,
                     Token::Punct(p) if p == ")" => paren_depth = paren_depth.saturating_sub(1),
-                    Token::Punct(p) if paren_depth == 0 && (p == "," || p == ";") => break,
+                    Token::Punct(p) if p == "[" => bracket_depth += 1,
+                    Token::Punct(p) if p == "]" => bracket_depth = bracket_depth.saturating_sub(1),
+                    Token::Punct(p)
+                        if paren_depth == 0 && bracket_depth == 0 && (p == "," || p == ";") =>
+                    {
+                        break;
+                    }
                     _ => {}
                 }
                 i += 1;
+            }
+            let rendered = format_initializer_tokens(&tokens[expr_start..i]);
+            if !rendered.is_empty() {
+                default_value = Some(rendered);
             }
         }
 
@@ -616,6 +679,7 @@ fn parse_uniform_decl(
                     name,
                     ty,
                     array_len,
+                    default_value,
                 });
             }
         }
@@ -704,6 +768,7 @@ pub(super) fn build_uniform_layout(
                 offset,
                 size,
                 array_stride: stride,
+                default_value: decl.default_value.clone(),
             });
         } else {
             let align = decl.ty.base_alignment();
@@ -733,6 +798,7 @@ pub(super) fn build_uniform_layout(
                 offset,
                 size,
                 array_stride: 0,
+                default_value: decl.default_value.clone(),
             });
         }
     }
@@ -754,7 +820,10 @@ pub(super) fn build_uniform_layout(
     })
 }
 
-pub(super) fn build_texture_bindings(samplers: &[String]) -> Vec<TextureBinding> {
+pub(super) fn build_texture_bindings(
+    samplers: &[String],
+    cube_samplers: &HashSet<String>,
+) -> Vec<TextureBinding> {
     let mut ordered: Vec<&String> = Vec::with_capacity(samplers.len());
     if let Some(diffuse) = samplers.iter().find(|s| s.as_str() == "tDiffuse") {
         ordered.push(diffuse);
@@ -773,15 +842,96 @@ pub(super) fn build_texture_bindings(samplers: &[String]) -> Vec<TextureBinding>
             let texture_binding = next_binding;
             let sampler_binding = next_binding + 1;
             next_binding += 2;
+            let is_cube = cube_samplers.contains(name);
             TextureBinding {
                 name: name.clone(),
                 group: 0,
                 texture_binding,
                 sampler_binding,
                 is_diffuse: name == "tDiffuse",
+                kind: if is_cube {
+                    TextureKind::TexCube
+                } else {
+                    TextureKind::Tex2D
+                },
+                is_cube,
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod decls_tests {
+    use super::*;
+
+    #[test]
+    fn parses_uniform_initializer_defaults_and_texture_kinds() {
+        let src = r#"
+            precision highp float;
+            uniform float Gain = 2.0;
+            uniform float Neg = -0.75, Plain;
+            uniform vec3 Tint = vec3(1.0, 0.5, 0.25);
+            uniform vec2 Broadcast = vec2(0.5);
+            uniform int Steps = -4;
+            uniform bool Enabled = true;
+            uniform sampler2D tDiffuse;
+            uniform samplerCube EnvMap;
+            varying vec2 vUv;
+            void main() {
+                vec4 a = texture2D(tDiffuse, vUv);
+                vec4 b = textureCube(EnvMap, vec3(vUv, 1.0));
+                float s = Enabled ? Gain + Neg + Plain + float(Steps) : 0.0;
+                gl_FragColor = vec4((a.rgb + b.rgb) * Tint + vec3(Broadcast, s * 0.01), 1.0);
+            }
+        "#;
+        let compiled = translate_glsl_es100(src).expect("uniform defaults must compile");
+
+        let gain = compiled.uniform_layout.field("Gain").unwrap();
+        assert_eq!(gain.default_value.as_deref(), Some("2.0"));
+        assert_eq!(gain.parsed_default_value(), Some(UniformValue::Float(2.0)));
+
+        let neg = compiled.uniform_layout.field("Neg").unwrap();
+        assert_eq!(neg.default_value.as_deref(), Some("-0.75"));
+        assert_eq!(neg.parsed_default_value(), Some(UniformValue::Float(-0.75)));
+
+        let plain = compiled.uniform_layout.field("Plain").unwrap();
+        assert_eq!(plain.default_value, None);
+        assert_eq!(plain.parsed_default_value(), None);
+
+        let tint = compiled.uniform_layout.field("Tint").unwrap();
+        assert_eq!(
+            tint.parsed_default_value(),
+            Some(UniformValue::Vec3([1.0, 0.5, 0.25]))
+        );
+
+        let broadcast = compiled.uniform_layout.field("Broadcast").unwrap();
+        assert_eq!(
+            broadcast.parsed_default_value(),
+            Some(UniformValue::Vec2([0.5, 0.5]))
+        );
+
+        let steps = compiled.uniform_layout.field("Steps").unwrap();
+        assert_eq!(steps.parsed_default_value(), Some(UniformValue::Int(-4)));
+
+        let enabled = compiled.uniform_layout.field("Enabled").unwrap();
+        assert_eq!(
+            enabled.parsed_default_value(),
+            Some(UniformValue::Bool(true))
+        );
+
+        assert_eq!(compiled.texture_bindings.len(), 2);
+        let td = &compiled.texture_bindings[0];
+        assert_eq!(td.name, "tDiffuse");
+        assert!(td.is_diffuse);
+        assert!(!td.is_cube);
+        assert_eq!(td.kind, TextureKind::Tex2D);
+
+        let env = &compiled.texture_bindings[1];
+        assert_eq!(env.name, "EnvMap");
+        assert!(!env.is_diffuse);
+        assert!(env.is_cube);
+        assert_eq!(env.kind, TextureKind::TexCube);
+    }
 }
 
 // ---------------------------------------------------------------------------

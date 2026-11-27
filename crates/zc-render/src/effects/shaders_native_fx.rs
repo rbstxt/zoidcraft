@@ -324,9 +324,9 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 /// Key Cleaner (`keycleaner`).
-/// Matches Zoidium `plugins/native-fx/shaders/fx_keycleaner.glsl` + `keycleaner.js`:
-/// Bounded 5x5 chatter alpha smoothing + 5x5 Gaussian edge decontamination + alpha contrast.
-/// `p0 = [chatter, contrast, strength, estSigma]`, `p1 = [estStep, 0, 0, 0]`.
+/// Variance-adaptive 5x5 chatter alpha stabilization + up to 24px multi-ring radial
+/// edge decontamination + alpha contrast.
+/// `p0 = [chatter, contrast, strength, estSigma]`, `p1 = [estStep, edgeRadiusPx, 0, 0]`.
 pub const SHADER_KEY_CLEANER: &str = r#"
 @fragment
 fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
@@ -338,38 +338,74 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
 
     let chatter = u.p0.x;
     let contrast = u.p0.y;
-    let strength = u.p0.z;
+    let strength = clamp(u.p0.z, 0.0, 1.0);
     let est_sigma = u.p0.w;
-    let est_step = u.p1.x;
+    let edge_rad = clamp(select(est_sigma * 2.0, u.p1.y, u.p1.y > 0.0), 0.0, 24.0);
 
     if (chatter > 0.5) {
-        var sum = 0.0;
+        // Pass 1: estimate local 5x5 alpha mean and variance to isolate chattering edges.
+        var sum_a = 0.0;
+        var sum_a2 = 0.0;
         for (var j: i32 = -2; j <= 2; j = j + 1) {
             for (var i: i32 = -2; i <= 2; i = i + 1) {
                 let s_uv = clamp(in_v.v_uv + vec2<f32>(f32(i), f32(j)) * texel, vec2<f32>(0.0), vec2<f32>(1.0));
-                sum = sum + sample_diffuse(s_uv).a;
+                let sa = max(sample_diffuse(s_uv).a, 0.0);
+                sum_a = sum_a + sa;
+                sum_a2 = sum_a2 + sa * sa;
             }
         }
-        na = clamp((sum / 25.0 - 0.5) * 1.5 + 0.5, 0.0, 1.0);
-    }
+        let mean_a = sum_a / 25.0;
+        let var_a = max(sum_a2 / 25.0 - mean_a * mean_a, 0.0);
+        let range_denom = max(2.0 * var_a + 0.015, 0.015);
 
-    if (est_sigma > 1e-3 && strength > 1e-3 && a0 > 1e-4 && a0 < 0.999) {
-        let sig2 = 2.0 * est_sigma * est_sigma;
-        var csum = vec3<f32>(0.0);
-        var asum = 0.0;
+        // Pass 2: variance-adaptive bilateral stabilization preserving clean solid silhouettes.
+        var bsum = 0.0;
+        var wsum = 0.0;
         for (var j: i32 = -2; j <= 2; j = j + 1) {
             for (var i: i32 = -2; i <= 2; i = i + 1) {
-                let off = vec2<f32>(f32(i), f32(j)) * est_step * texel;
-                let d2 = f32(i * i + j * j) * est_step * est_step;
-                let w = exp(-d2 / sig2);
-                let q = sample_diffuse(clamp(in_v.v_uv + off, vec2<f32>(0.0), vec2<f32>(1.0)));
-                csum = csum + q.rgb * w;
-                asum = asum + max(q.a, 0.0) * w;
+                let s_uv = clamp(in_v.v_uv + vec2<f32>(f32(i), f32(j)) * texel, vec2<f32>(0.0), vec2<f32>(1.0));
+                let sa = max(sample_diffuse(s_uv).a, 0.0);
+                let d2 = f32(i * i + j * j);
+                let da = sa - a0;
+                let w = exp(-d2 / 4.5) * exp(-(da * da) / range_denom);
+                bsum = bsum + sa * w;
+                wsum = wsum + w;
             }
         }
-        if (asum > 1e-4) {
-            let t = strength * (1.0 - a0);
-            c = c + (csum / asum - c) * t;
+        let stab_a = bsum / max(wsum, EPS);
+        let chatter_w = smoothstep(0.002, 0.05, var_a) * (1.0 - abs(a0 * 2.0 - 1.0) * 0.45);
+        let tightened = clamp((stab_a - 0.5) * (1.0 + 0.5 * chatter_w) + 0.5, 0.0, 1.0);
+        na = clamp(mix(a0, tightened, clamp(0.35 + chatter_w * 0.65, 0.0, 1.0)), 0.0, 1.0);
+    }
+
+    // Up to 24px multi-ring radial distance search to decontaminate semi-transparent edges
+    // toward clean opaque interior foreground pixels.
+    if (edge_rad > 1e-3 && strength > 1e-3 && a0 > 1e-4 && a0 < 0.999) {
+        let sigma = max(edge_rad * 0.45, 0.75);
+        let inv2s2 = 0.5 / (sigma * sigma);
+        var csum = vec3<f32>(0.0);
+        var wsum = 0.0;
+        var ring_fracs = array<f32, 3>(0.28, 0.62, 1.0);
+        for (var ring: i32 = 0; ring < 3; ring = ring + 1) {
+            let r_px = edge_rad * ring_fracs[ring];
+            let w_spat = exp(-(r_px * r_px) * inv2s2);
+            let ang_off = f32(ring) * (PI / 12.0);
+            for (var k: i32 = 0; k < 8; k = k + 1) {
+                let ang = f32(k) * (TAU / 8.0) + ang_off;
+                let off = vec2<f32>(cos(ang), sin(ang)) * r_px * texel;
+                let q = sample_diffuse(clamp(in_v.v_uv + off, vec2<f32>(0.0), vec2<f32>(1.0)));
+                let qa = max(q.a, 0.0);
+                if (qa > EPS) {
+                    let q_str = clamp(q.rgb / qa, vec3<f32>(0.0), vec3<f32>(1.0));
+                    let w_fg = w_spat * pow(qa, 1.5);
+                    csum = csum + q_str * w_fg;
+                    wsum = wsum + w_fg;
+                }
+            }
+        }
+        if (wsum > 1e-4) {
+            let t = clamp(strength * (1.0 - a0), 0.0, 1.0);
+            c = mix(c, csum / wsum, t);
         }
     }
 
@@ -1128,20 +1164,23 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     if (soft_px <= 0.0) {
         shadow = rs_shadow_at(luv);
     } else {
+        // 25-tap jittered golden-angle Poisson/Vogel disk blur for ghost-free soft shadows.
         let res = max(u.resolution, vec2<f32>(1.0));
-        let step_uv = vec2<f32>(soft_px * 0.125 / res.x, soft_px * 0.125 / res.y);
+        let inv_res = vec2<f32>(1.0) / res;
+        let jitter = hash12(floor(luv * res) + vec2<f32>(u.frame * 0.37, 13.7)) * TAU;
+        let max_r = soft_px * 0.45;
         var sum = vec4<f32>(0.0);
         var wsum = 0.0;
-        for (var j: i32 = -2; j <= 2; j = j + 1) {
-            let wj = select(select(1.0, 4.0, j == -1 || j == 1), 6.0, j == 0);
-            for (var i: i32 = -2; i <= 2; i = i + 1) {
-                let wi = select(select(1.0, 4.0, i == -1 || i == 1), 6.0, i == 0);
-                let w = wi * wj;
-                sum = sum + rs_shadow_at(luv + vec2<f32>(f32(i), f32(j)) * step_uv) * w;
-                wsum = wsum + w;
-            }
+        for (var i: i32 = 0; i < 25; i = i + 1) {
+            let fi = f32(i);
+            let r_norm = sqrt((fi + 0.5) / 25.0);
+            let ang = fi * 2.39996323 + jitter;
+            let off_uv = vec2<f32>(cos(ang), sin(ang)) * (r_norm * max_r) * inv_res;
+            let w = exp(-2.2 * r_norm * r_norm);
+            sum = sum + rs_shadow_at(luv + off_uv) * w;
+            wsum = wsum + w;
         }
-        shadow = sum / max(wsum, 1.0);
+        shadow = sum / max(wsum, EPS);
     }
 
     if ((u.flags & 1u) != 0u) {
@@ -1191,6 +1230,71 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
 /// - `1`: Straight-color interpolation (unpremult -> mix RGB & A -> premult).
 /// - `2`: Bidirectional optical-flow warp blend between frame A and frame B at `frac`.
 pub const SHADER_FRAME_MIX: &str = r#"
+fn fm_rgba_diff(a: vec4<f32>, b: vec4<f32>) -> f32 {
+    let d = abs(a - b);
+    return dot(d.rgb, vec3<f32>(0.299, 0.587, 0.114)) + d.a * 0.5;
+}
+
+fn fm_sym_cost(
+    uv: vec2<f32>,
+    v_px: vec2<f32>,
+    t: f32,
+    inv_res: vec2<f32>,
+    patch_r: f32,
+) -> f32 {
+    let lo = 0.5 * inv_res;
+    let hi = vec2<f32>(1.0) - lo;
+    let v_uv = v_px * inv_res;
+    let ua = uv - v_uv * t;
+    let ub = uv + v_uv * (1.0 - t);
+    if (ua.x < 0.0 || ua.x > 1.0 || ua.y < 0.0 || ua.y > 1.0
+        || ub.x < 0.0 || ub.x > 1.0 || ub.y < 0.0 || ub.y > 1.0) {
+        return 2.0;
+    }
+    let dx = vec2<f32>(inv_res.x * patch_r, 0.0);
+    let dy = vec2<f32>(0.0, inv_res.y * patch_r);
+    let d0 = fm_rgba_diff(sample_diffuse(clamp(ua, lo, hi)), sample_aux(clamp(ub, lo, hi)));
+    let dl = fm_rgba_diff(sample_diffuse(clamp(ua - dx, lo, hi)), sample_aux(clamp(ub - dx, lo, hi)));
+    let dr = fm_rgba_diff(sample_diffuse(clamp(ua + dx, lo, hi)), sample_aux(clamp(ub + dx, lo, hi)));
+    let du = fm_rgba_diff(sample_diffuse(clamp(ua - dy, lo, hi)), sample_aux(clamp(ub - dy, lo, hi)));
+    let dd = fm_rgba_diff(sample_diffuse(clamp(ua + dy, lo, hi)), sample_aux(clamp(ub + dy, lo, hi)));
+    return (d0 + dl + dr + du + dd) * 0.2;
+}
+
+fn fm_search_level(
+    uv: vec2<f32>,
+    init_px: vec2<f32>,
+    step_px: f32,
+    t: f32,
+    inv_res: vec2<f32>,
+    reg_pen: f32,
+) -> vec2<f32> {
+    let patch_r = max(1.0, step_px * 0.5);
+    var best_px = vec2<f32>(0.0);
+    var best_score = fm_sym_cost(uv, best_px, t, inv_res, patch_r);
+    if (length(init_px) > 1e-4) {
+        let init_score = fm_sym_cost(uv, init_px, t, inv_res, patch_r) + reg_pen * length(init_px);
+        if (init_score < best_score) {
+            best_score = init_score;
+            best_px = init_px;
+        }
+    }
+    for (var j: i32 = -1; j <= 1; j = j + 1) {
+        for (var i: i32 = -1; i <= 1; i = i + 1) {
+            if (i == 0 && j == 0) {
+                continue;
+            }
+            let cand_px = init_px + vec2<f32>(f32(i), f32(j)) * step_px;
+            let score = fm_sym_cost(uv, cand_px, t, inv_res, patch_r) + reg_pen * length(cand_px);
+            if (score < best_score) {
+                best_score = score;
+                best_px = cand_px;
+            }
+        }
+    }
+    return best_px;
+}
+
 @fragment
 fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     let a = sample_diffuse(in_v.v_uv);
@@ -1209,21 +1313,54 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
     }
 
     if (u.mode == 2u) {
-        // Bidirectional optical-flow warp blend for smooth slow-motion retiming.
-        let px = vec2<f32>(1.0) / max(u.resolution, vec2<f32>(1.0));
-        let step_uv = px * 2.0;
-        let l_r = luma601(sample_diffuse(clamp(in_v.v_uv + vec2<f32>(step_uv.x, 0.0), vec2<f32>(0.0), vec2<f32>(1.0))).rgb);
-        let l_l = luma601(sample_diffuse(clamp(in_v.v_uv - vec2<f32>(step_uv.x, 0.0), vec2<f32>(0.0), vec2<f32>(1.0))).rgb);
-        let l_u = luma601(sample_diffuse(clamp(in_v.v_uv + vec2<f32>(0.0, step_uv.y), vec2<f32>(0.0), vec2<f32>(1.0))).rgb);
-        let l_d = luma601(sample_diffuse(clamp(in_v.v_uv - vec2<f32>(0.0, step_uv.y), vec2<f32>(0.0), vec2<f32>(1.0))).rgb);
-        let gx = (l_r - l_l) * 0.5;
-        let gy = (l_u - l_d) * 0.5;
-        let dt = luma601(b.rgb) - luma601(a.rgb);
-        let denom = gx * gx + gy * gy + 0.004;
-        let flow = clamp(vec2<f32>(-dt * gx / denom, -dt * gy / denom) * step_uv * 4.0, vec2<f32>(-0.04), vec2<f32>(0.04));
-        let wa = sample_diffuse(clamp(in_v.v_uv - flow * t, vec2<f32>(0.0), vec2<f32>(1.0)));
-        let wb = sample_aux(clamp(in_v.v_uv + flow * (1.0 - t), vec2<f32>(0.0), vec2<f32>(1.0)));
-        let out_c = mix(wa, wb, t);
+        // Multi-scale coarse-to-fine block matching (16 -> 8 -> 4 -> 2 -> 1px)
+        // with bidirectional symmetric warp: mix(sample(prev, uv - t*v), sample(next, uv + (1-t)*v), t).
+        let res = max(u.resolution, vec2<f32>(1.0));
+        let inv_res = vec2<f32>(1.0) / res;
+        let lo = 0.5 * inv_res;
+        let hi = vec2<f32>(1.0) - lo;
+
+        let zero_fine = fm_sym_cost(in_v.v_uv, vec2<f32>(0.0), t, inv_res, 1.0);
+        let zero_coarse = fm_sym_cost(in_v.v_uv, vec2<f32>(0.0), t, inv_res, 4.0);
+        if (max(zero_fine, zero_coarse) < 0.012) {
+            let lin = a + (b - a) * t;
+            let la = clamp(lin.a, 0.0, 1.0);
+            return vec4<f32>(clamp(lin.rgb, vec3<f32>(0.0), vec3<f32>(la)), la);
+        }
+
+        let reg_pen = 0.002 / 32.0;
+        var best_px = vec2<f32>(0.0);
+        best_px = fm_search_level(in_v.v_uv, best_px, 16.0, t, inv_res, reg_pen);
+        best_px = fm_search_level(in_v.v_uv, best_px, 8.0, t, inv_res, reg_pen);
+        best_px = fm_search_level(in_v.v_uv, best_px, 4.0, t, inv_res, reg_pen);
+        best_px = fm_search_level(in_v.v_uv, best_px, 2.0, t, inv_res, reg_pen);
+        best_px = fm_search_level(in_v.v_uv, best_px, 1.0, t, inv_res, reg_pen);
+
+        // Parabolic sub-pixel refinement around integer match.
+        var vel_px = best_px;
+        let best_cost = fm_sym_cost(in_v.v_uv, best_px, t, inv_res, 1.0);
+        if (length(best_px) > 1e-4) {
+            let cmx = fm_sym_cost(in_v.v_uv, best_px - vec2<f32>(1.0, 0.0), t, inv_res, 1.0);
+            let cpx = fm_sym_cost(in_v.v_uv, best_px + vec2<f32>(1.0, 0.0), t, inv_res, 1.0);
+            let cmy = fm_sym_cost(in_v.v_uv, best_px - vec2<f32>(0.0, 1.0), t, inv_res, 1.0);
+            let cpy = fm_sym_cost(in_v.v_uv, best_px + vec2<f32>(0.0, 1.0), t, inv_res, 1.0);
+            let dx_den = cmx - 2.0 * best_cost + cpx;
+            let dy_den = cmy - 2.0 * best_cost + cpy;
+            if (dx_den > 1e-4) {
+                vel_px.x = vel_px.x + clamp(0.5 * (cmx - cpx) / dx_den, -0.5, 0.5);
+            }
+            if (dy_den > 1e-4) {
+                vel_px.y = vel_px.y + clamp(0.5 * (cmy - cpy) / dy_den, -0.5, 0.5);
+            }
+        }
+
+        let flow = vel_px * inv_res;
+        let wa = sample_diffuse(clamp(in_v.v_uv - flow * t, lo, hi));
+        let wb = sample_aux(clamp(in_v.v_uv + flow * (1.0 - t), lo, hi));
+        let warped = mix(wa, wb, t);
+        let linear = mix(a, b, t);
+        let warp_conf = 1.0 - smoothstep(0.28, 0.55, best_cost);
+        let out_c = mix(linear, warped, warp_conf);
         let out_a = clamp(out_c.a, 0.0, 1.0);
         return vec4<f32>(clamp(out_c.rgb, vec3<f32>(0.0), vec3<f32>(out_a)), out_a);
     }
@@ -1362,6 +1499,87 @@ fn ml_box(uv: vec2<f32>, r: f32, diag: bool, in_straight: bool) -> vec3<f32> {
     return acc / n;
 }
 
+fn ml_gaussian_13(uv: vec2<f32>, r: f32, in_straight: bool) -> vec3<f32> {
+    let inv_res = vec2<f32>(1.0) / max(u.resolution, vec2<f32>(1.0));
+    var acc = ml_tap(uv, in_straight);
+    var wsum = 1.0;
+    // Inner diamond ring (4 taps at 0.5*r)
+    let r1 = r * 0.5;
+    let w1 = exp(-0.5 * (0.5 / 0.55) * (0.5 / 0.55));
+    for (var k: i32 = 0; k < 4; k = k + 1) {
+        let ang = f32(k) * (PI * 0.5);
+        let off = vec2<f32>(cos(ang), sin(ang)) * r1 * inv_res;
+        acc = acc + ml_tap(uv + off, in_straight) * w1;
+        wsum = wsum + w1;
+    }
+    // Outer ring (8 taps at 1.0*r)
+    let w2 = exp(-0.5 * (1.0 / 0.55) * (1.0 / 0.55));
+    for (var k: i32 = 0; k < 8; k = k + 1) {
+        let ang = f32(k) * (TAU / 8.0) + (PI / 8.0);
+        let off = vec2<f32>(cos(ang), sin(ang)) * r * inv_res;
+        acc = acc + ml_tap(uv + off, in_straight) * w2;
+        wsum = wsum + w2;
+    }
+    return acc / max(wsum, EPS);
+}
+
+fn ml_gaussian_disk(uv: vec2<f32>, r: f32, rings: i32, in_straight: bool) -> vec3<f32> {
+    let inv_res = vec2<f32>(1.0) / max(u.resolution, vec2<f32>(1.0));
+    var acc = ml_tap(uv, in_straight);
+    var wsum = 1.0;
+    if (rings >= 3) {
+        // 3 concentric rings: 1 + 8 + 12 + 16 = 37 weighted Gaussian taps.
+        let w1 = exp(-0.5 * (0.35 / 0.52) * (0.35 / 0.52));
+        for (var k: i32 = 0; k < 8; k = k + 1) {
+            let ang = f32(k) * (TAU / 8.0);
+            acc = acc + ml_tap(uv + vec2<f32>(cos(ang), sin(ang)) * (r * 0.35) * inv_res, in_straight) * w1;
+            wsum = wsum + w1;
+        }
+        let w2 = exp(-0.5 * (0.68 / 0.52) * (0.68 / 0.52));
+        for (var k: i32 = 0; k < 12; k = k + 1) {
+            let ang = f32(k) * (TAU / 12.0) + (PI / 12.0);
+            acc = acc + ml_tap(uv + vec2<f32>(cos(ang), sin(ang)) * (r * 0.68) * inv_res, in_straight) * w2;
+            wsum = wsum + w2;
+        }
+        let w3 = exp(-0.5 * (1.0 / 0.52) * (1.0 / 0.52));
+        for (var k: i32 = 0; k < 16; k = k + 1) {
+            let ang = f32(k) * (TAU / 16.0) + (PI / 16.0);
+            acc = acc + ml_tap(uv + vec2<f32>(cos(ang), sin(ang)) * r * inv_res, in_straight) * w3;
+            wsum = wsum + w3;
+        }
+    } else {
+        // 2 concentric rings: 1 + 8 + 16 = 25 weighted Gaussian taps.
+        let w1 = exp(-0.5 * (0.48 / 0.55) * (0.48 / 0.55));
+        for (var k: i32 = 0; k < 8; k = k + 1) {
+            let ang = f32(k) * (TAU / 8.0);
+            acc = acc + ml_tap(uv + vec2<f32>(cos(ang), sin(ang)) * (r * 0.48) * inv_res, in_straight) * w1;
+            wsum = wsum + w1;
+        }
+        let w2 = exp(-0.5 * (1.0 / 0.55) * (1.0 / 0.55));
+        for (var k: i32 = 0; k < 16; k = k + 1) {
+            let ang = f32(k) * (TAU / 16.0) + (PI / 16.0);
+            acc = acc + ml_tap(uv + vec2<f32>(cos(ang), sin(ang)) * r * inv_res, in_straight) * w2;
+            wsum = wsum + w2;
+        }
+    }
+    return acc / max(wsum, EPS);
+}
+
+fn ml_gaussian_line(uv: vec2<f32>, r: f32, dir: vec2<f32>, falloff: f32, in_straight: bool) -> vec3<f32> {
+    let tx = vec2<f32>(1.0) / max(u.resolution, vec2<f32>(1.0));
+    let sigma = mix(1.25, 0.42, clamp(falloff, 0.0, 1.0));
+    let inv2s2 = 0.5 / (sigma * sigma);
+    var acc = vec3<f32>(0.0);
+    var wsum = 0.0;
+    for (var i: i32 = -8; i <= 8; i = i + 1) {
+        let t = f32(i) / 8.0;
+        let w = exp(-(t * t) * inv2s2);
+        acc = acc + ml_tap(uv + dir * (r * t) * tx, in_straight) * w;
+        wsum = wsum + w;
+    }
+    return acc / max(wsum, EPS);
+}
+
 fn ml_line(uv: vec2<f32>, r: f32, dir: vec2<f32>, half_n: i32, in_straight: bool) -> vec3<f32> {
     let tx = vec2<f32>(1.0) / max(u.resolution, vec2<f32>(1.0));
     let div = max(f32(half_n), 1.0);
@@ -1471,8 +1689,8 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
 
     switch (u.mode) {
         case 0u: {
-            // color-contrast: p0=[pivot, exposure], c0=contrastTint
-            c = ml_exposure(ml_contrast(c, 0.37, u.p0.x) * u.c0.xyz, u.p0.y);
+            // color-contrast: p0=[pivot, exposure, contrast], c0=contrastTint
+            c = ml_exposure(ml_contrast(c, u.p0.z, u.p0.x) * u.c0.xyz, u.p0.y);
         }
         case 1u: {
             // hsl-colors: p0=sat0..3, p1=sat4..7, p2=light0..3, p3=light4..7
@@ -1599,23 +1817,32 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
             c = mix(c, r, clamp(u.p0.x, 0.0, 1.0));
         }
         case 13u: {
-            // curves: 1D RGBA LUT in t_aux
+            // curves: 1D RGBA LUT in t_aux, or parametric sliders p0=[shadowLift, midGamma, highlightGain]
             if (has_aux) {
                 c = vec3<f32>(
                     textureSampleLevel(t_aux, s_linear, ml_lut_uv(c.r), 0.0).r,
                     textureSampleLevel(t_aux, s_linear, ml_lut_uv(c.g), 0.0).g,
                     textureSampleLevel(t_aux, s_linear, ml_lut_uv(c.b), 0.0).b,
                 );
+            } else {
+                let lifted = clamp(c + vec3<f32>(u.p0.x) * (vec3<f32>(1.0) - c), vec3<f32>(0.0), vec3<f32>(1.0));
+                let gamma_c = ml_pow_v(lifted, vec3<f32>(1.0 / max(u.p0.y, 0.05)));
+                c = clamp(gamma_c * max(u.p0.z, 0.0), vec3<f32>(0.0), vec3<f32>(1.0));
             }
         }
         case 14u: {
-            // s-curve: 1D luminance LUT in t_aux (R channel)
+            // s-curve: 1D luminance LUT in t_aux (R channel), or parametric sliders p0=[strength, pivot]
             if (has_aux) {
                 c = vec3<f32>(
                     textureSampleLevel(t_aux, s_linear, ml_lut_uv(c.r), 0.0).r,
                     textureSampleLevel(t_aux, s_linear, ml_lut_uv(c.g), 0.0).r,
                     textureSampleLevel(t_aux, s_linear, ml_lut_uv(c.b), 0.0).r,
                 );
+            } else {
+                let st = clamp(u.p0.x, -1.0, 1.0);
+                let pv = clamp(u.p0.y, 0.05, 0.95);
+                let s_shaped = clamp(c + st * 0.35 * sin((c - vec3<f32>(pv)) * PI * 2.0) * (c * (vec3<f32>(1.0) - c) * 4.0), vec3<f32>(0.0), vec3<f32>(1.0));
+                c = s_shaped;
             }
         }
         case 15u: {
@@ -1665,24 +1892,24 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
         }
         case 19u: {
             // haze-flare: p0=[spillage, softness, reach, exposure], p1=[reflExp, reflection, matteSize, matteShade], c0=tint
-            let hr = 1.0 + u.p0.y * 14.0;
-            let glow = ml_box(uv, hr, false, in_straight);
+            let hr = 1.5 + u.p0.y * 16.0;
+            let glow = ml_gaussian_disk(uv, hr, 3, in_straight);
             let hazed = glow * u.c0.xyz + vec3<f32>(0.02);
             let hbox = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) * 2.0;
             let hout = ml_smooth(u.p1.z, u.p1.z + 0.08, hbox);
             let spill = clamp(u.p0.x, 0.0, 1.0) * (1.0 - hout * u.p1.w * 0.85);
             var r = mix(c, hazed, spill);
-            if (u.p1.y > 0.5 && abs(u.p1.x) > 1e-5) {
-                let hs = ml_line(uv, u.p0.z * u.resolution.x * 0.04, vec2<f32>(1.0, 0.0), 3, in_straight);
-                r = r + hs * u.c0.xyz * (u.p1.x * 0.15);
+            if (u.p1.y > 1e-4 && abs(u.p1.x) > 1e-5) {
+                let hs = ml_gaussian_line(uv, max(2.0, u.p0.z * u.resolution.x * 0.04), vec2<f32>(1.0, 0.0), 0.45, in_straight);
+                r = r + hs * u.c0.xyz * (u.p1.x * u.p1.y * 0.15);
             }
             c = ml_exposure(r, u.p0.w);
         }
         case 20u: {
-            // pop: p0=[pop, size, preserveDetail]
+            // pop: p0=[pop, size, preserveDetail] — 13-tap Gaussian local contrast / unsharp mask
             if (abs(u.p0.x) > 1e-5) {
-                let pr = 1.0 + u.p0.y * 3.0;
-                let pd = c - ml_box(uv, pr, false, in_straight);
+                let pr = 1.25 + u.p0.y * 4.0;
+                let pd = c - ml_gaussian_13(uv, pr, in_straight);
                 let pkeep = 1.0 - u.p0.z * ml_smooth(0.0, 0.25, length(pd));
                 c = c + pd * u.p0.x * pkeep;
             }
@@ -1751,9 +1978,9 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
                     c = vec3<f32>(am);
                 } else {
                     c = c + u.c0.xyz * (am * u.p0.y * 0.35);
-                    if (u.p1.x > 0.5) {
+                    if (u.p1.x > 1e-4) {
                         let flip = ml_tap(vec2<f32>(1.0 - uv.x, uv.y), in_straight);
-                        c = c + flip * u.c0.xyz * (max(u.p1.y, 0.0) * 0.15);
+                        c = c + flip * u.c0.xyz * (max(u.p1.y, 0.0) * clamp(u.p1.x, 0.0, 1.0) * 0.15);
                     }
                 }
             }
@@ -1762,31 +1989,26 @@ fn fs_main(in_v: VsOut) -> @location(0) vec4<f32> {
             // lens-distortion already applied to `uv` above.
         }
         case 25u: {
-            // shutter-streak: p0=[size, boost, falloff]
+            // shutter-streak: p0=[size, boost, falloff] — 17-tap directional Gaussian streak
             let smix = clamp(u.p0.y * 0.5, 0.0, 1.0);
             if (smix > 0.0) {
-                let shr = max(1.0, u.p0.x * u.resolution.x * 0.02);
+                let shr = max(1.0, u.p0.x * u.resolution.x * 0.025);
                 let f = clamp(u.p0.z, 0.0, 1.0);
-                let tx = 1.0 / max(u.resolution.x, 1.0);
-                var acc = vec3<f32>(0.0);
-                var wsum = 0.0;
-                for (var i: i32 = -4; i <= 4; i = i + 1) {
-                    let fi = f32(i);
-                    let w = 1.0 + (1.0 - abs(fi) / 4.0 - 1.0) * f;
-                    acc = acc + ml_tap(uv + vec2<f32>(shr * fi / 4.0 * tx, 0.0), in_straight) * w;
-                    wsum = wsum + w;
-                }
-                c = mix(c, acc / max(wsum, 1e-3), smix);
+                let streaked = ml_gaussian_line(uv, shr, vec2<f32>(1.0, 0.0), f, in_straight);
+                c = mix(c, streaked, smix);
             }
         }
         case 26u: {
             // edge-softness: p0=[blurSize, quality, centerX, centerY], p1=[radius, aspect, spread]
+            // Multi-ring Gaussian disk blur (25..37 weighted taps); `quality` controls ring density,
+            // never stretching radius into ghost artifacts.
             if (u.p0.x > 1e-5) {
                 let ec = vec2<f32>(0.5 + u.p0.z * 0.5, 0.5 + u.p0.w * 0.5);
                 let ed = vec2<f32>((uv.x - ec.x) * u.p1.y, uv.y - ec.y);
                 let eout = ml_smooth(u.p1.x, u.p1.x + u.p1.z + 1e-4, length(ed));
-                let ebr = u.p0.x * 300.0 * (0.5 + u.p0.y / 8.0);
-                let eb = ml_box(uv, ebr, true, in_straight);
+                let ebr = clamp(u.p0.x * 240.0, 0.5, 48.0);
+                let rings = select(2, 3, u.p0.y >= 2.5);
+                let eb = ml_gaussian_disk(uv, ebr, rings, in_straight);
                 c = mix(c, eb, eout * clamp(u.p0.x * 40.0, 0.0, 1.0));
             }
         }

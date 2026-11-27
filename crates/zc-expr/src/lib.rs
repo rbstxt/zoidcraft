@@ -609,6 +609,19 @@ pub trait ExprContext {
             "fromScreen() requires an active 3D scene camera".to_string(),
         ))
     }
+
+    /// Samples overall audio amplitude/energy at `seconds`.
+    /// Defaults to `0.0` when no audio analysis track is attached.
+    fn audio_level(&self, _seconds: f64) -> f64 {
+        0.0
+    }
+
+    /// Samples frequency-band audio energy at `seconds` for a named band
+    /// (e.g. `"bass"`, `"mid"`, `"high"`, `"all"`) or numeric frequency / band index.
+    /// Defaults to `0.0` when no audio spectrum analysis is attached.
+    fn audio_band(&self, _band_or_freq: &Value, _seconds: f64) -> f64 {
+        0.0
+    }
 }
 
 /// Simple standalone [`ExprContext`] for basic evaluations and tests.
@@ -619,6 +632,8 @@ pub struct BasicContext {
     pub fps: f64,
     pub value: Value,
     pub properties: BTreeMap<String, Value>,
+    pub audio_level: f64,
+    pub audio_bands: BTreeMap<String, f64>,
 }
 
 impl Default for BasicContext {
@@ -629,6 +644,8 @@ impl Default for BasicContext {
             fps: 30.0,
             value: Value::Number(0.0),
             properties: BTreeMap::new(),
+            audio_level: 0.0,
+            audio_bands: BTreeMap::new(),
         }
     }
 }
@@ -658,6 +675,26 @@ impl ExprContext for BasicContext {
 
     fn properties(&self) -> BTreeMap<String, Value> {
         self.properties.clone()
+    }
+
+    fn audio_level(&self, _seconds: f64) -> f64 {
+        self.audio_level
+    }
+
+    fn audio_band(&self, band_or_freq: &Value, _seconds: f64) -> f64 {
+        let key = band_or_freq.to_js_string();
+        if let Some(&v) = self.audio_bands.get(&key) {
+            return v;
+        }
+        let lower = key.to_ascii_lowercase();
+        if let Some(&v) = self.audio_bands.get(&lower) {
+            return v;
+        }
+        if lower == "all" {
+            self.audio_level
+        } else {
+            0.0
+        }
     }
 }
 
@@ -2111,5 +2148,690 @@ mod tests {
             0.37,
             1e-12,
         );
+    }
+
+    #[test]
+    fn js_namespace_builtins_complete_and_edge_cases() {
+        // Number.isSafeInteger
+        assert_eq!(eval_plus("Number.isSafeInteger(42)"), Value::Bool(true));
+        assert_eq!(
+            eval_plus("Number.isSafeInteger(9007199254740991)"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_plus("Number.isSafeInteger(-9007199254740991)"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_plus("Number.isSafeInteger(9007199254740992)"),
+            Value::Bool(false)
+        );
+        assert_eq!(eval_plus("Number.isSafeInteger(1.5)"), Value::Bool(false));
+        assert_eq!(eval_plus("Number.isSafeInteger('42')"), Value::Bool(false));
+        assert_eq!(eval_plus("Number.isSafeInteger(NaN)"), Value::Bool(false));
+        assert_eq!(
+            eval_plus("Number.isSafeInteger(Infinity)"),
+            Value::Bool(false)
+        );
+        assert_eq!(eval_plus("Number.isSafeInteger?.(10)"), Value::Bool(true));
+
+        // Array.of
+        assert_eq!(eval_plus("Array.of()"), Value::Array(vec![]));
+        assert_eq!(
+            eval_plus("Array.of(7)"),
+            Value::Array(vec![Value::Number(7.0)])
+        );
+        assert_eq!(
+            eval_plus("Array.of(1, 'two', true)"),
+            Value::Array(vec![
+                Value::Number(1.0),
+                Value::String("two".into()),
+                Value::Bool(true),
+            ])
+        );
+        assert_eq!(eval_plus("Array.of?.(3, 4)"), Value::vec2(3.0, 4.0));
+
+        // String.fromCodePoint
+        assert_eq!(
+            eval_plus("String.fromCodePoint(65, 66, 67)"),
+            Value::String("ABC".into())
+        );
+        assert_eq!(
+            eval_plus("String.fromCodePoint(0x1F600)"),
+            Value::String("\u{1F600}".into())
+        );
+        assert_eq!(
+            eval_plus("String.fromCodePoint()"),
+            Value::String(String::new())
+        );
+        assert!(matches!(
+            eval(
+                "String.fromCodePoint(-1)",
+                &BasicContext::default(),
+                &EvalConfig::expressions_plus()
+            ),
+            Err(ExprError::RangeError(_))
+        ));
+        assert!(matches!(
+            eval(
+                "String.fromCodePoint(0x110000)",
+                &BasicContext::default(),
+                &EvalConfig::expressions_plus()
+            ),
+            Err(ExprError::RangeError(_))
+        ));
+        assert!(matches!(
+            eval(
+                "String.fromCodePoint(1.5)",
+                &BasicContext::default(),
+                &EvalConfig::expressions_plus()
+            ),
+            Err(ExprError::RangeError(_))
+        ));
+
+        // Object.fromEntries
+        assert_eq!(
+            eval_plus("const o = Object.fromEntries([['a', 1], ['b', 2]]); o.a + o.b"),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            eval_plus("Object.fromEntries(Object.entries({ x: 10, y: 20 })).y"),
+            Value::Number(20.0)
+        );
+
+        // Object.hasOwn
+        assert_eq!(
+            eval_plus("Object.hasOwn({ a: 1, b: undefined }, 'a')"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_plus("Object.hasOwn({ a: 1, b: undefined }, 'b')"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_plus("Object.hasOwn({ a: 1 }, 'c')"),
+            Value::Bool(false)
+        );
+        assert_eq!(eval_plus("Object.hasOwn([10, 20], 1)"), Value::Bool(true));
+        assert_eq!(eval_plus("Object.hasOwn([10, 20], 5)"), Value::Bool(false));
+
+        // Object.is (NaN == NaN, +0 != -0)
+        assert_eq!(eval_plus("Object.is(NaN, NaN)"), Value::Bool(true));
+        assert_eq!(eval_plus("Object.is(0, -0)"), Value::Bool(false));
+        assert_eq!(eval_plus("Object.is(-0, -0)"), Value::Bool(true));
+        assert_eq!(eval_plus("Object.is(0, 0)"), Value::Bool(true));
+        assert_eq!(eval_plus("Object.is(42, 42)"), Value::Bool(true));
+        assert_eq!(eval_plus("Object.is('x', 'x')"), Value::Bool(true));
+        assert_eq!(eval_plus("Object.is(null, undefined)"), Value::Bool(false));
+
+        // Object.freeze
+        assert_eq!(
+            eval_plus("const o = { k: 99 }; const f = Object.freeze(o); f === o && f.k === 99"),
+            Value::Bool(true)
+        );
+
+        // Object.create
+        assert_eq!(
+            eval_plus(
+                "const base = { a: 5, b: 6 }; const c = Object.create(base); c.b = 10; base.b * 100 + c.a + c.b"
+            ),
+            Value::Number(615.0)
+        );
+        assert_eq!(
+            eval_plus("const empty = Object.create(null); Object.keys(empty).length"),
+            Value::Number(0.0)
+        );
+    }
+
+    #[test]
+    fn array_prototype_splice_sort_and_copy_within() {
+        // splice: in-place mutation + returns removed elements
+        assert_eq!(
+            eval_plus(
+                "let a = [1, 2, 3, 4, 5]; const removed = a.splice(1, 2, 20, 30, 40); [removed, a]"
+            ),
+            Value::Array(vec![
+                Value::vec2(2.0, 3.0),
+                Value::from_f64_slice(&[1.0, 20.0, 30.0, 40.0, 4.0, 5.0]),
+            ])
+        );
+        // splice with negative start and omitted deleteCount
+        assert_eq!(
+            eval_plus("let a = [10, 20, 30, 40]; const r = a.splice(-2); [r, a]"),
+            Value::Array(vec![Value::vec2(30.0, 40.0), Value::vec2(10.0, 20.0)])
+        );
+
+        // sort: default lexicographical string order (10 before 2!) and undefined last
+        assert_eq!(
+            eval_plus("let a = [10, 2, 1, 20]; a.sort(); a"),
+            Value::from_f64_slice(&[1.0, 10.0, 2.0, 20.0])
+        );
+        assert_eq!(
+            eval_plus("let a = [3, undefined, 1, 2]; a.sort((x, y) => x - y); a"),
+            Value::Array(vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Undefined,
+            ])
+        );
+        // sort: custom comparator + in-place return reference + stability
+        assert_eq!(
+            eval_plus(
+                "const items = [{k: 2, v: 'a'}, {k: 1, v: 'b'}, {k: 2, v: 'c'}]; const ret = items.sort((x, y) => x.k - y.k); ret === items && items.map(i => i.v).join(',')"
+            ),
+            Value::String("b,a,c".into())
+        );
+
+        // copyWithin: overlapping forward/backward and negative indices
+        assert_eq!(
+            eval_plus("let a = [1, 2, 3, 4, 5]; a.copyWithin(0, 3); a"),
+            Value::from_f64_slice(&[4.0, 5.0, 3.0, 4.0, 5.0])
+        );
+        assert_eq!(
+            eval_plus("let a = [1, 2, 3, 4, 5]; a.copyWithin(1, 0, 3); a"),
+            Value::from_f64_slice(&[1.0, 1.0, 2.0, 3.0, 5.0])
+        );
+        assert_eq!(
+            eval_plus("let a = [1, 2, 3, 4, 5]; a.copyWithin(-2, -3, -1); a"),
+            Value::from_f64_slice(&[1.0, 2.0, 3.0, 3.0, 4.0])
+        );
+    }
+
+    #[test]
+    fn seed_random_affects_wiggle_and_gauss_random_and_noise_is_smooth() {
+        let cfg = EvalConfig::expressions_plus();
+        let ctx_f10 = BasicContext {
+            frame: 10.0,
+            value: Value::Number(50.0),
+            ..Default::default()
+        };
+        let ctx_f20 = BasicContext {
+            frame: 20.0,
+            value: Value::Number(50.0),
+            ..Default::default()
+        };
+
+        // seedRandom changes wiggle output deterministically
+        let w_seed1 = eval("seedRandom(11, true); wiggle(2, 10)", &ctx_f10, &cfg).unwrap();
+        let w_seed1_repeat = eval("seedRandom(11, true); wiggle(2, 10)", &ctx_f10, &cfg).unwrap();
+        let w_seed2 = eval("seedRandom(99, true); wiggle(2, 10)", &ctx_f10, &cfg).unwrap();
+        assert_eq!(w_seed1, w_seed1_repeat);
+        assert_ne!(w_seed1, w_seed2);
+
+        // seedRandom affects gaussRandom (both 0-arg and seeded, respecting timeless)
+        let g_t1 = eval("seedRandom(42, true); gaussRandom()", &ctx_f10, &cfg).unwrap();
+        let g_t2 = eval("seedRandom(42, true); gaussRandom()", &ctx_f20, &cfg).unwrap();
+        let g_other = eval("seedRandom(77, true); gaussRandom()", &ctx_f10, &cfg).unwrap();
+        assert_eq!(g_t1, g_t2);
+        assert_ne!(g_t1, g_other);
+
+        let g_var1 = eval("seedRandom(42, false); gaussRandom()", &ctx_f10, &cfg).unwrap();
+        let g_var2 = eval("seedRandom(42, false); gaussRandom()", &ctx_f20, &cfg).unwrap();
+        assert_ne!(g_var1, g_var2);
+
+        // noise(x), noise([x, y]), noise([x, y, z]): deterministic, bounded in [-1, 1], smooth
+        let n1a = eval_plus("noise(1.25)").as_f64().unwrap();
+        let n1b = eval_plus("noise(1.25)").as_f64().unwrap();
+        let n1_near = eval_plus("noise(1.26)").as_f64().unwrap();
+        let n1_far = eval_plus("noise(4.75)").as_f64().unwrap();
+        assert_near(n1a, n1b, 0.0);
+        assert!((-1.0..=1.0).contains(&n1a));
+        assert!((n1a - n1_near).abs() < 0.1, "1D noise should be smooth");
+        assert_ne!(n1a, n1_far);
+
+        let n2 = eval_plus("noise([1.5, 2.5])").as_f64().unwrap();
+        let n2_other = eval_plus("noise([3.5, 0.25])").as_f64().unwrap();
+        assert!((-1.0..=1.0).contains(&n2));
+        assert_ne!(n2, n2_other);
+
+        let n3 = eval_plus("noise([1.1, 2.2, 3.3])").as_f64().unwrap();
+        let n3_other = eval_plus("noise([5.4, 6.5, 7.6])").as_f64().unwrap();
+        assert!((-1.0..=1.0).contains(&n3));
+        assert_ne!(n3, n3_other);
+    }
+
+    struct MotionExprTestCtx {
+        frame: f64,
+        fps: f64,
+        camera_pos: [f64; 3],
+        target_pos: [f64; 3],
+    }
+
+    impl MotionExprTestCtx {
+        // Piecewise linear keyframed curve:
+        //   key 1: t = 1.0, v = 10.0
+        //   key 2: t = 2.0, v = 30.0
+        //   key 3: t = 3.0, v = 40.0
+        fn sample_scalar(t: f64) -> f64 {
+            if t <= 1.0 {
+                10.0
+            } else if t <= 2.0 {
+                10.0 + (t - 1.0) * 20.0
+            } else if t <= 3.0 {
+                30.0 + (t - 2.0) * 10.0
+            } else {
+                40.0
+            }
+        }
+    }
+
+    impl ExprContext for MotionExprTestCtx {
+        fn frame(&self) -> f64 {
+            self.frame
+        }
+        fn fps(&self) -> f64 {
+            self.fps
+        }
+        fn value(&self) -> Value {
+            Value::Number(Self::sample_scalar(self.time()))
+        }
+        fn property_value(&self, id: &HandleId) -> Result<Value, ExprError> {
+            match id.as_str() {
+                "thisProperty" => Ok(self.value()),
+                _ => Err(ExprError::NotFound(id.0.clone())),
+            }
+        }
+        fn property_value_at_time(&self, id: &HandleId, seconds: f64) -> Result<Value, ExprError> {
+            match id.as_str() {
+                "thisProperty" => Ok(Value::Number(Self::sample_scalar(seconds))),
+                _ => Err(ExprError::NotFound(id.0.clone())),
+            }
+        }
+        fn property_num_keys(&self, id: &HandleId) -> usize {
+            if id.as_str() == "thisProperty" { 3 } else { 0 }
+        }
+        fn property_key(
+            &self,
+            id: &HandleId,
+            index_1based: usize,
+        ) -> Result<KeyframeRecord, ExprError> {
+            if id.as_str() == "thisProperty" {
+                match index_1based {
+                    1 => Ok(KeyframeRecord {
+                        index: 1,
+                        time: 1.0,
+                        value: Value::Number(10.0),
+                    }),
+                    2 => Ok(KeyframeRecord {
+                        index: 2,
+                        time: 2.0,
+                        value: Value::Number(30.0),
+                    }),
+                    3 => Ok(KeyframeRecord {
+                        index: 3,
+                        time: 3.0,
+                        value: Value::Number(40.0),
+                    }),
+                    _ => Err(ExprError::RangeError("key out of range".into())),
+                }
+            } else {
+                Err(ExprError::NotFound(id.0.clone()))
+            }
+        }
+        fn object(&self, _owner: Option<&HandleId>, name: &str) -> Result<HandleId, ExprError> {
+            if name == "HeroTarget" {
+                Ok(HandleId::new("obj:hero_target"))
+            } else {
+                Err(ExprError::NotFound(name.into()))
+            }
+        }
+        fn world_position(&self, owner: Option<&HandleId>) -> Result<[f64; 3], ExprError> {
+            match owner.map(HandleId::as_str) {
+                None => Ok(self.camera_pos),
+                Some("obj:hero_target") => Ok(self.target_pos),
+                Some(other) => Err(ExprError::NotFound(other.into())),
+            }
+        }
+        fn audio_level(&self, seconds: f64) -> f64 {
+            (seconds * 0.25).clamp(0.0, 1.0)
+        }
+        fn audio_band(&self, band_or_freq: &Value, seconds: f64) -> f64 {
+            match band_or_freq.to_js_string().as_str() {
+                "bass" => 0.8 + seconds * 0.01,
+                "120" => 0.45,
+                _ => 0.0,
+            }
+        }
+    }
+
+    #[test]
+    fn posterize_time_loop_in_out_smooth_wiggle_focus_and_audio() {
+        let cfg = EvalConfig::expressions_plus();
+
+        // 1. posterizeTime(fps): quantizes time, frame, and thisProperty.value
+        let ctx_p = MotionExprTestCtx {
+            frame: 44.0, // time = 44/30 = 1.4666...s
+            fps: 30.0,
+            camera_pos: [0.0, 0.0, 10.0],
+            target_pos: [3.0, 4.0, 10.0],
+        };
+        // posterizeTime(5) => floor(1.4666 * 5) / 5 = 7 / 5 = 1.4s; frame = 42.0; value(1.4) = 18.0
+        let post = eval(
+            "posterizeTime(5); [time, frame, thisProperty.value]",
+            &ctx_p,
+            &cfg,
+        )
+        .unwrap()
+        .as_f64_vec()
+        .unwrap();
+        assert_near(post[0], 1.4, 1e-12);
+        assert_near(post[1], 42.0, 1e-12);
+        assert_near(post[2], 18.0, 1e-12);
+
+        // 2. loopOut: all 4 modes at t = 3.5s (past last key at t=3.0, duration=2.0, keys 1..3)
+        let ctx_out = MotionExprTestCtx {
+            frame: 105.0, // t = 3.5s
+            fps: 30.0,
+            camera_pos: [0.0, 0.0, 0.0],
+            target_pos: [0.0, 0.0, 0.0],
+        };
+        // cycle: t=3.5 wraps to t=1.5 => value(1.5) = 20.0
+        assert_near(
+            eval("loopOut('cycle')", &ctx_out, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            20.0,
+            1e-9,
+        );
+        // cycle with numKeyframes=1 (last segment t=2..3, duration=1): t=3.5 -> t=2.5 => 35.0
+        assert_near(
+            eval("thisProperty.loopOut('cycle', 1)", &ctx_out, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            35.0,
+            1e-9,
+        );
+        // pingpong: elapsed=0.5 backward from t=3.0 => t=2.5 => value(2.5) = 35.0
+        assert_near(
+            eval("loopOut('pingpong')", &ctx_out, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            35.0,
+            1e-9,
+        );
+        // offset: 1 cycle + delta(40 - 10 = 30) + value(1.5)=20 => 50.0
+        assert_near(
+            eval("loopOut('offset')", &ctx_out, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            50.0,
+            1e-9,
+        );
+        // continue: incoming slope at t=3.0 is (40 - 30)/1 = 10/s => 40 + 10 * 0.5 = 45.0
+        assert_near(
+            eval("loopOut('continue')", &ctx_out, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            45.0,
+            1e-6,
+        );
+
+        // 3. loopIn: all 4 modes at t = 0.5s (before first key at t=1.0)
+        let ctx_in = MotionExprTestCtx {
+            frame: 15.0, // t = 0.5s
+            fps: 30.0,
+            camera_pos: [0.0, 0.0, 0.0],
+            target_pos: [0.0, 0.0, 0.0],
+        };
+        // cycle: t=0.5 wraps to t=2.5 => value(2.5) = 35.0
+        assert_near(
+            eval("loopIn('cycle')", &ctx_in, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            35.0,
+            1e-9,
+        );
+        // pingpong: before=0.5 reflects forward from t=1.0 => t=1.5 => value(1.5) = 20.0
+        assert_near(
+            eval("thisProperty.loopIn('pingpong')", &ctx_in, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            20.0,
+            1e-9,
+        );
+        // offset: cycles=-1, offset_t=1.5 -> value(2.5)=35.0 + (-1)*(40-10) = 5.0
+        assert_near(
+            eval("loopIn('offset')", &ctx_in, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            5.0,
+            1e-9,
+        );
+        // continue: outgoing slope at t=1.0 is (30-10)/1 = 20/s => 10 + 20 * (-0.5) = 0.0
+        assert_near(
+            eval("loopIn('continue')", &ctx_in, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            0.0,
+            1e-6,
+        );
+
+        // 4. smooth(width, samples, t): global & thisProperty
+        let ctx_mid = MotionExprTestCtx {
+            frame: 45.0, // t = 1.5s (strictly inside linear segment 1..2 where v = 10 + 20*(t-1))
+            fps: 30.0,
+            camera_pos: [0.0, 0.0, 10.0],
+            target_pos: [3.0, 4.0, 10.0],
+        };
+        // Linear segment centered at 1.5s => exact average is 20.0
+        assert_near(
+            eval("smooth(0.4, 5)", &ctx_mid, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            20.0,
+            1e-9,
+        );
+        // Around corner at t=2.0s with width=0.4, samples=5:
+        // samples at 1.8(26), 1.9(28), 2.0(30), 2.1(31), 2.2(32) => avg = 147 / 5 = 29.4
+        assert_near(
+            eval("thisProperty.smooth(0.4, 5, 2.0)", &ctx_mid, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            29.4,
+            1e-9,
+        );
+
+        // 5. thisProperty.wiggle anchored at thisProperty's value at t
+        assert_near(
+            eval("thisProperty.wiggle(2, 0, 1, 0.5, 2.5)", &ctx_mid, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            35.0,
+            1e-9,
+        );
+        let pw = eval("thisProperty.wiggle(2, 4, 2, 0.45, 2.5)", &ctx_mid, &cfg)
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!((pw - 35.0).abs() <= 4.0 + 1e-9);
+
+        // 6. focusDistanceTo(target): named object, Vec3, handle, missing fallback
+        assert_near(
+            eval("focusDistanceTo('HeroTarget')", &ctx_mid, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            5.0,
+            1e-9,
+        );
+        assert_near(
+            eval("focusDistanceTo([0, 0, 22])", &ctx_mid, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            12.0,
+            1e-9,
+        );
+        assert_near(
+            eval("focusDistanceTo(object('HeroTarget'))", &ctx_mid, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            5.0,
+            1e-9,
+        );
+        assert_near(
+            eval("focusDistanceTo('DoesNotExist')", &ctx_mid, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            0.0,
+            1e-9,
+        );
+
+        // 7. audio(bandOrFreq) and audioLevel(time?)
+        assert_near(
+            eval("audioLevel()", &ctx_mid, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            0.375,
+            1e-9,
+        );
+        assert_near(
+            eval("audioLevel(2.0)", &ctx_mid, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            0.5,
+            1e-9,
+        );
+        assert_near(
+            eval("audio('bass')", &ctx_mid, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            0.815,
+            1e-9,
+        );
+        assert_near(
+            eval("audio(120)", &ctx_mid, &cfg)
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            0.45,
+            1e-9,
+        );
+        // Default BasicContext audio hooks return 0.0 cleanly
+        assert_eq!(eval_plus("audioLevel()"), Value::Number(0.0));
+        assert_eq!(eval_plus("audio('bass')"), Value::Number(0.0));
+    }
+
+    #[test]
+    fn expresstext_config_parses_and_animates_full_keyframe_tracks() {
+        use crate::expresstext::{
+            EtPropReader, EtValue, EvalAux, LetterList, evaluate_stack,
+            parse_express_text_config_str,
+        };
+
+        let json = r#"{
+            "expressProperties": {
+                "plainEnable": 1,
+                "plainStrength": {
+                    "animated": true,
+                    "value": 0,
+                    "keyframes": [
+                        { "frame": 0, "value": 0, "tween": 1 },
+                        { "frame": 10, "value": 100, "tween": 1 },
+                        { "frame": 20, "value": 50, "tween": 0 }
+                    ]
+                },
+                "plainPosition": {
+                    "objects": [
+                        {
+                            "animated": true,
+                            "keyframes": [
+                                { "frame": 0, "value": 0, "tween": 1 },
+                                { "frame": 10, "value": 100, "tween": 2 }
+                            ]
+                        },
+                        {
+                            "animated": true,
+                            "keyframes": [
+                                { "frame": 0, "value": 0, "tween": 1, "controlPoints": [[-2, 0], [5, 0]] },
+                                { "frame": 10, "value": 100, "tween": 257, "controlPoints": [[-5, 0], [2, 0]] }
+                            ]
+                        },
+                        {
+                            "value": 0,
+                            "expression": "frame * 2"
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let cfg = parse_express_text_config_str(json).expect("animated config should parse");
+        assert_eq!(cfg.effectors.len(), 1);
+        let eff = &cfg.effectors[0];
+
+        // Track metadata is preserved (all 3 keyframes, not truncated to first)
+        let strength_track = eff.tracks.get("plainStrength").expect("strength track");
+        assert!(strength_track.animated);
+        assert_eq!(strength_track.keyframes.len(), 3);
+        assert!(!eff.is_static("plainStrength"));
+        assert!(!eff.is_static("plainPosition"));
+        assert!(eff.is_static("plainEnable"));
+
+        // Linear segment [0..10]: frame 5 => strength 50
+        assert_near(
+            eff.read("plainStrength", 5.0).unwrap().as_number(0.0),
+            50.0,
+            1e-9,
+        );
+        // Hold segment [10..20] (tween=0 on key at frame 20): frame 15 holds 100, frame 20 jumps to 50
+        assert_near(
+            eff.read("plainStrength", 15.0).unwrap().as_number(0.0),
+            100.0,
+            1e-9,
+        );
+        assert_near(
+            eff.read("plainStrength", 20.0).unwrap().as_number(0.0),
+            50.0,
+            1e-9,
+        );
+
+        // Per-channel Vec3: X uses Quadratic EaseIn (tween=2 -> 0.5^2 * 100 = 25),
+        // Y uses symmetric Bezier (tween=257 -> 50 at midpoint), Z uses expression `frame * 2` (= 10)
+        let pos5 = eff.read("plainPosition", 5.0).unwrap();
+        let EtValue::Vec3(p5) = pos5 else {
+            panic!("expected Vec3, got {pos5:?}");
+        };
+        assert_near(p5[0], 25.0, 1e-9);
+        assert_near(p5[1], 50.0, 1e-6);
+        assert_near(p5[2], 10.0, 1e-9);
+
+        // End-to-end effector stack evaluation animates across frames (does not freeze at frame 0!)
+        let layers = [eff.as_layer()];
+        let list = LetterList {
+            total: 1,
+            order: vec![0],
+        };
+        let aux = EvalAux::default();
+        let c0 = evaluate_stack(&layers, 0.0, 0, &list, [0.0; 3], &aux);
+        let c5 = evaluate_stack(&layers, 5.0, 0, &list, [0.0; 3], &aux);
+        let c10 = evaluate_stack(&layers, 10.0, 0, &list, [0.0; 3], &aux);
+        assert_near(c0.position[0], 0.0, 1e-9);
+        // At frame 5: strength = 50% (0.5), plainPosition = [25, 50, 10] => [12.5, 25, 5]
+        assert_near(c5.position[0], 12.5, 1e-9);
+        assert_near(c5.position[1], 25.0, 1e-6);
+        assert_near(c5.position[2], 5.0, 1e-9);
+        // At frame 10: strength = 100% (1.0), plainPosition = [100, 100, 20] => [100, 100, 20]
+        assert_near(c10.position[0], 100.0, 1e-9);
+        assert_near(c10.position[1], 100.0, 1e-9);
+        assert_near(c10.position[2], 20.0, 1e-9);
     }
 }

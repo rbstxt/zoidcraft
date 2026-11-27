@@ -82,6 +82,21 @@ pub(super) fn build_effect_picker_items(session: &Session) -> Vec<FuzzyItem> {
         }
     }
 
+    // Declarative Shader Pack effects gated dynamically by enabled ShaderPack plugins
+    // (AfterClip, AlipFX Shader Pack 4, CCFX Shader Pack), grouped under their pack names.
+    for pack_fx in session.plugins.enabled_shader_pack_effects() {
+        let pack_label = session
+            .plugins
+            .get(pack_fx.plugin_id)
+            .map_or(pack_fx.plugin_id, |p| p.name.as_str());
+        items.push(FuzzyItem {
+            id: pack_fx.namespaced_id(),
+            category: format!("Shader Pack: {pack_label}"),
+            name: pack_fx.name.to_owned(),
+            desc: format!("{} ({})", pack_fx.description, pack_fx.category),
+        });
+    }
+
     items
 }
 
@@ -121,7 +136,10 @@ pub(super) fn show_effects_tab(
             }
             FuzzyPickerEvent::Selected(kind) => {
                 commit_inspector_tx_if_open(session, state);
-                let display = items.iter().find(|i| i.id == kind).map(|i| i.name.clone());
+                let shader_pack_fx = session.plugins.find_shader_pack_effect(&kind);
+                let display = shader_pack_fx
+                    .map(|fx| fx.name.to_owned())
+                    .or_else(|| items.iter().find(|i| i.id == kind).map(|i| i.name.clone()));
                 let started_tx = kind == "customshader"
                     && session.begin_transaction("add custom shader").is_ok();
                 if let Ok(res) = session.execute(Command::AddEffect {
@@ -137,7 +155,14 @@ pub(super) fn show_effects_tab(
                             value: json!(DEFAULT_CUSTOM_SHADER_GLSL),
                         });
                     }
-                    let _ = session.selection.select_effect(fx_id, &kind, false);
+                    let selected_kind = res.get("kind").and_then(Value::as_str).unwrap_or(&kind);
+                    let _ = session.selection.select_effect(fx_id, selected_kind, false);
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(
+                            Id::unique(("effects_list_selection_anchor", &clip_id)),
+                            fx_id.to_owned(),
+                        );
+                    });
                 }
                 if started_tx && session.history.is_in_transaction() {
                     let _ = session.commit_transaction(true);
@@ -299,6 +324,38 @@ pub(super) fn show_effects_tab(
 
                     let mut reorder_req: Option<(String, usize)> = None;
                     let local_frame = session.playback.current_frame - clip.start;
+                    let anchor_key = Id::unique(("effects_list_selection_anchor", &clip_id));
+
+                    // Pre-compute visible flattened order (top-level effects + expanded EffectGroup
+                    // children) so Shift-click range selection works across all visible rows.
+                    let group_children_per_fx: Vec<Vec<EffectGroupChildRow>> = clip
+                        .effects
+                        .iter()
+                        .map(|fx| {
+                            if fx.kind == "group" {
+                                collect_effect_group_child_rows(
+                                    session,
+                                    &clip_id,
+                                    &fx.id,
+                                    &state.collapsed_effect_groups,
+                                )
+                            } else {
+                                Vec::new()
+                            }
+                        })
+                        .collect();
+                    let mut visible_effects: Vec<(String, String)> =
+                        Vec::with_capacity(clip.effects.len());
+                    for (i, fx) in clip.effects.iter().enumerate() {
+                        visible_effects.push((fx.id.clone(), fx.kind.clone()));
+                        if !group_children_per_fx[i].is_empty()
+                            && !state.collapsed_effect_groups.contains(&fx.id)
+                        {
+                            for child in &group_children_per_fx[i] {
+                                visible_effects.push((child.id.clone(), child.kind_id.clone()));
+                            }
+                        }
+                    }
 
                     for (idx, fx) in clip.effects.iter().enumerate() {
                         let selected = session.selection.effect_ids.contains(&fx.id);
@@ -327,16 +384,7 @@ pub(super) fn show_effects_tab(
                         );
 
                         // If this top-level effect is an EffectGroup with children, draw expand/collapse tree box.
-                        let group_children = if fx.kind == "group" {
-                            collect_effect_group_child_rows(
-                                session,
-                                &clip_id,
-                                &fx.id,
-                                &state.collapsed_effect_groups,
-                            )
-                        } else {
-                            Vec::new()
-                        };
+                        let group_children = &group_children_per_fx[idx];
                         let has_group_children = !group_children.is_empty();
                         let group_expanded =
                             has_group_children && !state.collapsed_effect_groups.contains(&fx.id);
@@ -449,12 +497,19 @@ pub(super) fn show_effects_tab(
 
                         if row_resp.clicked() && !toggled_group_expand {
                             commit_inspector_tx_if_open(session, state);
-                            let shift = ui.input(|i| i.modifiers.shift);
-                            if let Err(err) =
-                                session.selection.select_effect(&fx.id, &fx.kind, shift)
-                            {
-                                actions.push(PanelAction::StatusMessage(err.to_string()));
-                            }
+                            let (shift, ctrl_cmd) = ui.input(|i| {
+                                (i.modifiers.shift, i.modifiers.ctrl || i.modifiers.command)
+                            });
+                            apply_effect_list_click(
+                                ui.ctx(),
+                                session,
+                                &visible_effects,
+                                anchor_key,
+                                &fx.id,
+                                &fx.kind,
+                                shift,
+                                ctrl_cmd,
+                            );
                         }
 
                         // Right-click context menu (Rename, Copy/Paste PZ JSON, Duplicate, Remove)
@@ -559,7 +614,7 @@ pub(super) fn show_effects_tab(
                         if group_expanded {
                             let mut pending_toggle_child: Option<String> = None;
                             let mut pending_delete_child: Option<String> = None;
-                            for child in &group_children {
+                            for child in group_children {
                                 let child_selected =
                                     session.selection.effect_ids.contains(&child.id);
                                 let (c_rect, c_resp) = ui.allocate_exact_size(
@@ -676,14 +731,19 @@ pub(super) fn show_effects_tab(
 
                                 if c_resp.clicked() && !eye_clicked && !child_toggled_expand {
                                     commit_inspector_tx_if_open(session, state);
-                                    let shift = ui.input(|i| i.modifiers.shift);
-                                    if let Err(err) = session.selection.select_effect(
+                                    let (shift, ctrl_cmd) = ui.input(|i| {
+                                        (i.modifiers.shift, i.modifiers.ctrl || i.modifiers.command)
+                                    });
+                                    apply_effect_list_click(
+                                        ui.ctx(),
+                                        session,
+                                        &visible_effects,
+                                        anchor_key,
                                         &child.id,
                                         &child.kind_id,
                                         shift,
-                                    ) {
-                                        actions.push(PanelAction::StatusMessage(err.to_string()));
-                                    }
+                                        ctrl_cmd,
+                                    );
                                 }
 
                                 let ctx_cid = child.id.clone();
@@ -786,6 +846,109 @@ pub(super) fn show_effects_tab(
     );
     // Crisp single 1px #333333 border around bottom pane (layout.rs paints the focus accent only when SideInspector is focused)
     paint_crisp_panel_border(ui.painter(), bot_rect, BORDER_PANEL);
+}
+
+fn sync_effect_base_type(session: &mut Session, visible_order: &[(String, String)]) {
+    let mut shared_kind: Option<&str> = None;
+    let mut mixed = false;
+    for sel_id in &session.selection.effect_ids {
+        if let Some((_, kind)) = visible_order.iter().find(|(id, _)| id == sel_id) {
+            match shared_kind {
+                None => shared_kind = Some(kind.as_str()),
+                Some(prev) if prev != kind.as_str() => {
+                    mixed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    session.selection.effect_base_type = if mixed {
+        None
+    } else {
+        shared_kind.map(str::to_owned)
+    };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_effect_list_click(
+    ctx: &egui::Context,
+    session: &mut Session,
+    visible_order: &[(String, String)],
+    anchor_key: Id,
+    clicked_id: &str,
+    clicked_kind: &str,
+    shift: bool,
+    ctrl_cmd: bool,
+) {
+    if shift {
+        let clicked_pos = visible_order.iter().position(|(id, _)| id == clicked_id);
+        let stored_anchor = ctx.data(|d| d.get_temp::<String>(anchor_key));
+        let anchor_id = stored_anchor
+            .filter(|aid| visible_order.iter().any(|(id, _)| id == aid))
+            .or_else(|| {
+                session
+                    .selection
+                    .effect_ids
+                    .last()
+                    .filter(|aid| visible_order.iter().any(|(id, _)| id == aid.as_str()))
+                    .cloned()
+            });
+        let anchor_pos = anchor_id
+            .as_deref()
+            .and_then(|aid| visible_order.iter().position(|(id, _)| id == aid));
+
+        if let (Some(a_idx), Some(c_idx)) = (anchor_pos, clicked_pos) {
+            let lo = a_idx.min(c_idx);
+            let hi = a_idx.max(c_idx);
+            let range = &visible_order[lo..=hi];
+            if !ctrl_cmd {
+                session.selection.effect_ids = range.iter().map(|(id, _)| id.clone()).collect();
+            } else {
+                for (id, _) in range {
+                    if !session.selection.effect_ids.contains(id) {
+                        session.selection.effect_ids.push(id.clone());
+                    }
+                }
+            }
+            sync_effect_base_type(session, visible_order);
+            session.selection.clear_objects_3d();
+            session.selection.clear_keyframes();
+            if let Some(aid) = anchor_id {
+                ctx.data_mut(|d| d.insert_temp(anchor_key, aid));
+            }
+            return;
+        }
+
+        let _ = session
+            .selection
+            .select_effect(clicked_id, clicked_kind, false);
+        ctx.data_mut(|d| d.insert_temp(anchor_key, clicked_id.to_owned()));
+        return;
+    }
+
+    if ctrl_cmd {
+        if let Some(pos) = session
+            .selection
+            .effect_ids
+            .iter()
+            .position(|id| id == clicked_id)
+        {
+            session.selection.effect_ids.remove(pos);
+        } else {
+            session.selection.effect_ids.push(clicked_id.to_owned());
+            session.selection.clear_objects_3d();
+            session.selection.clear_keyframes();
+            ctx.data_mut(|d| d.insert_temp(anchor_key, clicked_id.to_owned()));
+        }
+        sync_effect_base_type(session, visible_order);
+        return;
+    }
+
+    let _ = session
+        .selection
+        .select_effect(clicked_id, clicked_kind, false);
+    ctx.data_mut(|d| d.insert_temp(anchor_key, clicked_id.to_owned()));
 }
 
 pub(super) const DEFAULT_CUSTOM_SHADER_GLSL: &str = r#"uniform sampler2D tDiffuse;
@@ -961,10 +1124,127 @@ fn mutate_effect_group_child(
             }
         }
     }
+    if mutated {
+        session.playback.bump_epoch();
+    }
     if started_tx {
         let _ = session.commit_transaction(mutated);
     }
     mutated
+}
+
+fn regenerate_grouped_effect_ids(eff: &mut EffectInstance) {
+    eff.id = Uuid::new_v4();
+    if let EffectKind::EffectGroup { children, .. } = &mut eff.kind {
+        for child in children.iter_mut() {
+            regenerate_grouped_effect_ids(child);
+        }
+    }
+}
+
+/// Resets an Effect Group child's parameters back to its template defaults inside an undoable transaction.
+pub(super) fn reset_effect_group_child(
+    session: &mut Session,
+    clip_id: &str,
+    child_id: &str,
+) -> bool {
+    mutate_effect_group_child(session, clip_id, child_id, "reset grouped effect", |eff| {
+        eff.enabled = PropertyTrack::option(1);
+        let template = match &eff.kind {
+            EffectKind::Standard(id) => create_effect_by_id(id),
+            EffectKind::Plugin {
+                plugin_id,
+                effect_id,
+            } => create_effect_by_id(&format!("zoidium:{plugin_id}/{effect_id}"))
+                .or_else(|| create_effect_by_id(effect_id)),
+            EffectKind::CustomShader { .. } | EffectKind::EffectGroup { .. } => None,
+        };
+        if let Some(tpl) = template {
+            eff.params = tpl.params;
+        } else {
+            for tr in eff.params.values_mut() {
+                tr.animated = false;
+                tr.expression = None;
+                tr.keyframes.clear();
+                tr.channels.clear();
+            }
+            match &mut eff.kind {
+                EffectKind::CustomShader {
+                    custom_properties, ..
+                }
+                | EffectKind::EffectGroup {
+                    custom_properties, ..
+                } => {
+                    for cp in custom_properties.iter_mut() {
+                        cp.track.animated = false;
+                        cp.track.expression = None;
+                        cp.track.keyframes.clear();
+                        cp.track.channels.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+}
+
+/// Clones an Effect Group child (regenerating UUIDs recursively) directly after the original inside
+/// the same Effect Group, selecting the newly created clone in an undoable transaction.
+pub(super) fn duplicate_effect_group_child(
+    session: &mut Session,
+    clip_id: &str,
+    child_id: &str,
+) -> Option<String> {
+    fn dup_rec(effects: &mut Vec<EffectInstance>, target: &str) -> Option<(String, String)> {
+        if let Some(pos) = effects.iter().position(|e| e.id.to_string() == target) {
+            let mut cloned = effects[pos].clone();
+            regenerate_grouped_effect_ids(&mut cloned);
+            let new_id = cloned.id.to_string();
+            let new_kind = effect_instance_kind_id(&cloned.kind);
+            effects.insert(pos + 1, cloned);
+            return Some((new_id, new_kind));
+        }
+        for fx in effects.iter_mut() {
+            if let EffectKind::EffectGroup { children, .. } = &mut fx.kind
+                && let Some(found) = dup_rec(children, target)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    let clip_uuid = Uuid::parse_str(clip_id).ok()?;
+    let started_tx = if !session.history.is_in_transaction() {
+        session
+            .begin_transaction("duplicate grouped effect")
+            .is_ok()
+    } else {
+        false
+    };
+    let mut created: Option<(String, String)> = None;
+    'outer: for track in &mut session.active_sequence_mut().video_tracks {
+        for vc in &mut track.clips {
+            if vc.id == clip_uuid {
+                for fx in &mut vc.layer.effects {
+                    if let EffectKind::EffectGroup { children, .. } = &mut fx.kind
+                        && let Some(res) = dup_rec(children, child_id)
+                    {
+                        created = Some(res);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    if let Some((ref new_id, ref new_kind)) = created {
+        session.playback.bump_epoch();
+        let _ = session.selection.select_effect(new_id, new_kind, false);
+    }
+    if started_tx {
+        let _ = session.commit_transaction(created.is_some());
+    }
+    created.map(|(id, _)| id)
 }
 
 /// Deletes a top-level effect on `clip_id`. When the deleted effect was selected and other
@@ -1119,6 +1399,7 @@ pub(super) fn render_effect_group_custom_properties(
     viewport_rect: Rect,
     state: &mut PanelsState,
     theme: &Cm3Theme,
+    actions: &mut Vec<PanelAction>,
 ) {
     let mut updates: Vec<(String, PropertyValue)> = Vec::new();
     for cp in custom_props {
@@ -1274,6 +1555,12 @@ pub(super) fn render_effect_group_custom_properties(
                         ]),
                     ));
                 }
+                if cev.eyedropper_clicked {
+                    actions.push(PanelAction::EyedropperActivate {
+                        target_id: group_effect_id.to_owned(),
+                        property: cp.name.clone(),
+                    });
+                }
             }
             PropertyValue::ColorRgba(c) => {
                 let mut rgba = Rgba::new(c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32);
@@ -1306,6 +1593,12 @@ pub(super) fn render_effect_group_custom_properties(
                             f64::from(rgba.0[3]),
                         ]),
                     ));
+                }
+                if cev.eyedropper_clicked {
+                    actions.push(PanelAction::EyedropperActivate {
+                        target_id: group_effect_id.to_owned(),
+                        property: cp.name.clone(),
+                    });
                 }
             }
             PropertyValue::Text(s) => {
@@ -1428,6 +1721,12 @@ pub(super) fn render_effect_group_custom_properties(
                             f64::from(rgba.0[3]),
                         ]),
                     ));
+                }
+                if cev.eyedropper_clicked {
+                    actions.push(PanelAction::EyedropperActivate {
+                        target_id: group_effect_id.to_owned(),
+                        property: cp.name.clone(),
+                    });
                 }
             }
             PropertyValue::List(s) | PropertyValue::Shader(s) => {
@@ -1592,6 +1891,14 @@ pub(super) fn show_nested_effect_group_child_inspector(
                     "effect JSON or GLSL",
                 );
             }
+            if hdr_act.reset {
+                commit_inspector_tx_if_open(session, state);
+                reset_effect_group_child(session, &clip.id, &child_id);
+            }
+            if hdr_act.duplicate {
+                commit_inspector_tx_if_open(session, state);
+                duplicate_effect_group_child(session, &clip.id, &child_id);
+            }
             if hdr_act.remove {
                 commit_inspector_tx_if_open(session, state);
                 delete_effect_group_child(session, &clip.id, &child_id);
@@ -1669,6 +1976,7 @@ pub(super) fn show_nested_effect_group_child_inspector(
                         viewport_rect,
                         state,
                         theme,
+                        actions,
                     );
                 }
             }
@@ -1831,6 +2139,12 @@ pub(super) fn show_nested_effect_group_child_inspector(
                                 ]),
                             ));
                         }
+                        if cev.eyedropper_clicked {
+                            actions.push(PanelAction::EyedropperActivate {
+                                target_id: child_id.clone(),
+                                property: key.clone(),
+                            });
+                        }
                     }
                     PropertyValue::ColorRgba(c) => {
                         let mut rgba =
@@ -1864,6 +2178,12 @@ pub(super) fn show_nested_effect_group_child_inspector(
                                     f64::from(rgba.0[3]),
                                 ]),
                             ));
+                        }
+                        if cev.eyedropper_clicked {
+                            actions.push(PanelAction::EyedropperActivate {
+                                target_id: child_id.clone(),
+                                property: key.clone(),
+                            });
                         }
                     }
                     PropertyValue::Text(s) => {
@@ -1936,4 +2256,145 @@ pub(super) fn show_nested_effect_group_child_inspector(
                 );
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shader_pack_picker_entries_gate_on_enabled_packs() {
+        let mut session = Session::new();
+
+        // Disabled by default: none of the 34 Shader Pack effects appear in the picker.
+        let initial_items = build_effect_picker_items(&session);
+        assert!(
+            !initial_items
+                .iter()
+                .any(|item| item.category.starts_with("Shader Pack:")),
+            "disabled Shader Packs must not appear in the Effects picker"
+        );
+
+        // Enable `afterclip`: its Shader Pack effects appear grouped under its pack name.
+        session
+            .execute(Command::EnablePlugin {
+                plugin_id: "afterclip".to_owned(),
+            })
+            .expect("enable afterclip");
+        let afterclip_items = build_effect_picker_items(&session);
+        let afterclip_pack_count = afterclip_items
+            .iter()
+            .filter(|item| item.id.starts_with("zoidcraft:afterclip/"))
+            .count();
+        assert!(
+            afterclip_pack_count > 0,
+            "enabled afterclip pack must populate Effects picker"
+        );
+        assert!(
+            afterclip_items
+                .iter()
+                .filter(|item| item.id.starts_with("zoidcraft:afterclip/"))
+                .all(|item| item.category.starts_with("Shader Pack:"))
+        );
+        assert!(
+            !afterclip_items
+                .iter()
+                .any(|item| item.id.starts_with("zoidcraft:ccfx-shader-pack/"))
+        );
+
+        // Enable the other two Shader Packs and verify all 34 declarative effects appear.
+        session
+            .execute(Command::EnablePlugin {
+                plugin_id: "alipfx-shader-pack-4".to_owned(),
+            })
+            .expect("enable alipfx-shader-pack-4");
+        session
+            .execute(Command::EnablePlugin {
+                plugin_id: "ccfx-shader-pack".to_owned(),
+            })
+            .expect("enable ccfx-shader-pack");
+        let all_items = build_effect_picker_items(&session);
+        let total_pack_items = all_items
+            .iter()
+            .filter(|item| item.category.starts_with("Shader Pack:"))
+            .count();
+        assert_eq!(
+            total_pack_items, 34,
+            "all 34 Shader Pack effects across the 3 packs must appear when enabled"
+        );
+
+        // Disabling a pack removes only that pack's effects from the picker.
+        session
+            .execute(Command::DisablePlugin {
+                plugin_id: "ccfx-shader-pack".to_owned(),
+            })
+            .expect("disable ccfx-shader-pack");
+        let after_disable = build_effect_picker_items(&session);
+        assert!(
+            !after_disable
+                .iter()
+                .any(|item| item.id.starts_with("zoidcraft:ccfx-shader-pack/"))
+        );
+        assert!(
+            after_disable
+                .iter()
+                .any(|item| item.id.starts_with("zoidcraft:afterclip/"))
+        );
+    }
+
+    #[test]
+    fn effect_group_child_reset_and_duplicate_work_undoably() {
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let clip_uuid = Uuid::parse_str(&clip_id).expect("clip uuid");
+
+        let mut child = create_effect_by_id("gaussianblur").expect("gaussianblur template");
+        let child_id = child.id.to_string();
+        let default_delta = child
+            .params
+            .get("delta")
+            .and_then(|tr| tr.value.as_f64())
+            .expect("default delta");
+        if let Some(tr) = child.params.get_mut("delta") {
+            tr.value = PropertyValue::Number(default_delta + 42.0);
+        }
+
+        let mut group = zc_project::create_effect_group("FX Group");
+        let group_id = group.id.to_string();
+        if let EffectKind::EffectGroup {
+            ref mut children, ..
+        } = group.kind
+        {
+            children.push(child);
+        }
+        for track in &mut session.active_sequence_mut().video_tracks {
+            for vc in &mut track.clips {
+                if vc.id == clip_uuid {
+                    vc.layer.effects.push(group.clone());
+                }
+            }
+        }
+
+        // Reset restores the child's parameters back to template defaults.
+        assert!(reset_effect_group_child(&mut session, &clip_id, &child_id));
+        let reset_child =
+            find_effect_group_child(&session, &clip_id, &child_id).expect("reset child");
+        assert_eq!(
+            reset_child
+                .params
+                .get("delta")
+                .and_then(|tr| tr.value.as_f64()),
+            Some(default_delta)
+        );
+
+        // Duplicate clones the child directly inside the same EffectGroup with a fresh UUID.
+        let dup_id =
+            duplicate_effect_group_child(&mut session, &clip_id, &child_id).expect("dup child");
+        assert_ne!(dup_id, child_id);
+        let rows = collect_effect_group_child_rows(&session, &clip_id, &group_id, &BTreeSet::new());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, child_id);
+        assert_eq!(rows[1].id, dup_id);
+        assert_eq!(session.selection.effect_ids, vec![dup_id]);
+    }
 }

@@ -836,11 +836,38 @@ pub struct PlaybackToolbarMetrics {
 }
 
 /// Runtime state for `player-plus` viewport toolbar controls.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct PlayerPlusState {
     pub drawing_paused: bool,
     pub single_render_requested: bool,
     pub preview_quality: PreviewQuality,
+    /// When enabled, dynamically steps down preview scale during playback when frames exceed budget.
+    pub adaptive_quality: bool,
+    /// Dynamic adaptive resolution divisor (`1`, `2`, `4`, `8`); resets to `1` on pause.
+    pub adaptive_divisor: u32,
+    /// Upscale filtering mode: `false` = Smooth (`Linear`), `true` = Sharp (`Nearest`).
+    pub sharp_upscale: bool,
+    /// Render effects at full sequence scale even when preview quality is reduced.
+    pub exact_effects: bool,
+    /// When `false` (default), playback steps through uncached frames without skipping so the
+    /// preview cache builds a contiguous green bar before playing back at real-time speed.
+    /// When `true`, playback always advances in real time and drops uncached frames if needed.
+    pub drop_frames: bool,
+}
+
+impl Default for PlayerPlusState {
+    fn default() -> Self {
+        Self {
+            drawing_paused: false,
+            single_render_requested: false,
+            preview_quality: PreviewQuality::Full,
+            adaptive_quality: false,
+            adaptive_divisor: 1,
+            sharp_upscale: false,
+            exact_effects: false,
+            drop_frames: false,
+        }
+    }
 }
 
 /// High-level UI actions bubbled out of [`Cm3Workspace::show`] to `main.rs` / host shell.
@@ -872,6 +899,14 @@ pub enum UiAction {
     CancelExport,
     #[cfg(not(target_arch = "wasm32"))]
     OpenOutputFolder(PathBuf),
+    #[cfg(not(target_arch = "wasm32"))]
+    OpenFfmpegSetup,
+    #[cfg(not(target_arch = "wasm32"))]
+    BrowseFfmpegBinary,
+    #[cfg(not(target_arch = "wasm32"))]
+    ClearFfmpegBinary,
+    #[cfg(not(target_arch = "wasm32"))]
+    ReprobeFfmpeg,
     #[cfg(not(target_arch = "wasm32"))]
     SaveRecoverySnapshotNow,
     #[cfg(not(target_arch = "wasm32"))]
@@ -1623,6 +1658,14 @@ impl Cm3Workspace {
                 PanelAction::CancelExport => UiAction::CancelExport,
                 #[cfg(not(target_arch = "wasm32"))]
                 PanelAction::OpenOutputFolder(path) => UiAction::OpenOutputFolder(path),
+                #[cfg(not(target_arch = "wasm32"))]
+                PanelAction::OpenFfmpegSetup => UiAction::OpenFfmpegSetup,
+                #[cfg(not(target_arch = "wasm32"))]
+                PanelAction::BrowseFfmpegBinary => UiAction::BrowseFfmpegBinary,
+                #[cfg(not(target_arch = "wasm32"))]
+                PanelAction::ClearFfmpegBinary => UiAction::ClearFfmpegBinary,
+                #[cfg(not(target_arch = "wasm32"))]
+                PanelAction::ReprobeFfmpeg => UiAction::ReprobeFfmpeg,
                 #[cfg(not(target_arch = "wasm32"))]
                 PanelAction::SaveRecoverySnapshotNow => UiAction::SaveRecoverySnapshotNow,
                 #[cfg(not(target_arch = "wasm32"))]
@@ -2766,7 +2809,9 @@ impl Cm3Workspace {
             let q_resp = ui
                 .interact(q_rect, Id::unique("pp_quality"), Sense::click())
                 .on_hover_cursor(CursorIcon::PointingHand)
-                .on_hover_text("Player+: cycle preview resolution quality");
+                .on_hover_text(
+                    "Player+: Left-click to cycle quality · Right-click for adaptive/upscale options",
+                );
             if q_resp.hovered() && !q_resp.has_focus() {
                 ui.painter().rect_filled(
                     q_rect,
@@ -2796,8 +2841,43 @@ impl Cm3Workspace {
                     .unwrap_or(0);
                 self.player_plus.preview_quality =
                     PreviewQuality::ALL[(idx + 1) % PreviewQuality::ALL.len()];
+                self.player_plus.adaptive_divisor = 1;
                 ui.memory_mut(|m| m.surrender_focus(q_resp.id));
             }
+            q_resp.context_menu(|ui| {
+                ui.set_min_width(168.0);
+                ui.label(egui::RichText::new("Preview Quality").strong());
+                for q in PreviewQuality::ALL {
+                    if ui
+                        .selectable_label(self.player_plus.preview_quality == q, q.label())
+                        .clicked()
+                    {
+                        self.player_plus.preview_quality = q;
+                        self.player_plus.adaptive_divisor = 1;
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui
+                    .checkbox(&mut self.player_plus.adaptive_quality, "Adaptive quality")
+                    .changed()
+                    && !self.player_plus.adaptive_quality
+                {
+                    self.player_plus.adaptive_divisor = 1;
+                }
+                ui.checkbox(
+                    &mut self.player_plus.sharp_upscale,
+                    "Sharp upscale (Nearest)",
+                );
+                ui.checkbox(&mut self.player_plus.exact_effects, "Exact effects")
+                    .on_hover_text(
+                        "Evaluate effects at full sequence resolution (disables preview downsampling)",
+                    );
+                ui.checkbox(&mut self.player_plus.drop_frames, "Drop frames (realtime)")
+                    .on_hover_text(
+                        "Skip uncached frames to keep real-time playback speed instead of caching every frame",
+                    );
+            });
         } else {
             self.speed_menu_open = false;
         }
@@ -2967,17 +3047,13 @@ impl Cm3Workspace {
                 let delta = if shift { 5.0 } else { 1.0 };
                 let _ = session.execute(Command::StepFrame { delta });
             } else if !ctrl && !shift && !alt && i.key_pressed(Key::J) {
-                let speed = session.playback.speed - 0.25;
+                let speed = super::shortcuts::next_shuttle_reverse_speed(session.playback.speed);
                 let _ = session.execute(Command::SetSpeed { speed });
             } else if !ctrl && !shift && !alt && i.key_pressed(Key::K) {
                 let _ = session.execute(Command::SetSpeed { speed: 0.0 });
-            } else if !ctrl
-                && !shift
-                && !alt
-                && i.key_pressed(Key::L)
-                && self.focused_panel != PanelFocus::Timeline
-            {
-                let speed = session.playback.speed + 0.25;
+                session.playback.last_speed = 1.0;
+            } else if !ctrl && !shift && !alt && i.key_pressed(Key::L) {
+                let speed = super::shortcuts::next_shuttle_forward_speed(session.playback.speed);
                 let _ = session.execute(Command::SetSpeed { speed });
             } else if !ctrl
                 && !shift
@@ -3457,6 +3533,15 @@ mod tests {
             "dragging horizontal splitter back up -60px must move viewport to ~{}, got {}",
             init_vp_h - 20.0,
             vp_after_up.height()
+        );
+    }
+
+    #[test]
+    fn player_plus_defaults_to_caching_every_frame_without_dropping() {
+        let state = PlayerPlusState::default();
+        assert!(
+            !state.drop_frames,
+            "PlayerPlusState must default drop_frames to false so RAM preview caches every frame cleanly"
         );
     }
 }

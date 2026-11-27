@@ -1207,6 +1207,122 @@ pub fn apply_warp(mesh: &MeshData, bend: f32, _bulge: f32, axis: DeformAxis) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Shear Deformer (`scene-effectors.js:307-373`, `effector-core.js:284-296`)
+// ---------------------------------------------------------------------------
+
+/// Zoidium `Shear` deformer parameters (`zoidium:repeater/shear`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShearParams {
+    /// Shear amount (offset per unit of extent along `axis`, measured from `pivot`).
+    pub amount: f32,
+    /// Axis measured along (`0 = X, 1 = Y, 2 = Z`, default `Y`).
+    pub axis: DeformAxis,
+    /// Direction axis displaced (`0 = X, 1 = Y, 2 = Z`, default `X`).
+    pub direction: DeformAxis,
+    /// Reference pivot in deformer space.
+    pub pivot: Vec3,
+    /// Subdivision level (`1`, `2`, `4`, `8`, `16`).
+    pub subdivision: u32,
+    pub field: Option<EffectorField>,
+}
+
+impl Default for ShearParams {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            axis: DeformAxis::Y,
+            direction: DeformAxis::X,
+            pivot: Vec3::ZERO,
+            subdivision: 1,
+            field: None,
+        }
+    }
+}
+
+/// Exact Zoidium `shearPositions` (`effector-core.js:284-296`) with optional subdivision,
+/// deformer-relative frame, and 6-type spatial falloff field.
+#[must_use]
+pub fn apply_shear_with_params(
+    mesh: &MeshData,
+    params: &ShearParams,
+    shared_bounds: Option<Aabb3>,
+    deformer_frame: Option<&DeformerFrame>,
+) -> MeshData {
+    if mesh.vertices.is_empty() || !params.amount.is_finite() || params.amount.abs() <= 1e-9 {
+        return mesh.clone();
+    }
+
+    let mut out = if params.subdivision > 1 {
+        subdivide_mesh(mesh, params.subdivision)
+    } else {
+        mesh.clone()
+    };
+    let rest_vertices = out.vertices.clone();
+
+    let use_frame = deformer_frame.is_some_and(|f| !f.identity);
+    if let Some(frame) = deformer_frame
+        && use_frame
+    {
+        for v in &mut out.vertices {
+            v.position = frame
+                .forward
+                .transform_point3(Vec3::from_array(v.position))
+                .to_array();
+        }
+        out.recompute_bounds();
+    }
+
+    let prepared_field = params.field.as_ref().map(|f| {
+        if let Some(sb) = shared_bounds {
+            prepare_field_for_bounds(f, sb)
+        } else {
+            let pos_list: Vec<[f32; 3]> = out.vertices.iter().map(|v| v.position).collect();
+            prepare_field_from_positions(f, &pos_list, None)
+        }
+    });
+
+    let along_axis = match params.axis {
+        DeformAxis::X => 0usize,
+        DeformAxis::Y => 1usize,
+        DeformAxis::Z => 2usize,
+    };
+    let move_axis = match params.direction {
+        DeformAxis::X => 0usize,
+        DeformAxis::Y => 1usize,
+        DeformAxis::Z => 2usize,
+    };
+    let pivot_val = f64::from(params.pivot.to_array()[along_axis]);
+    let amount = f64::from(params.amount);
+
+    for v in &mut out.vertices {
+        let p = v.position;
+        let weight = prepared_field
+            .as_ref()
+            .map_or(1.0, |pf| evaluate_field(Vec3::from_array(p), pf));
+        if weight.abs() <= 1e-12 {
+            continue;
+        }
+        let delta = amount * (f64::from(p[along_axis]) - pivot_val) * weight;
+        v.position[move_axis] = (f64::from(p[move_axis]) + delta) as f32;
+    }
+
+    if let Some(frame) = deformer_frame
+        && use_frame
+    {
+        for v in &mut out.vertices {
+            v.position = frame
+                .inverse
+                .transform_point3(Vec3::from_array(v.position))
+                .to_array();
+        }
+    }
+
+    recompute_deformed_normals(&mut out, &rest_vertices);
+    out.recompute_bounds();
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Plain Effector (`effector-core.js:532-567`)
 // ---------------------------------------------------------------------------
 
@@ -2009,12 +2125,14 @@ enum ClipOutcome {
 }
 
 /// Clips a convex polygon against half-space `(p - origin).dot(inward_normal) >= 0`.
-/// If the plane cuts the polygon, pushes the boundary intersection segment `(start, end)`
-/// and populates `out` (reusing caller-owned scratch buffers `dists` and `out`).
+/// Populates `out` and appends every boundary edge `(a, b)` of the clipped polygon lying on the
+/// bisector plane (`|dist| <= 4 * eps`), matching Zoidium `effector-fracture.js:657-662` so
+/// vertices or edges lying directly on the plane never drop cap segments.
 fn clip_polygon_halfspace(
     poly: &[ClipVert],
     plane_origin: Vec3,
     inward_normal: Vec3,
+    plane_eps: f32,
     dists: &mut Vec<f32>,
     out: &mut Vec<ClipVert>,
     cut_segments: &mut Vec<(Vec3, Vec3)>,
@@ -2024,7 +2142,7 @@ fn clip_polygon_halfspace(
         return ClipOutcome::AllOut;
     }
 
-    let eps = 1e-5_f32;
+    let eps = plane_eps.max(1e-6);
     dists.clear();
     let mut all_in = true;
     let mut all_out = true;
@@ -2042,17 +2160,28 @@ fn clip_polygon_halfspace(
         return ClipOutcome::AllOut;
     }
     if all_in {
+        // Still record any boundary edge lying directly on the cut plane so planar faces
+        // touching the bisector do not leave open gaps in the cap loop.
+        let on_plane_eps = eps * 4.0;
+        for i in 0..n {
+            let j = (i + 1) % n;
+            if dists[i].abs() <= on_plane_eps && dists[j].abs() <= on_plane_eps {
+                let a = poly[i].pos;
+                let b = poly[j].pos;
+                if a.distance_squared(b) > (eps * eps).max(1e-12) {
+                    cut_segments.push((a, b));
+                }
+            }
+        }
         return ClipOutcome::AllIn;
     }
 
     out.clear();
-    let mut cross_pts = [Vec3::ZERO; 2];
-    let mut cross_count = 0_usize;
-
+    let dedup_eps2 = (eps * eps).max(1e-12);
     let push_dedup = |dst: &mut Vec<ClipVert>, v: ClipVert| {
         if dst
             .last()
-            .is_none_or(|prev| prev.pos.distance_squared(v.pos) > 1e-10)
+            .is_none_or(|prev| prev.pos.distance_squared(v.pos) > dedup_eps2)
         {
             dst.push(v);
         }
@@ -2079,22 +2208,29 @@ fn clip_polygon_halfspace(
             };
             let hit = ClipVert::lerp(vi, vj, t);
             push_dedup(out, hit);
-            if cross_count < 2 {
-                cross_pts[cross_count] = hit.pos;
-                cross_count += 1;
-            }
         }
     }
 
-    while out.len() >= 2 && out[0].pos.distance_squared(out[out.len() - 1].pos) <= 1e-10 {
+    while out.len() >= 2 && out[0].pos.distance_squared(out[out.len() - 1].pos) <= dedup_eps2 {
         out.pop();
     }
 
-    if cross_count == 2 && cross_pts[0].distance_squared(cross_pts[1]) > 1e-10 {
-        cut_segments.push((cross_pts[0], cross_pts[1]));
-    }
-
     if out.len() >= 3 {
+        let on_plane_eps = eps * 4.0;
+        let m = out.len();
+        for i in 0..m {
+            let j = (i + 1) % m;
+            let a = out[i].pos;
+            let b = out[j].pos;
+            let da = (a - plane_origin).dot(inward_normal);
+            let db = (b - plane_origin).dot(inward_normal);
+            if da.abs() <= on_plane_eps
+                && db.abs() <= on_plane_eps
+                && a.distance_squared(b) > dedup_eps2
+            {
+                cut_segments.push((a, b));
+            }
+        }
         ClipOutcome::Clipped
     } else {
         ClipOutcome::AllOut
@@ -2162,11 +2298,13 @@ fn extend_cap_chain(
 
 /// Builds planar inner cap triangles on a Voronoi bisector plane (`material_slot = 1`)
 /// using `lyon_tessellation::FillRule::EvenOdd` so hollow/non-convex cuts preserve interior holes,
-/// and appends them directly to `cell_polys` so subsequent bisector planes clip them cleanly.
+/// canceling shared interior edges (`effector-fracture.js:334-343`) and using extent-relative
+/// welding before chaining closed loops.
 fn build_planar_cap_polys(
     segments: &[(Vec3, Vec3)],
     plane_origin: Vec3,
     inward_normal: Vec3,
+    weld_eps: f32,
     cell_polys: &mut Vec<Vec<ClipVert>>,
     tessellator: &mut FillTessellator,
     cap_geo: &mut VertexBuffers<[f32; 2], u32>,
@@ -2184,34 +2322,71 @@ fn build_planar_cap_polys(
     let tangent_u = cap_normal.cross(ref_axis).normalize_or_zero();
     let tangent_v = cap_normal.cross(tangent_u).normalize_or_zero();
 
-    let segments_2d: Vec<(Vec2, Vec2)> = segments
-        .iter()
-        .take(MAX_CAP_CONTOUR_VERTS)
-        .filter_map(|&(a, b)| {
-            let da = a - plane_origin;
-            let db = b - plane_origin;
-            let p0 = Vec2::new(da.dot(tangent_u), da.dot(tangent_v));
-            let p1 = Vec2::new(db.dot(tangent_u), db.dot(tangent_v));
-            (p0.x.is_finite()
-                && p0.y.is_finite()
-                && p1.x.is_finite()
-                && p1.y.is_finite()
-                && p0.distance_squared(p1) > 1e-10)
-                .then_some((p0, p1))
-        })
+    let weld = weld_eps.clamp(1e-6, 1e-2);
+    let weld2 = weld * weld;
+    let inv_cell = 1.0 / weld;
+
+    // Weld 2D endpoints using neighbor buckets and cancel duplicate undirected edges
+    // (exact match to Zoidium `cutLoops`, `effector-fracture.js:300-343`).
+    let mut points: Vec<Vec2> = Vec::with_capacity(segments.len());
+    let mut buckets: HashMap<(i64, i64), Vec<usize>> = HashMap::with_capacity(segments.len() * 2);
+    let mut edge_set: std::collections::BTreeMap<(usize, usize), (usize, usize)> =
+        std::collections::BTreeMap::new();
+
+    let mut weld_pt = |p: Vec2| -> usize {
+        let (gx, gy) = cap_grid_key(p, inv_cell);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if let Some(list) = buckets.get(&(gx + dx, gy + dy)) {
+                    for &id in list {
+                        if points[id].distance_squared(p) <= weld2 {
+                            return id;
+                        }
+                    }
+                }
+            }
+        }
+        let id = points.len();
+        points.push(p);
+        buckets.entry((gx, gy)).or_default().push(id);
+        id
+    };
+
+    for &(a, b) in segments.iter().take(MAX_CAP_CONTOUR_VERTS) {
+        let da = a - plane_origin;
+        let db = b - plane_origin;
+        let p0 = Vec2::new(da.dot(tangent_u), da.dot(tangent_v));
+        let p1 = Vec2::new(db.dot(tangent_u), db.dot(tangent_v));
+        if !p0.x.is_finite() || !p0.y.is_finite() || !p1.x.is_finite() || !p1.y.is_finite() {
+            continue;
+        }
+        let i = weld_pt(p0);
+        let j = weld_pt(p1);
+        if i == j {
+            continue;
+        }
+        let key = if i < j { (i, j) } else { (j, i) };
+        if edge_set.remove(&key).is_none() {
+            edge_set.insert(key, (i, j));
+        }
+    }
+
+    let segments_2d: Vec<(Vec2, Vec2)> = edge_set
+        .values()
+        .map(|&(i, j)| (points[i], points[j]))
         .collect();
 
     if segments_2d.len() < 3 {
         return;
     }
 
-    let snap_eps2 = 1e-4_f32;
-    let inv_cell = 1.0 / snap_eps2.sqrt();
+    let snap_eps2 = (weld * 4.0).powi(2).max(1e-8);
+    let snap_inv_cell = 1.0 / snap_eps2.sqrt();
     let mut endpoint_grid: HashMap<(i64, i64), Vec<usize>> =
         HashMap::with_capacity(segments_2d.len() * 2);
     for (idx, &(a, b)) in segments_2d.iter().enumerate() {
-        let ka = cap_grid_key(a, inv_cell);
-        let kb = cap_grid_key(b, inv_cell);
+        let ka = cap_grid_key(a, snap_inv_cell);
+        let kb = cap_grid_key(b, snap_inv_cell);
         endpoint_grid.entry(ka).or_default().push(idx);
         if kb != ka {
             endpoint_grid.entry(kb).or_default().push(idx);
@@ -2233,7 +2408,7 @@ fn build_planar_cap_polys(
             &segments_2d,
             &mut used,
             &endpoint_grid,
-            inv_cell,
+            snap_inv_cell,
             snap_eps2,
         ) {
             chain.reverse();
@@ -2242,11 +2417,11 @@ fn build_planar_cap_polys(
                 &segments_2d,
                 &mut used,
                 &endpoint_grid,
-                inv_cell,
+                snap_inv_cell,
                 snap_eps2,
             );
         }
-        if chain.len() >= 3 && polygon_area_2d(&chain).abs() > 1e-7 {
+        if chain.len() >= 3 && polygon_area_2d(&chain).abs() > 1e-8 {
             loops.push(chain);
         }
     }
@@ -2441,37 +2616,63 @@ pub fn generate_voronoi_sites(mesh: &MeshData, params: &VoronoiFractureParams) -
     sites
 }
 
-/// Evaluates Zoidium Voronoi Fracture (`effector-fracture.js:557-921`) with `effectorHash01`,
-/// 4 site distributions, anisotropic `cell_scale` metric, `closed` cap toggle, and full
-/// `applyFragmentMotion` (distance, scatter, shrink offset, Rodrigues spin, explicit direction &
-/// XYZ rotation, fragment scale, quadratic gravity, randomness, and 6-type Field).
+/// Cached Voronoi fracture topology stage built once per `(source mesh, cells, seed, closed,
+/// distribution, cell_scale)` matching Zoidium `effector-fracture.js:buildVoronoiFracture`.
+///
+/// Per-frame motion (`apply_voronoi_fragment_motion`) transforms this cached stage in O(vertices)
+/// without rebuilding cells or clipping polygons.
+#[derive(Clone, Debug)]
+pub struct VoronoiFractureStage {
+    pub rest_mesh: MeshData,
+    /// Per-vertex piece index (`0..piece_count`).
+    pub piece_ids: Vec<u32>,
+    /// Per-piece rest centroid in mesh-local space.
+    pub piece_centroids: Vec<Vec3>,
+    /// Overall fracture center in mesh-local space.
+    pub center: Vec3,
+    pub seed: i32,
+    pub cells: u32,
+    pub closed: bool,
+    /// Precomputed per-vertex random HSL piece colors (`voronoi_piece_color`).
+    pub random_vertex_colors: Vec<[f32; 4]>,
+}
+
+/// Builds the cached Voronoi fracture topology stage for `mesh` (`effector-fracture.js:557-833`).
 #[must_use]
-pub fn apply_voronoi_fracture_with_params(
+pub fn build_voronoi_fracture_stage(
     mesh: &MeshData,
     params: &VoronoiFractureParams,
-    shared_bounds: Option<Aabb3>,
-    deformer_frame: Option<&DeformerFrame>,
-) -> MeshData {
+) -> VoronoiFractureStage {
     let cells = params.cells.clamp(1, 1000) as usize;
+    let seed = params.seed;
+    let rest_center = 0.5 * (mesh.bounds.min + mesh.bounds.max);
     if mesh.indices.len() < 3 || mesh.vertices.is_empty() {
-        return MeshData::empty();
+        return VoronoiFractureStage {
+            rest_mesh: MeshData::empty(),
+            piece_ids: Vec::new(),
+            piece_centroids: Vec::new(),
+            center: rest_center,
+            seed,
+            cells: cells as u32,
+            closed: params.closed,
+            random_vertex_colors: Vec::new(),
+        };
     }
 
-    let has_motion = params.distance.abs() > 1e-8
-        || params.scatter.abs() > 1e-8
-        || params.offset.abs() > 1e-8
-        || params.spin_rad.abs() > 1e-8
-        || params.direction.length_squared() > 1e-12
-        || params.rotation_deg.length_squared() > 1e-12
-        || (params.fragment_scale - 100.0).abs() > 1e-6
-        || params.gravity.abs() > 1e-8;
-    if cells == 1 && !has_motion {
-        let mut cloned = mesh.clone();
-        if params.random_colors {
-            let c = voronoi_piece_color(params.seed, 0);
-            cloned.colors = vec![[c[0], c[1], c[2], 1.0]; cloned.vertices.len()];
-        }
-        return cloned;
+    if cells == 1 {
+        let c = voronoi_piece_color(seed, 0);
+        let random_vertex_colors = vec![[c[0], c[1], c[2], 1.0]; mesh.vertices.len()];
+        let piece_ids = vec![0u32; mesh.vertices.len()];
+        return VoronoiFractureStage {
+            rest_mesh: mesh.clone(),
+            piece_ids,
+            piece_centroids: vec![rest_center],
+            center: rest_center,
+            seed,
+            cells: 1,
+            closed: params.closed,
+            random_vertex_colors,
+        };
     }
 
     let sites = generate_voronoi_sites(mesh, params);
@@ -2499,42 +2700,6 @@ pub fn apply_voronoi_fracture_with_params(
         }
     }
 
-    let use_frame = deformer_frame.is_some_and(|f| !f.identity);
-    let forward = deformer_frame.map(|f| f.forward);
-    let rest_center = 0.5 * (mesh.bounds.min + mesh.bounds.max);
-    let center = match (forward, use_frame) {
-        (Some(m), true) => m.transform_point3(rest_center),
-        _ => rest_center,
-    };
-
-    let prepared_field = params.field.as_ref().map(|f| {
-        if let Some(sb) = shared_bounds {
-            prepare_field_for_bounds(f, sb)
-        } else {
-            let pos_list: Vec<[f32; 3]> = mesh.vertices.iter().map(|v| v.position).collect();
-            prepare_field_from_positions(f, &pos_list, if use_frame { forward } else { None })
-        }
-    });
-
-    let seed = params.seed;
-    let distance = finite_or(f64::from(params.distance), 0.0);
-    let scatter = finite_or(f64::from(params.scatter), 0.0);
-    let shrink_offset = finite_or(f64::from(params.offset), 0.0);
-    let spin_rad = finite_or(f64::from(params.spin_rad), 0.0);
-    let explicit_dir = [
-        finite_or(f64::from(params.direction.x), 0.0),
-        finite_or(f64::from(params.direction.y), 0.0),
-        finite_or(f64::from(params.direction.z), 0.0),
-    ];
-    let explicit_rot = [
-        finite_or(f64::from(params.rotation_deg.x), 0.0),
-        finite_or(f64::from(params.rotation_deg.y), 0.0),
-        finite_or(f64::from(params.rotation_deg.z), 0.0),
-    ];
-    let fragment_scale = finite_or(f64::from(params.fragment_scale), 100.0);
-    let gravity = finite_or(f64::from(params.gravity), 0.0);
-    let randomness = clamp_unit(finite_or(f64::from(params.randomness), 0.0) / 100.0);
-
     let mut source_min = Vec3::splat(f32::INFINITY);
     let mut source_max = Vec3::splat(f32::NEG_INFINITY);
     for poly in &source_tris {
@@ -2543,6 +2708,11 @@ pub fn apply_voronoi_fracture_with_params(
             source_max = source_max.max(v.pos);
         }
     }
+    let extent_v = source_max - source_min;
+    let max_extent = extent_v.x.max(extent_v.y).max(extent_v.z).max(1e-4);
+    let plane_eps = (max_extent * 1e-6).clamp(1e-6, 1e-4);
+    let weld_eps = (max_extent * 1e-5).clamp(1e-6, 5e-3);
+
     let max_metric_sqrt = metric[0].max(metric[1]).max(metric[2]).sqrt();
     let compute_break_threshold = |c_min: Vec3, c_max: Vec3, site: Vec3| -> f64 {
         let dx = f64::from((c_min.x - site.x).abs().max((c_max.x - site.x).abs()));
@@ -2555,9 +2725,10 @@ pub fn apply_voronoi_fracture_with_params(
 
     let mut out_verts: Vec<Vertex3D> = Vec::new();
     let mut out_indices: Vec<u32> = Vec::new();
+    let mut out_piece_ids: Vec<u32> = Vec::new();
     let mut out_colors: Vec<[f32; 4]> = Vec::new();
+    let mut piece_centroids: Vec<Vec3> = Vec::with_capacity(cells);
 
-    // Hoisted reusable scratch buffers across all Voronoi cells & half-space planes.
     let mut tessellator = FillTessellator::new();
     let mut cap_geo: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
     let mut dists_scratch: Vec<f32> = Vec::with_capacity(16);
@@ -2568,18 +2739,18 @@ pub fn apply_voronoi_fracture_with_params(
 
     for (ci, &site_c) in sites.iter().enumerate() {
         if out_indices.len() / 3 >= MAX_VORONOI_OUTPUT_TRIS {
-            break;
+            piece_centroids.push(site_c);
+            continue;
         }
         let mut cell_polys = source_tris.clone();
         if cell_polys.is_empty() {
+            piece_centroids.push(site_c);
             continue;
         }
         let mut cell_min = source_min;
         let mut cell_max = source_max;
         let mut break_threshold = compute_break_threshold(cell_min, cell_max, site_c);
 
-        // Sort neighbor sites by ascending metric-squared distance from `site_c` so the closest
-        // clipping planes shrink the cell AABB immediately and distant sites early-out.
         neighbors.clear();
         for (cj, &site_j) in sites.iter().enumerate() {
             if ci == cj {
@@ -2598,7 +2769,6 @@ pub fn apply_voronoi_fracture_with_params(
                 break;
             }
             let site_j = sites[cj];
-            // Anisotropic bisector plane matching `effector-fracture.js:173-181`.
             let diff_m = [
                 f64::from(site_c.x - site_j.x) * metric[0],
                 f64::from(site_c.y - site_j.y) * metric[1],
@@ -2616,9 +2786,6 @@ pub fn apply_voronoi_fracture_with_params(
             );
             let mid = (site_c + site_j) * 0.5;
 
-            // Fast O(1) AABB half-space projection tests:
-            // `worst` minimizes `(p - mid).dot(inward_n)` over the cell AABB;
-            // `best` maximizes `(p - mid).dot(inward_n)` over the cell AABB.
             let worst = Vec3::new(
                 if inward_n.x >= 0.0 {
                     cell_min.x
@@ -2636,7 +2803,7 @@ pub fn apply_voronoi_fracture_with_params(
                     cell_max.z
                 },
             );
-            if (worst - mid).dot(inward_n) > 1e-4 {
+            if (worst - mid).dot(inward_n) > plane_eps * 10.0 {
                 continue;
             }
             let best = Vec3::new(
@@ -2656,7 +2823,7 @@ pub fn apply_voronoi_fracture_with_params(
                     cell_min.z
                 },
             );
-            if (best - mid).dot(inward_n) < -1e-4 {
+            if (best - mid).dot(inward_n) < -plane_eps * 10.0 {
                 cell_polys.clear();
                 break;
             }
@@ -2669,6 +2836,7 @@ pub fn apply_voronoi_fracture_with_params(
                     &poly,
                     mid,
                     inward_n,
+                    plane_eps,
                     &mut dists_scratch,
                     &mut out_scratch,
                     &mut cut_segs,
@@ -2695,6 +2863,7 @@ pub fn apply_voronoi_fracture_with_params(
                         &cut_segs,
                         mid,
                         inward_n,
+                        weld_eps,
                         &mut cell_polys,
                         &mut tessellator,
                         &mut cap_geo,
@@ -2718,11 +2887,10 @@ pub fn apply_voronoi_fracture_with_params(
         }
 
         if cell_polys.is_empty() {
+            piece_centroids.push(site_c);
             continue;
         }
 
-        // Compute outer-surface fragment centroid (matching `effector-fracture.js:770-791`:
-        // outer fragment vertices determine centroid; falls back to all cell vertices / site_c).
         let mut outer_sum = [0.0_f64; 3];
         let mut outer_count = 0_usize;
         let mut all_sum = [0.0_f64; 3];
@@ -2756,13 +2924,125 @@ pub fn apply_voronoi_fracture_with_params(
         } else {
             site_c
         };
+        piece_centroids.push(rest_centroid);
 
+        let c = voronoi_piece_color(seed, ci as i32);
+        let piece_rgba = [c[0], c[1], c[2], 1.0];
+        for poly in &cell_polys {
+            if out_indices.len() / 3 >= MAX_VORONOI_OUTPUT_TRIS {
+                break;
+            }
+            let base = out_verts.len() as u32;
+            for v in poly {
+                out_verts.push(Vertex3D::new(
+                    v.pos.to_array(),
+                    v.normal.to_array(),
+                    v.uv,
+                    v.material_slot,
+                ));
+                out_piece_ids.push(ci as u32);
+                out_colors.push(piece_rgba);
+            }
+            for k in 1..(poly.len() - 1) {
+                out_indices.push(base);
+                out_indices.push(base + k as u32);
+                out_indices.push(base + k as u32 + 1);
+            }
+        }
+    }
+
+    VoronoiFractureStage {
+        rest_mesh: MeshData::new(out_verts, out_indices),
+        piece_ids: out_piece_ids,
+        piece_centroids,
+        center: rest_center,
+        seed,
+        cells: cells as u32,
+        closed: params.closed,
+        random_vertex_colors: out_colors,
+    }
+}
+
+/// Applies per-frame Voronoi fragment motion (`effector-fracture.js:841-921`) to a cached
+/// [`VoronoiFractureStage`] without rebuilding cell topology.
+#[must_use]
+pub fn apply_voronoi_fragment_motion(
+    stage: &VoronoiFractureStage,
+    params: &VoronoiFractureParams,
+    shared_bounds: Option<Aabb3>,
+    deformer_frame: Option<&DeformerFrame>,
+) -> MeshData {
+    if stage.rest_mesh.vertices.is_empty() || stage.rest_mesh.indices.is_empty() {
+        return MeshData::empty();
+    }
+
+    let has_motion = params.distance.abs() > 1e-8
+        || params.scatter.abs() > 1e-8
+        || params.offset.abs() > 1e-8
+        || params.spin_rad.abs() > 1e-8
+        || params.direction.length_squared() > 1e-12
+        || params.rotation_deg.length_squared() > 1e-12
+        || (params.fragment_scale - 100.0).abs() > 1e-6
+        || params.gravity.abs() > 1e-8;
+    if !has_motion {
+        let mut out = stage.rest_mesh.clone();
+        if params.random_colors {
+            out.colors = stage.random_vertex_colors.clone();
+        }
+        return out;
+    }
+
+    let use_frame = deformer_frame.is_some_and(|f| !f.identity);
+    let forward = deformer_frame.map(|f| f.forward);
+    let center = match (forward, use_frame) {
+        (Some(m), true) => m.transform_point3(stage.center),
+        _ => stage.center,
+    };
+
+    let prepared_field = params.field.as_ref().map(|f| {
+        if let Some(sb) = shared_bounds {
+            prepare_field_for_bounds(f, sb)
+        } else {
+            let pos_list: Vec<[f32; 3]> = stage
+                .rest_mesh
+                .vertices
+                .iter()
+                .map(|v| v.position)
+                .collect();
+            prepare_field_from_positions(f, &pos_list, if use_frame { forward } else { None })
+        }
+    });
+
+    let seed = stage.seed;
+    let distance = finite_or(f64::from(params.distance), 0.0);
+    let scatter = finite_or(f64::from(params.scatter), 0.0);
+    let shrink_offset = finite_or(f64::from(params.offset), 0.0);
+    let spin_rad = finite_or(f64::from(params.spin_rad), 0.0);
+    let explicit_dir = [
+        finite_or(f64::from(params.direction.x), 0.0),
+        finite_or(f64::from(params.direction.y), 0.0),
+        finite_or(f64::from(params.direction.z), 0.0),
+    ];
+    let explicit_rot = [
+        finite_or(f64::from(params.rotation_deg.x), 0.0),
+        finite_or(f64::from(params.rotation_deg.y), 0.0),
+        finite_or(f64::from(params.rotation_deg.z), 0.0),
+    ];
+    let fragment_scale = finite_or(f64::from(params.fragment_scale), 100.0);
+    let gravity = finite_or(f64::from(params.gravity), 0.0);
+    let randomness = clamp_unit(finite_or(f64::from(params.randomness), 0.0) / 100.0);
+
+    let piece_count = stage.piece_centroids.len();
+    let mut local_centroids = Vec::with_capacity(piece_count);
+    let mut shifts = Vec::with_capacity(piece_count);
+    let mut scales = Vec::with_capacity(piece_count);
+    let mut rots = Vec::with_capacity(piece_count);
+
+    for (ci, &rest_centroid) in stage.piece_centroids.iter().enumerate() {
         let local_centroid = match (forward, use_frame) {
             (Some(m), true) => m.transform_point3(rest_centroid),
             _ => rest_centroid,
         };
-
-        // Exact Zoidium `applyFragmentMotion` (`effector-fracture.js:871-904`).
         let piece = ci as i32;
         let field_weight = prepared_field
             .as_ref()
@@ -2832,74 +3112,95 @@ pub fn apply_voronoi_fracture_with_params(
                 rot[6 + col] = rotated[2];
             }
         }
-
-        let cx = f64::from(local_centroid.x);
-        let cy = f64::from(local_centroid.y);
-        let cz = f64::from(local_centroid.z);
-
-        let piece_rgba = if params.random_colors {
-            let c = voronoi_piece_color(seed, piece);
-            Some([c[0], c[1], c[2], 1.0])
-        } else {
-            None
-        };
-
-        // Emit transformed fragment vertices (and transform back from deformer frame if needed).
-        for poly in &cell_polys {
-            if out_indices.len() / 3 >= MAX_VORONOI_OUTPUT_TRIS {
-                break;
-            }
-            let base = out_verts.len() as u32;
-            for v in poly {
-                let p_def = match (forward, use_frame) {
-                    (Some(m), true) => m.transform_point3(v.pos),
-                    _ => v.pos,
-                };
-                let qx = (f64::from(p_def.x) - cx) * scale;
-                let qy = (f64::from(p_def.y) - cy) * scale;
-                let qz = (f64::from(p_def.z) - cz) * scale;
-                let moved_def = Vec3::new(
-                    (cx + rot[0] * qx + rot[1] * qy + rot[2] * qz + shift[0]) as f32,
-                    (cy + rot[3] * qx + rot[4] * qy + rot[5] * qz + shift[1]) as f32,
-                    (cz + rot[6] * qx + rot[7] * qy + rot[8] * qz + shift[2]) as f32,
-                );
-                let final_pos = match (deformer_frame, use_frame) {
-                    (Some(frame), true) => frame.inverse.transform_point3(moved_def),
-                    _ => moved_def,
-                };
-                let nx = f64::from(v.normal.x);
-                let ny = f64::from(v.normal.y);
-                let nz = f64::from(v.normal.z);
-                let rn = Vec3::new(
-                    (rot[0] * nx + rot[1] * ny + rot[2] * nz) as f32,
-                    (rot[3] * nx + rot[4] * ny + rot[5] * nz) as f32,
-                    (rot[6] * nx + rot[7] * ny + rot[8] * nz) as f32,
-                )
-                .normalize_or_zero();
-                let final_n = if rn.length_squared() > 1e-12 {
-                    rn
-                } else {
-                    v.normal
-                };
-                out_verts.push(Vertex3D::new(
-                    final_pos.to_array(),
-                    final_n.to_array(),
-                    v.uv,
-                    v.material_slot,
-                ));
-                if let Some(rgba) = piece_rgba {
-                    out_colors.push(rgba);
-                }
-            }
-            for k in 1..(poly.len() - 1) {
-                out_indices.push(base);
-                out_indices.push(base + k as u32);
-                out_indices.push(base + k as u32 + 1);
-            }
-        }
+        local_centroids.push(local_centroid);
+        shifts.push(shift);
+        scales.push(scale);
+        rots.push(rot);
     }
 
-    MeshData::with_colors(out_verts, out_indices, out_colors)
+    let mut out_verts = Vec::with_capacity(stage.rest_mesh.vertices.len());
+    for (vi, v) in stage.rest_mesh.vertices.iter().enumerate() {
+        let piece = stage.piece_ids.get(vi).copied().unwrap_or(0) as usize;
+        if piece >= piece_count {
+            out_verts.push(*v);
+            continue;
+        }
+        let lc = local_centroids[piece];
+        let shift = shifts[piece];
+        let scale = scales[piece];
+        let rot = rots[piece];
+        let pos = Vec3::from_array(v.position);
+        let p_def = match (forward, use_frame) {
+            (Some(m), true) => m.transform_point3(pos),
+            _ => pos,
+        };
+        let cx = f64::from(lc.x);
+        let cy = f64::from(lc.y);
+        let cz = f64::from(lc.z);
+        let qx = (f64::from(p_def.x) - cx) * scale;
+        let qy = (f64::from(p_def.y) - cy) * scale;
+        let qz = (f64::from(p_def.z) - cz) * scale;
+        let moved_def = Vec3::new(
+            (cx + rot[0] * qx + rot[1] * qy + rot[2] * qz + shift[0]) as f32,
+            (cy + rot[3] * qx + rot[4] * qy + rot[5] * qz + shift[1]) as f32,
+            (cz + rot[6] * qx + rot[7] * qy + rot[8] * qz + shift[2]) as f32,
+        );
+        let final_pos = match (deformer_frame, use_frame) {
+            (Some(frame), true) => frame.inverse.transform_point3(moved_def),
+            _ => moved_def,
+        };
+        // Transform normal into deformer space, rotate with piece, then back to mesh-local space.
+        let n_rest = Vec3::from_array(v.normal);
+        let n_def = match (forward, use_frame) {
+            (Some(m), true) => m.transform_vector3(n_rest).normalize_or_zero(),
+            _ => n_rest,
+        };
+        let nx = f64::from(n_def.x);
+        let ny = f64::from(n_def.y);
+        let nz = f64::from(n_def.z);
+        let rn_def = Vec3::new(
+            (rot[0] * nx + rot[1] * ny + rot[2] * nz) as f32,
+            (rot[3] * nx + rot[4] * ny + rot[5] * nz) as f32,
+            (rot[6] * nx + rot[7] * ny + rot[8] * nz) as f32,
+        );
+        let rn_local = match (deformer_frame, use_frame) {
+            (Some(frame), true) => frame.inverse.transform_vector3(rn_def).normalize_or_zero(),
+            _ => rn_def.normalize_or_zero(),
+        };
+        let final_n = if rn_local.length_squared() > 1e-12 {
+            rn_local
+        } else {
+            n_rest
+        };
+        out_verts.push(Vertex3D::new(
+            final_pos.to_array(),
+            final_n.to_array(),
+            v.uv,
+            v.material_slot,
+        ));
+    }
+
+    let out_colors = if params.random_colors {
+        stage.random_vertex_colors.clone()
+    } else {
+        Vec::new()
+    };
+    MeshData::with_colors(out_verts, stage.rest_mesh.indices.clone(), out_colors)
+}
+
+/// Evaluates Zoidium Voronoi Fracture (`effector-fracture.js:557-921`) with `effectorHash01`,
+/// 4 site distributions, anisotropic `cell_scale` metric, `closed` cap toggle, and full
+/// `applyFragmentMotion` (distance, scatter, shrink offset, Rodrigues spin, explicit direction &
+/// XYZ rotation, fragment scale, quadratic gravity, randomness, and 6-type Field).
+#[must_use]
+pub fn apply_voronoi_fracture_with_params(
+    mesh: &MeshData,
+    params: &VoronoiFractureParams,
+    shared_bounds: Option<Aabb3>,
+    deformer_frame: Option<&DeformerFrame>,
+) -> MeshData {
+    let stage = build_voronoi_fracture_stage(mesh, params);
+    apply_voronoi_fragment_motion(&stage, params, shared_bounds, deformer_frame)
 }
 
 /// Parses 1-based Voronoi character selection ranges matching Zoidium
@@ -2989,4 +3290,47 @@ pub fn apply_voronoi_fracture(
         ..VoronoiFractureParams::default()
     };
     apply_voronoi_fracture_with_params(mesh, &params, None, None)
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use crate::mesh::build_box;
+
+    #[test]
+    fn voronoi_stage_cache_matches_direct_and_caps_interior_cuts() {
+        let cube = build_box(2.0, 2.0, 2.0);
+        let params = VoronoiFractureParams {
+            cells: 6,
+            seed: 17,
+            closed: true,
+            distance: 0.45,
+            spin_rad: 0.4,
+            ..VoronoiFractureParams::default()
+        };
+        let stage = build_voronoi_fracture_stage(&cube, &params);
+        assert!(
+            stage.piece_centroids.len() >= 2,
+            "expected multiple voronoi fragments, got {}",
+            stage.piece_centroids.len()
+        );
+        let via_stage = apply_voronoi_fragment_motion(&stage, &params, None, None);
+        let direct = apply_voronoi_fracture_with_params(&cube, &params, None, None);
+        assert_eq!(via_stage.vertices.len(), direct.vertices.len());
+        assert_eq!(via_stage.indices.len(), direct.indices.len());
+        assert!(
+            via_stage.vertices.iter().any(|v| v.material_slot == 1),
+            "closed Voronoi fracture must emit capped interior triangles on material_slot=1"
+        );
+        for (a, b) in via_stage.vertices.iter().zip(direct.vertices.iter()) {
+            for k in 0..3 {
+                assert!(
+                    (a.position[k] - b.position[k]).abs() < 1e-4,
+                    "cached stage vertex mismatch: {:?} vs {:?}",
+                    a.position,
+                    b.position
+                );
+            }
+        }
+    }
 }

@@ -949,21 +949,521 @@ pub(crate) fn compute_scaled_2d(
 // Motion Paths Plugin Overlay (`motion-path`)
 // ---------------------------------------------------------------------------
 
+const MOTION_PATH_MAX_SAMPLES: usize = 1500;
+const MOTION_PATH_MAX_TICKS: usize = 900;
+const MOTION_PATH_DRAG_THRESHOLD_PX: f32 = 3.0;
+const MOTION_PATH_CLIP_NEAR_W_EPS: f32 = 1e-4;
+const MOTION_PATH_CLIP_XY_GUARD: f32 = 8.0;
+
+const COLOR_MOTION_PATH_LINE: Color32 = Color32::from_rgb(0x9f, 0xd8, 0xff);
+const COLOR_MOTION_PATH_OUTLINE: Color32 = Color32::from_rgba_premultiplied(0x00, 0x00, 0x00, 184);
+const COLOR_MOTION_KEY_FILL: Color32 = Color32::from_rgba_premultiplied(0x00, 0x00, 0x00, 155);
+const COLOR_MOTION_TANGENT: Color32 = Color32::from_rgb(0xff, 0xd3, 0x6b);
+const COLOR_MOTION_PLAYHEAD: Color32 = Color32::WHITE;
+
 pub(crate) struct MotionPathKeyframe {
     pub(crate) frame: f64,
     pub(crate) value: Vec3,
     pub(crate) tween: u16,
     pub(crate) control_points: [[f64; 2]; 2],
+    pub(crate) continuous_tangent: bool,
 }
 
 pub(crate) struct MotionPathTarget {
     pub(crate) clip_id: String,
     pub(crate) target_id: String,
     pub(crate) frame_offset: f64,
+    pub(crate) clip_length: f64,
     pub(crate) is_3d: bool,
     pub(crate) locked: bool,
+    pub(crate) parent_id: Option<String>,
     pub(crate) parent_world: Mat4,
     pub(crate) keyframes: Vec<MotionPathKeyframe>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SceneLayer2DTransform {
+    is_identity: bool,
+    position: GeomVec2,
+    scale: GeomVec2,
+    anchor: GeomVec2,
+    rotation: f32,
+}
+
+impl SceneLayer2DTransform {
+    const IDENTITY: Self = Self {
+        is_identity: true,
+        position: GeomVec2::ZERO,
+        scale: GeomVec2::ONE,
+        anchor: GeomVec2::ZERO,
+        rotation: 0.0,
+    };
+
+    fn from_clip(clip: &SessionClip, local_frame: f64) -> Self {
+        let position = clip.properties.get("position").map_or(GeomVec2::ZERO, |p| {
+            eval_prop_vec2(p, local_frame, GeomVec2::ZERO)
+        });
+        let scale = clip.properties.get("scale").map_or(GeomVec2::ONE, |p| {
+            eval_prop_vec2(p, local_frame, GeomVec2::ONE)
+        });
+        let anchor = clip.properties.get("anchor").map_or(GeomVec2::ZERO, |p| {
+            eval_prop_vec2(p, local_frame, GeomVec2::ZERO)
+        });
+        let rotation = clip
+            .properties
+            .get("rotation")
+            .map_or(0.0, |p| eval_prop_scalar(p, local_frame, 0.0) as f32);
+        let is_identity = position.x.abs() <= 1e-4
+            && position.y.abs() <= 1e-4
+            && (scale.x - 1.0).abs() <= 1e-4
+            && (scale.y - 1.0).abs() <= 1e-4
+            && anchor.x.abs() <= 1e-4
+            && anchor.y.abs() <= 1e-4
+            && rotation.abs() <= 1e-5;
+        Self {
+            is_identity,
+            position,
+            scale,
+            anchor,
+            rotation,
+        }
+    }
+
+    fn apply_to_canvas_point(&self, pt: Pos2, canvas_rect: Rect, ratio: f32) -> Pos2 {
+        if self.is_identity {
+            return pt;
+        }
+        let safe_ratio = ratio.max(1e-4);
+        let center = canvas_rect.center();
+        let lx = (pt.x - center.x) / safe_ratio;
+        let ly = -(pt.y - center.y) / safe_ratio;
+        let sx = (lx - self.anchor.x) * self.scale.x;
+        let sy = (ly - self.anchor.y) * self.scale.y;
+        let (sr, cr) = self.rotation.sin_cos();
+        let seq_x = self.position.x + sx * cr - sy * sr;
+        let seq_y = self.position.y + sx * sr + sy * cr;
+        layer_2d_to_screen(GeomVec2::new(seq_x, seq_y), canvas_rect, safe_ratio)
+    }
+
+    fn unapply_from_canvas_point(&self, pt: Pos2, canvas_rect: Rect, ratio: f32) -> Option<Pos2> {
+        if self.is_identity {
+            return Some(pt);
+        }
+        if self.scale.x.abs() <= 1e-5 || self.scale.y.abs() <= 1e-5 {
+            return None;
+        }
+        let safe_ratio = ratio.max(1e-4);
+        let center = canvas_rect.center();
+        let seq_x = (pt.x - center.x) / safe_ratio - self.position.x;
+        let seq_y = -(pt.y - center.y) / safe_ratio - self.position.y;
+        let (sr, cr) = (-self.rotation).sin_cos();
+        let rx = seq_x * cr - seq_y * sr;
+        let ry = seq_x * sr + seq_y * cr;
+        let lx = rx / self.scale.x + self.anchor.x;
+        let ly = ry / self.scale.y + self.anchor.y;
+        Some(layer_2d_to_screen(
+            GeomVec2::new(lx, ly),
+            canvas_rect,
+            safe_ratio,
+        ))
+    }
+}
+
+#[inline]
+fn is_hold_tween(tween: u16) -> bool {
+    InterpolationMode::from_cm3_tween_code(tween).0 == InterpolationMode::Discrete
+}
+
+#[inline]
+fn is_bezier_tween(tween: u16) -> bool {
+    InterpolationMode::from_cm3_tween_code(tween).0 == InterpolationMode::Bezier
+}
+
+#[inline]
+fn to_bezier_tween(tween: u16) -> u16 {
+    (1 << 8) | (tween & 0xFF).max(1)
+}
+
+#[inline]
+fn clean_json_f64(v: f32) -> f64 {
+    if v == 0.0 || !v.is_finite() {
+        0.0
+    } else {
+        f64::from(v)
+    }
+}
+
+fn eval_motion_path_segment(
+    k0: &MotionPathKeyframe,
+    k1: &MotionPathKeyframe,
+    sample_frame: f64,
+) -> Vec3 {
+    Vec3::new(
+        eval_segment_scalar(
+            k0.frame,
+            f64::from(k0.value.x),
+            k0.control_points[1],
+            k1.frame,
+            f64::from(k1.value.x),
+            k1.control_points[0],
+            k1.tween,
+            sample_frame,
+        ) as f32,
+        eval_segment_scalar(
+            k0.frame,
+            f64::from(k0.value.y),
+            k0.control_points[1],
+            k1.frame,
+            f64::from(k1.value.y),
+            k1.control_points[0],
+            k1.tween,
+            sample_frame,
+        ) as f32,
+        eval_segment_scalar(
+            k0.frame,
+            f64::from(k0.value.z),
+            k0.control_points[1],
+            k1.frame,
+            f64::from(k1.value.z),
+            k1.control_points[0],
+            k1.tween,
+            sample_frame,
+        ) as f32,
+    )
+}
+
+pub(crate) fn eval_motion_path_at(
+    keyframes: &[MotionPathKeyframe],
+    local_frame: f64,
+) -> Option<Vec3> {
+    if keyframes.is_empty() {
+        return None;
+    }
+    if keyframes.len() == 1 || local_frame <= keyframes[0].frame {
+        return Some(keyframes[0].value);
+    }
+    let last = &keyframes[keyframes.len() - 1];
+    if local_frame >= last.frame {
+        return Some(last.value);
+    }
+    let idx = keyframes
+        .partition_point(|k| k.frame <= local_frame)
+        .clamp(1, keyframes.len() - 1);
+    Some(eval_motion_path_segment(
+        &keyframes[idx - 1],
+        &keyframes[idx],
+        local_frame,
+    ))
+}
+
+#[inline]
+fn clip_homogeneous_halfspace(d0: f32, d1: f32, t0: &mut f32, t1: &mut f32) -> bool {
+    let delta = d1 - d0;
+    if delta.abs() <= 1e-12 {
+        return d0 >= 0.0;
+    }
+    let t_hit = -d0 / delta;
+    if delta > 0.0 {
+        *t0 = (*t0).max(t_hit);
+    } else {
+        *t1 = (*t1).min(t_hit);
+    }
+    *t0 <= *t1
+}
+
+/// Clips a 3D world-space segment `[a, b]` against the camera's wgpu depth frustum
+/// (`clip.w >= 1e-4`, `0 <= clip.z <= clip.w`) and wide XY guard planes before projecting
+/// into `canvas_rect`. Prevents NaN/Inf explosions and wrap-around lines when a path crosses
+/// behind the 3D camera (`clip_z <= 0`).
+pub(crate) fn clip_and_project_3d_segment(
+    vp: Mat4,
+    a: Vec3,
+    b: Vec3,
+    canvas_rect: Rect,
+) -> Option<[Pos2; 2]> {
+    if !a.is_finite() || !b.is_finite() {
+        return None;
+    }
+    let ca = vp * Vec4::new(a.x, a.y, a.z, 1.0);
+    let cb = vp * Vec4::new(b.x, b.y, b.z, 1.0);
+    if !ca.is_finite() || !cb.is_finite() {
+        return None;
+    }
+
+    let mut t0 = 0.0_f32;
+    let mut t1 = 1.0_f32;
+
+    // 1. Positive W guard (strictly in front of eye singularity).
+    if !clip_homogeneous_halfspace(
+        ca.w - MOTION_PATH_CLIP_NEAR_W_EPS,
+        cb.w - MOTION_PATH_CLIP_NEAR_W_EPS,
+        &mut t0,
+        &mut t1,
+    ) {
+        return None;
+    }
+    // 2. Near plane: clip.z >= 0 (wgpu NDC Z in [0, 1]).
+    if !clip_homogeneous_halfspace(ca.z, cb.z, &mut t0, &mut t1) {
+        return None;
+    }
+    // 3. Far plane: clip.w - clip.z >= 0.
+    if !clip_homogeneous_halfspace(ca.w - ca.z, cb.w - cb.z, &mut t0, &mut t1) {
+        return None;
+    }
+    // 4. Wide XY guard planes (+/- 8w) so near-plane intersections stay finite & tessellator-safe.
+    let g = MOTION_PATH_CLIP_XY_GUARD;
+    if !clip_homogeneous_halfspace(ca.w * g - ca.x, cb.w * g - cb.x, &mut t0, &mut t1)
+        || !clip_homogeneous_halfspace(ca.w * g + ca.x, cb.w * g + cb.x, &mut t0, &mut t1)
+        || !clip_homogeneous_halfspace(ca.w * g - ca.y, cb.w * g - cb.y, &mut t0, &mut t1)
+        || !clip_homogeneous_halfspace(ca.w * g + ca.y, cb.w * g + cb.y, &mut t0, &mut t1)
+    {
+        return None;
+    }
+
+    let p0 = ca + (cb - ca) * t0;
+    let p1 = ca + (cb - ca) * t1;
+    if p0.w <= 1e-6 || p1.w <= 1e-6 {
+        return None;
+    }
+    let ndc0 = p0.truncate() / p0.w;
+    let ndc1 = p1.truncate() / p1.w;
+    if !ndc0.is_finite() || !ndc1.is_finite() {
+        return None;
+    }
+
+    let to_screen = |ndc: Vec3| -> Pos2 {
+        pos2(
+            canvas_rect.left() + (ndc.x * 0.5 + 0.5) * canvas_rect.width(),
+            canvas_rect.top() + (0.5 - ndc.y * 0.5) * canvas_rect.height(),
+        )
+    };
+    Some([to_screen(ndc0), to_screen(ndc1)])
+}
+
+/// Computes sample frame timestamps across a single segment `[start, end]` inside a motion path
+/// of total span `total_span`, maintaining per-frame fidelity while bounding total curve samples
+/// to [`MOTION_PATH_MAX_SAMPLES`] (matching Zoidium `motion-path`).
+pub(crate) fn motion_path_sample_frames(start: f64, end: f64, total_span: f64) -> Vec<f64> {
+    if !start.is_finite() || !end.is_finite() || end <= start + 1e-9 {
+        return Vec::new();
+    }
+    let span = end - start;
+    let safe_total = total_span.max(span).max(1e-6);
+    let max_budget = ((MOTION_PATH_MAX_SAMPLES as f64) * (span / safe_total))
+        .ceil()
+        .max(2.0) as usize;
+    let desired = if span <= 24.0 {
+        (span * 2.0).ceil() as usize
+    } else {
+        span.ceil() as usize
+    };
+    let steps = desired.clamp(2, max_budget.min(MOTION_PATH_MAX_SAMPLES));
+    let mut out = Vec::with_capacity(steps + 1);
+    for s in 0..=steps {
+        let u = s as f64 / steps as f64;
+        out.push(if s == steps { end } else { start + span * u });
+    }
+    out
+}
+
+/// Computes integer-aligned speed-density tick frames strictly inside `(start, end)`.
+/// Emits 1 dot per frame when `total_span <= 900`, or evenly thinned integer frames beyond 900.
+pub(crate) fn motion_path_tick_frames(start: f64, end: f64, total_span: f64) -> Vec<f64> {
+    if !start.is_finite() || !end.is_finite() || end <= start + 0.3 {
+        return Vec::new();
+    }
+    let safe_total = total_span.max(end - start).max(1.0);
+    let step = if safe_total <= MOTION_PATH_MAX_TICKS as f64 {
+        1.0
+    } else {
+        (safe_total / MOTION_PATH_MAX_TICKS as f64).ceil().max(1.0)
+    };
+    let mut f = (start + 0.15).ceil();
+    if f <= start + 0.15 {
+        f += 1.0;
+    }
+    let limit = end - 0.15;
+    let mut out = Vec::new();
+    while f <= limit && out.len() < MOTION_PATH_MAX_TICKS {
+        out.push(f);
+        f += step;
+    }
+    out
+}
+
+/// Unprojects a 3D keyframe screen drag `(press_screen -> current_screen)` onto the plane through
+/// `parent_world * orig_local` perpendicular to the camera's view direction, then returns the
+/// resulting displacement in the object's parent-local coordinate space.
+pub(crate) fn unproject_motion_path_drag_3d(
+    cam: &ResolvedCamera3D,
+    parent_world: Mat4,
+    orig_local: Vec3,
+    press_screen: Pos2,
+    current_screen: Pos2,
+    canvas_rect: Rect,
+) -> Option<Vec3> {
+    if !orig_local.is_finite() || parent_world.determinant().abs() <= 1e-8 {
+        return None;
+    }
+    let orig_world = parent_world.transform_point3(orig_local);
+    if !orig_world.is_finite() {
+        return None;
+    }
+
+    let plane_hit = |screen_pt: Pos2| -> Option<Vec3> {
+        let (ray_o, ray_d) = cam.screen_ray(screen_pt, canvas_rect)?;
+        let denom = ray_d.dot(cam.forward);
+        if denom.abs() <= 1e-6 {
+            return None;
+        }
+        let t = (orig_world - ray_o).dot(cam.forward) / denom;
+        if !t.is_finite() {
+            return None;
+        }
+        let hit = ray_o + ray_d * t;
+        hit.is_finite().then_some(hit)
+    };
+
+    let world_delta = if let (Some(hit_start), Some(hit_cur)) =
+        (plane_hit(press_screen), plane_hit(current_screen))
+    {
+        hit_cur - hit_start
+    } else {
+        cam.unproject_delta_at_depth(current_screen - press_screen, orig_world, canvas_rect)
+    };
+
+    let local_delta = parent_world.inverse().transform_vector3(world_delta);
+    local_delta.is_finite().then_some(local_delta)
+}
+
+/// Constrains a keyframe drag displacement to the dominant axis when `shift` is held.
+/// Returns `(constrained_delta, locked_axis_index)` where `0 = X`, `1 = Y`, `2 = Z`.
+pub(crate) fn constrain_motion_path_delta(
+    delta: Vec3,
+    is_3d: bool,
+    shift: bool,
+) -> (Vec3, Option<u8>) {
+    if !shift {
+        return (delta, None);
+    }
+    let ax = delta.x.abs();
+    let ay = delta.y.abs();
+    if !is_3d {
+        if ax >= ay {
+            (Vec3::new(delta.x, 0.0, 0.0), Some(0))
+        } else {
+            (Vec3::new(0.0, delta.y, 0.0), Some(1))
+        }
+    } else {
+        let az = delta.z.abs();
+        if ax >= ay && ax >= az {
+            (Vec3::new(delta.x, 0.0, 0.0), Some(0))
+        } else if ay >= az {
+            (Vec3::new(0.0, delta.y, 0.0), Some(1))
+        } else {
+            (Vec3::new(0.0, 0.0, delta.z), Some(2))
+        }
+    }
+}
+
+fn format_motion_path_frame_label(timeline_frame: f64) -> String {
+    let rounded = timeline_frame.round();
+    if (timeline_frame - rounded).abs() < 0.05 {
+        format!("F{}", rounded as i64)
+    } else {
+        format!("F{timeline_frame:.1}")
+    }
+}
+
+fn paint_motion_path_diamond(
+    painter: &egui::Painter,
+    center: Pos2,
+    radius: f32,
+    fill: Color32,
+    stroke: Stroke,
+) {
+    let outer_r = radius + 1.4;
+    let outer = vec![
+        pos2(center.x, center.y - outer_r),
+        pos2(center.x + outer_r, center.y),
+        pos2(center.x, center.y + outer_r),
+        pos2(center.x - outer_r, center.y),
+    ];
+    painter.add(Shape::convex_polygon(
+        outer,
+        COLOR_MOTION_PATH_OUTLINE,
+        Stroke::NONE,
+    ));
+    let inner = vec![
+        pos2(center.x, center.y - radius),
+        pos2(center.x + radius, center.y),
+        pos2(center.x, center.y + radius),
+        pos2(center.x - radius, center.y),
+    ];
+    painter.add(Shape::convex_polygon(inner, fill, stroke));
+}
+
+fn paint_motion_path_tooltip(painter: &egui::Painter, anchor: Pos2, text: &str, bounds: Rect) {
+    let pad_x = 5.0;
+    let pill_w = (text.chars().count() as f32 * 6.4 + pad_x * 2.0).max(28.0);
+    let pill_h = 18.0;
+    let min_x = bounds.left() + 4.0;
+    let max_x = (bounds.right() - pill_w - 4.0).max(min_x);
+    let min_y = bounds.top() + 4.0;
+    let max_y = (bounds.bottom() - pill_h - 4.0).max(min_y);
+    let left = (anchor.x - pill_w * 0.5).clamp(min_x, max_x);
+    let preferred_top = anchor.y - pill_h - 11.0;
+    let top = if preferred_top >= min_y {
+        preferred_top
+    } else {
+        (anchor.y + 11.0).clamp(min_y, max_y)
+    };
+    let rect = Rect::from_min_size(pos2(left, top), vec2(pill_w, pill_h));
+    painter.rect(
+        rect,
+        CornerRadius::same(3),
+        Color32::from_rgba_unmultiplied(0x16, 0x18, 0x1e, 232),
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x9f, 0xd8, 0xff, 165)),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::monospace(10.0),
+        Color32::from_rgb(0xf0, 0xf4, 0xff),
+    );
+}
+
+struct MotionPathTangentVisual {
+    is_out: bool,
+    screen: Pos2,
+    is_bezier: bool,
+    neighbor_screen: Pos2,
+    neighbor_frame: f64,
+    neighbor_tween: u16,
+    neighbor_cp: [[f64; 2]; 2],
+    neighbor_continuous: bool,
+    span: f64,
+}
+
+struct MotionPathKeyVisual {
+    kidx: usize,
+    frame: f64,
+    value: Vec3,
+    tween: u16,
+    control_points: [[f64; 2]; 2],
+    continuous_tangent: bool,
+    parent_world: Mat4,
+    screen: Option<Pos2>,
+    in_handle: Option<MotionPathTangentVisual>,
+    out_handle: Option<MotionPathTangentVisual>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MotionPathHover {
+    Keyframe(usize),
+    Tangent(usize, bool),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -985,112 +1485,313 @@ pub(crate) fn handle_and_paint_motion_path(
     }
 
     let cur_local = session.playback.current_frame - target.frame_offset;
-    let active_cam = if target.is_3d {
-        if is_editing_camera_active(session) && state.active_camera_id.is_none() {
-            Some(ResolvedCamera3D::from_editor_camera(
-                &state.camera,
-                canvas_rect.width() / canvas_rect.height().max(1.0),
-            ))
-        } else {
-            session
-                .document()
-                .video_tracks
-                .iter()
-                .flat_map(|t| t.clips.iter())
-                .find(|c| c.id == target.clip_id)
-                .map(|clip| {
-                    ResolvedCamera3D::from_scene_clip_with_override(
-                        clip,
-                        cur_local,
-                        seq_w,
-                        seq_h,
-                        state.active_camera_id.as_deref(),
-                    )
-                })
-        }
-    } else {
-        None
-    };
-
     let ratio = canvas_rect.width() / seq_w.max(1.0);
-    let to_world = |p: Vec3| -> Vec3 { target.parent_world.transform_point3(p) };
-    let project_pt = |p: Vec3| -> Option<Pos2> {
-        if target.is_3d {
-            active_cam
-                .as_ref()?
-                .project_world_point(to_world(p), canvas_rect)
-        } else {
-            Some(layer_2d_to_screen(
-                GeomVec2::new(p.x, p.y),
-                canvas_rect,
-                ratio,
-            ))
-        }
-    };
-
     let visible_canvas = canvas_rect.intersect(panel_rect);
-    let painter = ui.painter().with_clip_rect(visible_canvas);
-
-    // Draw smooth trajectory spline sampled across every keyframe segment (including Bezier).
-    for pair in target.keyframes.windows(2) {
-        let k0 = &pair[0];
-        let k1 = &pair[1];
-        let span = (k1.frame - k0.frame).max(1e-6);
-        let steps = (span.ceil() as usize).clamp(8, 48);
-
-        let mut poly = Vec::with_capacity(steps + 1);
-        for s in 0..=steps {
-            let u = s as f64 / steps as f64;
-            let sample_frame = k0.frame + span * u;
-            let sample = Vec3::new(
-                eval_segment_scalar(
-                    k0.frame,
-                    f64::from(k0.value.x),
-                    k0.control_points[1],
-                    k1.frame,
-                    f64::from(k1.value.x),
-                    k1.control_points[0],
-                    k1.tween,
-                    sample_frame,
-                ) as f32,
-                eval_segment_scalar(
-                    k0.frame,
-                    f64::from(k0.value.y),
-                    k0.control_points[1],
-                    k1.frame,
-                    f64::from(k1.value.y),
-                    k1.control_points[0],
-                    k1.tween,
-                    sample_frame,
-                ) as f32,
-                eval_segment_scalar(
-                    k0.frame,
-                    f64::from(k0.value.z),
-                    k0.control_points[1],
-                    k1.frame,
-                    f64::from(k1.value.z),
-                    k1.control_points[0],
-                    k1.tween,
-                    sample_frame,
-                ) as f32,
-            );
-            if let Some(sp) = project_pt(sample) {
-                poly.push(sp);
-            }
-        }
-        if poly.len() >= 2 {
-            painter.add(Shape::line(poly, Stroke::new(1.75, COLOR_MOTION_PATH)));
-        }
+    if !visible_canvas.is_positive() {
+        return false;
     }
 
+    // Phase 1: Snapshot camera, per-frame parent transforms, frustum-clipped splines, speed ticks,
+    // playhead point, and keyframe/tangent screen visuals while borrowing `session` immutably.
+    let (active_cam, scene_2d_tf, polylines, ticks, playhead_screen, key_nodes) = {
+        let editing_cam_mode =
+            is_editing_camera_active(session) && state.active_camera_id.is_none();
+        let clip_ref = session
+            .document()
+            .video_tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .find(|c| c.id == target.clip_id);
+
+        let active_cam = if target.is_3d {
+            clip_ref.map(|clip| {
+                resolve_active_3d_camera(session, state, clip, cur_local, canvas_rect, seq_w, seq_h)
+            })
+        } else {
+            None
+        };
+        let scene_2d_tf = if target.is_3d && !editing_cam_mode {
+            clip_ref.map_or(SceneLayer2DTransform::IDENTITY, |clip| {
+                SceneLayer2DTransform::from_clip(clip, cur_local)
+            })
+        } else {
+            SceneLayer2DTransform::IDENTITY
+        };
+
+        let obj_index = if target.is_3d && target.parent_id.is_some() {
+            clip_ref.map(|clip| build_object_3d_index(&clip.objects_3d))
+        } else {
+            None
+        };
+
+        let parent_world_at = |frame: f64| -> Mat4 {
+            if !target.is_3d {
+                return Mat4::IDENTITY;
+            }
+            if let (Some(pid), Some(clip), Some(idx)) =
+                (target.parent_id.as_deref(), clip_ref, obj_index.as_ref())
+            {
+                compute_object_3d_world_matrix_indexed(&clip.objects_3d, idx, pid, frame)
+            } else {
+                target.parent_world
+            }
+        };
+
+        let project_pt_with_parent = |local_p: Vec3, parent_m: Mat4| -> Option<Pos2> {
+            if target.is_3d {
+                let cam = active_cam.as_ref()?;
+                let world = parent_m.transform_point3(local_p);
+                let raw = cam.project_world_point(world, canvas_rect)?;
+                Some(scene_2d_tf.apply_to_canvas_point(raw, canvas_rect, ratio))
+            } else {
+                Some(layer_2d_to_screen(
+                    GeomVec2::new(local_p.x, local_p.y),
+                    canvas_rect,
+                    ratio,
+                ))
+            }
+        };
+
+        let first_kf_frame = target.keyframes[0].frame;
+        let last_kf_frame = target.keyframes[target.keyframes.len() - 1].frame;
+        let vis_start = if target.clip_length > 0.0 {
+            first_kf_frame.max(0.0)
+        } else {
+            first_kf_frame
+        };
+        let vis_end = if target.clip_length > 0.0 {
+            last_kf_frame.min(target.clip_length)
+        } else {
+            last_kf_frame
+        };
+        let total_vis_span = (vis_end - vis_start).max(1e-6);
+
+        let mut polylines: Vec<(Vec<Pos2>, bool)> = Vec::new();
+        let mut ticks: Vec<Pos2> = Vec::new();
+
+        for pair in target.keyframes.windows(2) {
+            let k0 = &pair[0];
+            let k1 = &pair[1];
+            let seg_start = k0.frame.max(vis_start);
+            let seg_end = k1.frame.min(vis_end);
+            if seg_end <= seg_start + 1e-9 {
+                continue;
+            }
+
+            if is_hold_tween(k1.tween) {
+                let pm0 = parent_world_at(seg_start);
+                let pm1 = parent_world_at(seg_end);
+                if target.is_3d {
+                    if let Some(cam) = active_cam.as_ref()
+                        && let Some([pa, pb]) = clip_and_project_3d_segment(
+                            cam.view_proj,
+                            pm0.transform_point3(k0.value),
+                            pm1.transform_point3(k1.value),
+                            canvas_rect,
+                        )
+                    {
+                        polylines.push((
+                            vec![
+                                scene_2d_tf.apply_to_canvas_point(pa, canvas_rect, ratio),
+                                scene_2d_tf.apply_to_canvas_point(pb, canvas_rect, ratio),
+                            ],
+                            true,
+                        ));
+                    }
+                } else if let (Some(pa), Some(pb)) = (
+                    project_pt_with_parent(k0.value, pm0),
+                    project_pt_with_parent(k1.value, pm1),
+                ) {
+                    polylines.push((vec![pa, pb], true));
+                }
+                continue;
+            }
+
+            let sample_frames = motion_path_sample_frames(seg_start, seg_end, total_vis_span);
+            if target.is_3d {
+                if let Some(cam) = active_cam.as_ref() {
+                    let mut strip: Vec<Pos2> = Vec::new();
+                    let mut prev_world: Option<Vec3> = None;
+                    for &sf in &sample_frames {
+                        let local_p = eval_motion_path_segment(k0, k1, sf);
+                        let world_p = parent_world_at(sf).transform_point3(local_p);
+                        if let Some(pw) = prev_world {
+                            if let Some([pa_raw, pb_raw]) =
+                                clip_and_project_3d_segment(cam.view_proj, pw, world_p, canvas_rect)
+                            {
+                                let pa =
+                                    scene_2d_tf.apply_to_canvas_point(pa_raw, canvas_rect, ratio);
+                                let pb =
+                                    scene_2d_tf.apply_to_canvas_point(pb_raw, canvas_rect, ratio);
+                                let continuous =
+                                    strip.last().is_some_and(|last| last.distance(pa) <= 1.5);
+                                if !continuous {
+                                    if strip.len() >= 2 {
+                                        polylines.push((std::mem::take(&mut strip), false));
+                                    } else {
+                                        strip.clear();
+                                    }
+                                    strip.push(pa);
+                                }
+                                strip.push(pb);
+                            } else if strip.len() >= 2 {
+                                polylines.push((std::mem::take(&mut strip), false));
+                            } else {
+                                strip.clear();
+                            }
+                        }
+                        prev_world = Some(world_p);
+                    }
+                    if strip.len() >= 2 {
+                        polylines.push((strip, false));
+                    }
+                }
+            } else {
+                let mut strip = Vec::with_capacity(sample_frames.len());
+                for &sf in &sample_frames {
+                    let local_p = eval_motion_path_segment(k0, k1, sf);
+                    if let Some(sp) = project_pt_with_parent(local_p, Mat4::IDENTITY) {
+                        strip.push(sp);
+                    }
+                }
+                if strip.len() >= 2 {
+                    polylines.push((strip, false));
+                }
+            }
+
+            // Per-frame speed-density dots (tight = slow, wide = fast).
+            for f in motion_path_tick_frames(seg_start, seg_end, total_vis_span) {
+                let local_p = eval_motion_path_segment(k0, k1, f);
+                if let Some(sp) = project_pt_with_parent(local_p, parent_world_at(f)) {
+                    ticks.push(sp);
+                }
+            }
+        }
+
+        let playhead_screen = eval_motion_path_at(&target.keyframes, cur_local)
+            .and_then(|p| project_pt_with_parent(p, parent_world_at(cur_local)));
+
+        let mut key_nodes = Vec::with_capacity(target.keyframes.len());
+        for (kidx, kf) in target.keyframes.iter().enumerate() {
+            if target.clip_length > 0.0
+                && (kf.frame < -1e-4 || kf.frame > target.clip_length + 1e-4)
+            {
+                continue;
+            }
+            let pm = parent_world_at(kf.frame);
+            let sp = project_pt_with_parent(kf.value, pm);
+
+            let build_tangent = |is_out: bool,
+                                 neighbor_opt: Option<&MotionPathKeyframe>|
+             -> Option<MotionPathTangentVisual> {
+                let sp = sp?;
+                let neighbor = neighbor_opt?;
+                let seg_tween = if is_out { neighbor.tween } else { kf.tween };
+                if is_hold_tween(seg_tween) {
+                    return None;
+                }
+                let span = (neighbor.frame - kf.frame).abs();
+                if span <= 1e-6 {
+                    return None;
+                }
+                let seg_vec = neighbor.value - kf.value;
+                if seg_vec.length() <= 1e-4 {
+                    return None;
+                }
+                let seg_is_bezier = is_bezier_tween(seg_tween);
+                let (left_kf, right_kf) = if is_out {
+                    (kf, neighbor)
+                } else {
+                    (neighbor, kf)
+                };
+                let corr = zc_anim::correct_curve(
+                    span,
+                    left_kf.control_points[1][0],
+                    right_kf.control_points[0][0],
+                );
+                let cp = if is_out {
+                    kf.control_points[1]
+                } else {
+                    kf.control_points[0]
+                };
+                let dt_eff = if seg_is_bezier {
+                    (cp[0].abs() * corr).clamp(span * 0.06, span * 0.94)
+                } else {
+                    span / 3.0
+                };
+                let frac = (dt_eff / span) as f32;
+                let dv_eff = if seg_is_bezier {
+                    (cp[1] * corr) as f32
+                } else {
+                    0.0
+                };
+                let handle_local = kf.value + seg_vec * frac + Vec3::new(0.0, dv_eff * 0.25, 0.0);
+                let hp = project_pt_with_parent(handle_local, pm)?;
+                let neighbor_pm = parent_world_at(neighbor.frame);
+                let neighbor_screen =
+                    project_pt_with_parent(neighbor.value, neighbor_pm).unwrap_or(hp);
+                // Keep collapsed handles from blocking their own keyframe diamond.
+                if hp.distance(sp) < 9.5 {
+                    return None;
+                }
+                Some(MotionPathTangentVisual {
+                    is_out,
+                    screen: hp,
+                    is_bezier: seg_is_bezier,
+                    neighbor_screen,
+                    neighbor_frame: neighbor.frame,
+                    neighbor_tween: neighbor.tween,
+                    neighbor_cp: neighbor.control_points,
+                    neighbor_continuous: neighbor.continuous_tangent,
+                    span,
+                })
+            };
+
+            let prev_kf = kidx.checked_sub(1).and_then(|i| target.keyframes.get(i));
+            let next_kf = target.keyframes.get(kidx + 1);
+            key_nodes.push(MotionPathKeyVisual {
+                kidx,
+                frame: kf.frame,
+                value: kf.value,
+                tween: kf.tween,
+                control_points: kf.control_points,
+                continuous_tangent: kf.continuous_tangent,
+                parent_world: pm,
+                screen: sp,
+                in_handle: build_tangent(false, prev_kf),
+                out_handle: build_tangent(true, next_kf),
+            });
+        }
+
+        (
+            active_cam,
+            scene_2d_tf,
+            polylines,
+            ticks,
+            playhead_screen,
+            key_nodes,
+        )
+    };
+
+    // Phase 2: Read input, resolve hover & active drag visuals, and paint overlay.
     let wants_kb = ui.ctx().egui_wants_keyboard_input();
-    let (pointer_pos, press_origin, primary_pressed, primary_down, space_down) = ui.input(|i| {
+    let (
+        pointer_pos,
+        press_origin,
+        primary_pressed,
+        primary_down,
+        space_down,
+        shift_down,
+        alt_down,
+    ) = ui.input(|i| {
         (
             i.pointer.latest_pos(),
             i.pointer.press_origin(),
             i.pointer.primary_pressed(),
             i.pointer.primary_down(),
             !wants_kb && i.key_down(egui::Key::Space),
+            i.modifiers.shift,
+            i.modifiers.alt,
         )
     });
     let hit_pos = if primary_pressed {
@@ -1099,99 +1800,547 @@ pub(crate) fn handle_and_paint_motion_path(
         pointer_pos
     };
 
-    // Draw draggable keyframe dots along the motion path.
-    let mut started_drag = false;
-    for kf in &target.keyframes {
-        let Some(sp) = project_pt(kf.value) else {
+    let active_drag_frame = match &state.drag_state {
+        ViewportDragState::MotionPathKey(d) if d.target_id == target.target_id => {
+            Some((d.local_frame, d.handle_kind))
+        }
+        _ => None,
+    };
+
+    // Determine closest hovered keyframe diamond or tangent handle (handles take priority when visible).
+    let pointer_valid = hit_pos.is_some_and(|ptr| {
+        !space_down && pointer_hits_viewport(ui, ptr, panel_rect) && visible_canvas.contains(ptr)
+    });
+
+    // First check which keyframe diamond is closest (used both for hit-testing and for showing
+    // discoverable tangent handles on hovered keyframes).
+    let hovered_key_idx = if pointer_valid
+        && matches!(state.drag_state, ViewportDragState::None)
+        && let Some(ptr) = hit_pos
+    {
+        let mut best: Option<(usize, f32)> = None;
+        for (idx, node) in key_nodes.iter().enumerate() {
+            if let Some(sp) = node.screen {
+                let d = ptr.distance(sp);
+                if d <= 9.5 && best.is_none_or(|(_, bd)| d < bd) {
+                    best = Some((idx, d));
+                }
+            }
+        }
+        best.map(|(idx, _)| idx)
+    } else {
+        None
+    };
+
+    let should_show_handles_for = |idx: usize, node: &MotionPathKeyVisual| -> bool {
+        let is_current = (node.frame - cur_local).abs() < 0.5;
+        let is_hovered = hovered_key_idx == Some(idx);
+        let is_dragged = active_drag_frame.is_some_and(|(f, _)| (f - node.frame).abs() < 1e-6);
+        is_current || is_hovered || is_dragged
+    };
+
+    let hovered = if pointer_valid
+        && matches!(state.drag_state, ViewportDragState::None)
+        && let Some(ptr) = hit_pos
+    {
+        let mut best_handle: Option<(usize, bool, f32)> = None;
+        if !target.locked {
+            for (idx, node) in key_nodes.iter().enumerate() {
+                let show_all = should_show_handles_for(idx, node);
+                for h_opt in [node.out_handle.as_ref(), node.in_handle.as_ref()] {
+                    if let Some(h) = h_opt
+                        && (h.is_bezier || show_all)
+                    {
+                        let d = ptr.distance(h.screen);
+                        if d <= 8.5 && best_handle.is_none_or(|(_, _, bd)| d < bd) {
+                            best_handle = Some((idx, h.is_out, d));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((idx, is_out, _)) = best_handle {
+            Some(MotionPathHover::Tangent(idx, is_out))
+        } else {
+            hovered_key_idx.map(MotionPathHover::Keyframe)
+        }
+    } else {
+        None
+    };
+
+    let painter = ui.painter().with_clip_rect(visible_canvas);
+
+    // 2a. Trajectory splines (dark outline underneath crisp blue core; muted line for Hold jumps).
+    for (pts, is_hold) in &polylines {
+        if pts.len() < 2 {
+            continue;
+        }
+        if *is_hold {
+            painter.add(Shape::line(
+                pts.clone(),
+                Stroke::new(
+                    1.25,
+                    Color32::from_rgba_unmultiplied(
+                        COLOR_MOTION_PATH.r(),
+                        COLOR_MOTION_PATH.g(),
+                        COLOR_MOTION_PATH.b(),
+                        115,
+                    ),
+                ),
+            ));
+        } else {
+            painter.add(Shape::line(
+                pts.clone(),
+                Stroke::new(3.5, COLOR_MOTION_PATH_OUTLINE),
+            ));
+            painter.add(Shape::line(
+                pts.clone(),
+                Stroke::new(1.75, COLOR_MOTION_PATH_LINE),
+            ));
+        }
+    }
+
+    // 2b. Per-frame speed-density tick dots.
+    for &tp in &ticks {
+        painter.circle_filled(tp, 2.0, COLOR_MOTION_PATH_OUTLINE);
+        painter.circle_filled(tp, 1.35, COLOR_MOTION_PATH_LINE);
+    }
+
+    // 2c. Bezier / velocity tangent handles.
+    for (idx, node) in key_nodes.iter().enumerate() {
+        let Some(sp) = node.screen else {
             continue;
         };
-        let is_current = (kf.frame - cur_local).abs() < 0.5;
-        let radius = if is_current { 6.0 } else { 4.5 };
-        let fill = if is_current {
+        let show_all = should_show_handles_for(idx, node);
+        for h_opt in [node.in_handle.as_ref(), node.out_handle.as_ref()] {
+            let Some(h) = h_opt else {
+                continue;
+            };
+            if !h.is_bezier && !show_all {
+                continue;
+            }
+            let is_active_h = hovered == Some(MotionPathHover::Tangent(idx, h.is_out))
+                || active_drag_frame.is_some_and(|(f, hk)| {
+                    (f - node.frame).abs() < 1e-6
+                        && matches!(
+                            (hk, h.is_out),
+                            (MotionPathHandleKind::OutTangent, true)
+                                | (MotionPathHandleKind::InTangent, false)
+                        )
+                });
+            let alpha = if h.is_bezier || is_active_h { 255 } else { 180 };
+            let handle_col = Color32::from_rgba_unmultiplied(
+                COLOR_MOTION_TANGENT.r(),
+                COLOR_MOTION_TANGENT.g(),
+                COLOR_MOTION_TANGENT.b(),
+                alpha,
+            );
+            painter.line_segment([sp, h.screen], Stroke::new(3.0, COLOR_MOTION_PATH_OUTLINE));
+            painter.line_segment([sp, h.screen], Stroke::new(1.25, handle_col));
+            let knob_r = if is_active_h { 4.4 } else { 3.5 };
+            painter.circle_filled(h.screen, knob_r + 1.1, COLOR_MOTION_PATH_OUTLINE);
+            painter.circle_filled(h.screen, knob_r, handle_col);
+        }
+    }
+
+    // 2d. Active playhead marker ring on the path.
+    if let Some(pp) = playhead_screen {
+        painter.circle_stroke(pp, 5.5, Stroke::new(3.5, COLOR_MOTION_PATH_OUTLINE));
+        painter.circle_stroke(pp, 5.5, Stroke::new(1.75, COLOR_MOTION_PLAYHEAD));
+    }
+
+    // 2e. Keyframe diamonds.
+    for (idx, node) in key_nodes.iter().enumerate() {
+        let Some(sp) = node.screen else {
+            continue;
+        };
+        let is_current = (node.frame - cur_local).abs() < 0.5;
+        let is_hovered = hovered == Some(MotionPathHover::Keyframe(idx));
+        let is_dragged = active_drag_frame.is_some_and(|(f, hk)| {
+            (f - node.frame).abs() < 1e-6 && hk == MotionPathHandleKind::Keyframe
+        });
+        let emphasized = is_current || is_hovered || is_dragged;
+        let radius = if emphasized { 6.4 } else { 5.0 };
+        let fill = if emphasized {
             COLOR_MOTION_ACTIVE
         } else {
-            COLOR_MOTION_PATH
+            COLOR_MOTION_KEY_FILL
         };
-        painter.circle(sp, radius, fill, Stroke::new(1.5, Color32::BLACK));
+        let stroke = if emphasized {
+            Stroke::new(1.5, Color32::BLACK)
+        } else {
+            Stroke::new(1.5, COLOR_MOTION_PATH_LINE)
+        };
+        paint_motion_path_diamond(&painter, sp, radius, fill, stroke);
+    }
 
-        if !started_drag
-            && !target.locked
-            && !space_down
-            && matches!(state.drag_state, ViewportDragState::None)
-            && let Some(ptr) = hit_pos
-            && pointer_hits_viewport(ui, ptr, panel_rect)
-            && visible_canvas.contains(ptr)
-            && ptr.distance(sp) <= 9.0
-        {
-            ui.ctx().set_cursor_icon(CursorIcon::Move);
-            if primary_pressed
-                && session
+    // 2f. Shift-constrained axis guide & hover/drag `F<frame>` tooltip.
+    let mut tooltip_info: Option<(Pos2, String)> = None;
+    if let ViewportDragState::MotionPathKey(ref drag) = state.drag_state
+        && drag.target_id == target.target_id
+        && let Some(node) = key_nodes
+            .iter()
+            .find(|n| (n.frame - drag.local_frame).abs() < 1e-6)
+    {
+        let timeline_f = target.frame_offset + drag.local_frame;
+        let mut label = format_motion_path_frame_label(timeline_f);
+        if drag.handle_kind == MotionPathHandleKind::Keyframe && shift_down && drag.changed {
+            let delta = drag.current_pos - drag.orig_pos;
+            let (_, axis_opt) = constrain_motion_path_delta(delta, drag.is_3d, true);
+            if let Some(axis) = axis_opt {
+                let (axis_name, axis_vec, axis_col) = match axis {
+                    0 => ("X", Vec3::X, COLOR_GIZMO_X),
+                    1 => ("Y", Vec3::Y, COLOR_GIZMO_Y),
+                    _ => ("Z", Vec3::Z, COLOR_GIZMO_Z),
+                };
+                label.push_str(" · ");
+                label.push_str(axis_name);
+                if drag.is_3d {
+                    if let Some(cam) = active_cam.as_ref() {
+                        let world_o = node.parent_world.transform_point3(drag.orig_pos);
+                        let span_world =
+                            (cam.world_units_per_px(world_o, canvas_rect) * 180.0).max(10.0);
+                        let world_a = node
+                            .parent_world
+                            .transform_point3(drag.orig_pos - axis_vec * span_world);
+                        let world_b = node
+                            .parent_world
+                            .transform_point3(drag.orig_pos + axis_vec * span_world);
+                        if let Some([pa, pb]) = clip_and_project_3d_segment(
+                            cam.view_proj,
+                            world_a,
+                            world_b,
+                            canvas_rect,
+                        ) {
+                            painter.line_segment(
+                                [
+                                    scene_2d_tf.apply_to_canvas_point(pa, canvas_rect, ratio),
+                                    scene_2d_tf.apply_to_canvas_point(pb, canvas_rect, ratio),
+                                ],
+                                Stroke::new(1.25, axis_col),
+                            );
+                        }
+                    }
+                } else if let Some(sp) = node.screen {
+                    let seg = if axis == 0 {
+                        [
+                            pos2(visible_canvas.left(), sp.y),
+                            pos2(visible_canvas.right(), sp.y),
+                        ]
+                    } else {
+                        [
+                            pos2(sp.x, visible_canvas.top()),
+                            pos2(sp.x, visible_canvas.bottom()),
+                        ]
+                    };
+                    painter.line_segment(seg, Stroke::new(1.25, axis_col));
+                }
+            }
+        }
+        let anchor = match drag.handle_kind {
+            MotionPathHandleKind::Keyframe => node.screen,
+            MotionPathHandleKind::InTangent => node.in_handle.as_ref().map(|h| h.screen),
+            MotionPathHandleKind::OutTangent => node.out_handle.as_ref().map(|h| h.screen),
+        };
+        if let Some(a) = anchor {
+            tooltip_info = Some((a, label));
+        }
+    } else if let Some(hov) = hovered {
+        match hov {
+            MotionPathHover::Keyframe(idx) => {
+                let node = &key_nodes[idx];
+                ui.ctx().set_cursor_icon(if target.locked {
+                    CursorIcon::PointingHand
+                } else {
+                    CursorIcon::Move
+                });
+                if let Some(sp) = node.screen {
+                    tooltip_info = Some((
+                        sp,
+                        format_motion_path_frame_label(target.frame_offset + node.frame),
+                    ));
+                }
+            }
+            MotionPathHover::Tangent(idx, is_out) => {
+                let node = &key_nodes[idx];
+                ui.ctx().set_cursor_icon(CursorIcon::Grab);
+                let h_opt = if is_out {
+                    node.out_handle.as_ref()
+                } else {
+                    node.in_handle.as_ref()
+                };
+                if let Some(h) = h_opt {
+                    let prefix = if is_out { "Out" } else { "In" };
+                    let f_lbl = format_motion_path_frame_label(target.frame_offset + node.frame);
+                    tooltip_info = Some((h.screen, format!("{prefix} · {f_lbl}")));
+                }
+            }
+        }
+    }
+    if let Some((anchor, label)) = tooltip_info {
+        paint_motion_path_tooltip(&painter, anchor, &label, visible_canvas);
+    }
+
+    // Phase 3: Gesture start, active drag mutation, click-to-seek, and Alt-click Bezier toggle.
+    if primary_pressed
+        && matches!(state.drag_state, ViewportDragState::None)
+        && let (Some(hov), Some(ptr)) = (hovered, hit_pos)
+    {
+        match hov {
+            MotionPathHover::Tangent(idx, is_out) => {
+                if !target.locked
+                    && session
+                        .begin_transaction("Edit Motion Path Tangent")
+                        .is_ok()
+                {
+                    let node = &key_nodes[idx];
+                    state.drag_state = ViewportDragState::MotionPathKey(MotionPathDrag {
+                        target_id: target.target_id.clone(),
+                        is_3d: target.is_3d,
+                        local_frame: node.frame,
+                        tween: node.tween,
+                        handle_kind: if is_out {
+                            MotionPathHandleKind::OutTangent
+                        } else {
+                            MotionPathHandleKind::InTangent
+                        },
+                        orig_pos: node.value,
+                        current_pos: node.value,
+                        orig_control_points: node.control_points,
+                        continuous: !alt_down && node.continuous_tangent,
+                        last_pointer: ptr,
+                        changed: false,
+                    });
+                }
+            }
+            MotionPathHover::Keyframe(idx) => {
+                let node = &key_nodes[idx];
+                if target.locked {
+                    // On locked tracks, clicking a keyframe diamond still jumps the playhead.
+                    let timeline_frame = target.frame_offset + node.frame;
+                    let total_frames = session.document().sequence_length;
+                    session.playback.set_frame(timeline_frame, total_frames);
+                    action.force_refresh = true;
+                    return true;
+                }
+                if session
                     .begin_transaction("Edit Motion Path Keyframe")
                     .is_ok()
-            {
-                state.drag_state = ViewportDragState::MotionPathKey(MotionPathDrag {
-                    target_id: target.target_id.clone(),
-                    is_3d: target.is_3d,
-                    local_frame: kf.frame,
-                    tween: kf.tween,
-                    orig_pos: kf.value,
-                    current_pos: kf.value,
-                    last_pointer: ptr,
-                    changed: false,
-                });
-                started_drag = true;
+                {
+                    state.drag_state = ViewportDragState::MotionPathKey(MotionPathDrag {
+                        target_id: target.target_id.clone(),
+                        is_3d: target.is_3d,
+                        local_frame: node.frame,
+                        tween: node.tween,
+                        handle_kind: MotionPathHandleKind::Keyframe,
+                        orig_pos: node.value,
+                        current_pos: node.value,
+                        orig_control_points: node.control_points,
+                        continuous: node.continuous_tangent,
+                        last_pointer: ptr,
+                        changed: false,
+                    });
+                }
             }
         }
     }
 
-    if started_drag {
-        return true;
-    }
-
     let current = std::mem::take(&mut state.drag_state);
     if let ViewportDragState::MotionPathKey(mut drag) = current {
+        let node_opt = key_nodes
+            .iter()
+            .find(|n| (n.frame - drag.local_frame).abs() < 1e-6);
+
         if let Some(pos) = pointer_pos {
-            let delta = pos - drag.last_pointer;
-            drag.last_pointer = pos;
-            if delta.length_sq() > 0.01 {
+            let total_delta = pos - drag.last_pointer;
+            if !drag.changed && total_delta.length() >= MOTION_PATH_DRAG_THRESHOLD_PX {
                 drag.changed = true;
-                if drag.is_3d {
-                    if let Some(cam) = &active_cam {
-                        let world_pos = to_world(drag.current_pos);
-                        let world_delta =
-                            cam.unproject_delta_at_depth(delta, world_pos, canvas_rect);
-                        let local_delta = if target.parent_world.determinant().abs() > 1e-8 {
-                            target.parent_world.inverse().transform_vector3(world_delta)
+            }
+            if drag.changed {
+                match drag.handle_kind {
+                    MotionPathHandleKind::Keyframe => {
+                        if drag.is_3d {
+                            if let Some(cam) = active_cam.as_ref()
+                                && let (Some(press_cam_pos), Some(cur_cam_pos)) = (
+                                    scene_2d_tf.unapply_from_canvas_point(
+                                        drag.last_pointer,
+                                        canvas_rect,
+                                        ratio,
+                                    ),
+                                    scene_2d_tf.unapply_from_canvas_point(pos, canvas_rect, ratio),
+                                )
+                            {
+                                let parent_m =
+                                    node_opt.map_or(target.parent_world, |n| n.parent_world);
+                                if let Some(local_delta) = unproject_motion_path_drag_3d(
+                                    cam,
+                                    parent_m,
+                                    drag.orig_pos,
+                                    press_cam_pos,
+                                    cur_cam_pos,
+                                    canvas_rect,
+                                ) {
+                                    let (constrained, _) =
+                                        constrain_motion_path_delta(local_delta, true, shift_down);
+                                    drag.current_pos = drag.orig_pos + constrained;
+                                    let val = json!([
+                                        clean_json_f64(drag.current_pos.x),
+                                        clean_json_f64(drag.current_pos.y),
+                                        clean_json_f64(drag.current_pos.z)
+                                    ]);
+                                    let _ = session.execute(Command::SetKeyframe {
+                                        target_id: drag.target_id.clone(),
+                                        property: "position".to_string(),
+                                        frame: drag.local_frame,
+                                        value: val,
+                                        tween: Some(drag.tween),
+                                    });
+                                    action.transform_modified = true;
+                                }
+                            }
                         } else {
-                            world_delta
-                        };
-                        drag.current_pos += local_delta;
-                        let val = json!([
-                            f64::from(drag.current_pos.x),
-                            f64::from(drag.current_pos.y),
-                            f64::from(drag.current_pos.z)
-                        ]);
-                        let _ = session.execute(Command::SetKeyframe {
-                            target_id: drag.target_id.clone(),
-                            property: "position".to_string(),
-                            frame: drag.local_frame,
-                            value: val,
-                            tween: Some(drag.tween),
-                        });
+                            let raw_delta =
+                                Vec3::new(total_delta.x / ratio, -total_delta.y / ratio, 0.0);
+                            let (constrained, _) =
+                                constrain_motion_path_delta(raw_delta, false, shift_down);
+                            drag.current_pos = drag.orig_pos + constrained;
+                            let val = json!([
+                                clean_json_f64(drag.current_pos.x),
+                                clean_json_f64(drag.current_pos.y)
+                            ]);
+                            let _ = session.execute(Command::SetKeyframe {
+                                target_id: drag.target_id.clone(),
+                                property: "position".to_string(),
+                                frame: drag.local_frame,
+                                value: val,
+                                tween: Some(drag.tween),
+                            });
+                            action.transform_modified = true;
+                        }
                     }
-                } else {
-                    drag.current_pos.x += delta.x / ratio;
-                    drag.current_pos.y -= delta.y / ratio;
-                    let val = json!([f64::from(drag.current_pos.x), f64::from(drag.current_pos.y)]);
-                    let _ = session.execute(Command::SetKeyframe {
-                        target_id: drag.target_id.clone(),
-                        property: "position".to_string(),
-                        frame: drag.local_frame,
-                        value: val,
-                        tween: Some(drag.tween),
-                    });
+                    MotionPathHandleKind::InTangent | MotionPathHandleKind::OutTangent => {
+                        if alt_down {
+                            drag.continuous = false;
+                        }
+                        let is_out = drag.handle_kind == MotionPathHandleKind::OutTangent;
+                        if let Some(node) = node_opt
+                            && let Some(key_sp) = node.screen
+                        {
+                            let h_opt = if is_out {
+                                node.out_handle.as_ref()
+                            } else {
+                                node.in_handle.as_ref()
+                            };
+                            if let Some(h) = h_opt {
+                                let seg_screen = h.neighbor_screen - key_sp;
+                                let seg_screen_len = seg_screen.length().max(12.0);
+                                let along_dir = seg_screen / seg_screen_len;
+                                let mut perp_dir = vec2(-along_dir.y, along_dir.x);
+                                if perp_dir.y > 0.0 {
+                                    perp_dir = -perp_dir;
+                                }
+                                let along_px = total_delta.dot(along_dir);
+                                let perp_px = total_delta.dot(perp_dir);
+                                let value_per_px = if drag.is_3d {
+                                    active_cam.as_ref().map_or(0.25, |cam| {
+                                        let w_kf = node.parent_world.transform_point3(node.value);
+                                        f64::from(cam.world_units_per_px(w_kf, canvas_rect))
+                                    })
+                                } else {
+                                    1.0 / f64::from(ratio.max(0.1))
+                                };
+
+                                let mut cp = drag.orig_control_points;
+                                if is_out {
+                                    let base_dt = if h.is_bezier {
+                                        drag.orig_control_points[1][0].max(0.5)
+                                    } else {
+                                        h.span / 3.0
+                                    };
+                                    let base_dv = if h.is_bezier {
+                                        drag.orig_control_points[1][1]
+                                    } else {
+                                        0.0
+                                    };
+                                    let next_dt = (base_dt
+                                        + f64::from(along_px)
+                                            * (h.span / f64::from(seg_screen_len)))
+                                    .clamp(0.5, h.span);
+                                    let next_dv = if shift_down {
+                                        0.0
+                                    } else {
+                                        base_dv + f64::from(perp_px) * value_per_px
+                                    };
+                                    cp[1] = [next_dt, next_dv];
+                                    if drag.continuous && node.kidx > 0 {
+                                        let dt_in = if drag.orig_control_points[0][0] < -0.5 {
+                                            drag.orig_control_points[0][0]
+                                        } else {
+                                            -next_dt
+                                        };
+                                        cp[0] = [dt_in, next_dv * (dt_in / next_dt)];
+                                    }
+                                    let _ = session.set_keyframe_bezier_handles(
+                                        &drag.target_id,
+                                        "position",
+                                        drag.local_frame,
+                                        cp,
+                                        drag.continuous,
+                                        None,
+                                    );
+                                    if !h.is_bezier && !is_hold_tween(h.neighbor_tween) {
+                                        let _ = session.set_keyframe_bezier_handles(
+                                            &drag.target_id,
+                                            "position",
+                                            h.neighbor_frame,
+                                            h.neighbor_cp,
+                                            h.neighbor_continuous,
+                                            Some(to_bezier_tween(h.neighbor_tween)),
+                                        );
+                                    }
+                                } else {
+                                    let base_dt = if h.is_bezier {
+                                        drag.orig_control_points[0][0].min(-0.5)
+                                    } else {
+                                        -h.span / 3.0
+                                    };
+                                    let base_dv = if h.is_bezier {
+                                        drag.orig_control_points[0][1]
+                                    } else {
+                                        0.0
+                                    };
+                                    let next_dt = (base_dt
+                                        - f64::from(along_px)
+                                            * (h.span / f64::from(seg_screen_len)))
+                                    .clamp(-h.span, -0.5);
+                                    let next_dv = if shift_down {
+                                        0.0
+                                    } else {
+                                        base_dv + f64::from(perp_px) * value_per_px
+                                    };
+                                    cp[0] = [next_dt, next_dv];
+                                    if drag.continuous && node.kidx + 1 < target.keyframes.len() {
+                                        let dt_out = if drag.orig_control_points[1][0] > 0.5 {
+                                            drag.orig_control_points[1][0]
+                                        } else {
+                                            -next_dt
+                                        };
+                                        cp[1] = [dt_out, next_dv * (dt_out / next_dt)];
+                                    }
+                                    let _ = session.set_keyframe_bezier_handles(
+                                        &drag.target_id,
+                                        "position",
+                                        drag.local_frame,
+                                        cp,
+                                        drag.continuous,
+                                        Some(to_bezier_tween(drag.tween)),
+                                    );
+                                }
+                                action.transform_modified = true;
+                            }
+                        }
+                    }
                 }
-                action.transform_modified = true;
             }
         }
 
@@ -1200,11 +2349,108 @@ pub(crate) fn handle_and_paint_motion_path(
             state.drag_state = ViewportDragState::MotionPathKey(drag);
             return true;
         }
+
+        // Pointer released: handle Alt-click Linear/Bezier toggle, plain click-to-seek, or drag commit.
+        if !drag.changed && drag.handle_kind == MotionPathHandleKind::Keyframe {
+            if alt_down && let Some(node) = node_opt {
+                let mut toggled = false;
+                let prev_kf = node
+                    .kidx
+                    .checked_sub(1)
+                    .and_then(|i| target.keyframes.get(i));
+                let next_kf = target.keyframes.get(node.kidx + 1);
+                let in_is_bezier = prev_kf.is_some() && is_bezier_tween(node.tween);
+                let out_is_bezier = next_kf.is_some_and(|nk| is_bezier_tween(nk.tween));
+                let to_linear = in_is_bezier || out_is_bezier;
+
+                if to_linear {
+                    if in_is_bezier {
+                        let _ = session.set_keyframe_bezier_handles(
+                            &drag.target_id,
+                            "position",
+                            node.frame,
+                            node.control_points,
+                            node.continuous_tangent,
+                            Some(1),
+                        );
+                        toggled = true;
+                    }
+                    if let Some(nk) = next_kf
+                        && out_is_bezier
+                    {
+                        let _ = session.set_keyframe_bezier_handles(
+                            &drag.target_id,
+                            "position",
+                            nk.frame,
+                            nk.control_points,
+                            nk.continuous_tangent,
+                            Some(1),
+                        );
+                        toggled = true;
+                    }
+                } else {
+                    let mut cp = node.control_points;
+                    if let Some(pk) = prev_kf
+                        && !is_hold_tween(node.tween)
+                    {
+                        let span = (node.frame - pk.frame).max(1.0);
+                        cp[0] = [-span / 3.0, 0.0];
+                        let _ = session.set_keyframe_bezier_handles(
+                            &drag.target_id,
+                            "position",
+                            node.frame,
+                            cp,
+                            true,
+                            Some(to_bezier_tween(node.tween)),
+                        );
+                        toggled = true;
+                    }
+                    if let Some(nk) = next_kf
+                        && !is_hold_tween(nk.tween)
+                    {
+                        let span = (nk.frame - node.frame).max(1.0);
+                        cp[1] = [span / 3.0, 0.0];
+                        let _ = session.set_keyframe_bezier_handles(
+                            &drag.target_id,
+                            "position",
+                            node.frame,
+                            cp,
+                            true,
+                            None,
+                        );
+                        let _ = session.set_keyframe_bezier_handles(
+                            &drag.target_id,
+                            "position",
+                            nk.frame,
+                            nk.control_points,
+                            nk.continuous_tangent,
+                            Some(to_bezier_tween(nk.tween)),
+                        );
+                        toggled = true;
+                    }
+                }
+                if session.history.is_in_transaction() {
+                    let _ = session.commit_transaction(toggled);
+                }
+                if toggled {
+                    action.transform_modified = true;
+                }
+            } else {
+                if session.history.is_in_transaction() {
+                    let _ = session.commit_transaction(false);
+                }
+                let timeline_frame = target.frame_offset + drag.local_frame;
+                let total_frames = session.document().sequence_length;
+                session.playback.set_frame(timeline_frame, total_frames);
+                action.force_refresh = true;
+            }
+            return true;
+        }
+
         if session.history.is_in_transaction() {
             let _ = session.commit_transaction(drag.changed);
         }
-        // Let non-drag pointer releases pass through (e.g. double-click camera reset).
-        return drag.changed;
+        return true;
     }
 
     state.drag_state = current;
@@ -1261,54 +2507,74 @@ pub(crate) fn active_single_video_clip_transform(
 }
 
 pub(crate) fn collect_active_motion_path(session: &Session) -> Option<MotionPathTarget> {
-    if session.selection.clip_ids.len() != 1 {
+    let (track, clip) = if session.selection.clip_ids.len() == 1 {
+        let clip_id = &session.selection.clip_ids[0];
+        session
+            .document()
+            .video_tracks
+            .iter()
+            .find_map(|t| t.clips.iter().find(|c| &c.id == clip_id).map(|c| (t, c)))?
+    } else {
+        let obj_id = session.selection.object_3d_ids.first()?;
+        session.document().video_tracks.iter().find_map(|t| {
+            t.clips
+                .iter()
+                .find(|c| c.objects_3d.iter().any(|o| &o.id == obj_id))
+                .map(|c| (t, c))
+        })?
+    };
+
+    let frame = session.playback.current_frame;
+    if clip.length > 0.0 && (frame < clip.start || frame > clip.start + clip.length) {
         return None;
     }
-    let clip_id = &session.selection.clip_ids[0];
-    let (track, clip) = session
-        .document()
-        .video_tracks
-        .iter()
-        .find_map(|t| t.clips.iter().find(|c| &c.id == clip_id).map(|c| (t, c)))?;
+    let cur_local = frame - clip.start;
 
-    let cur_local = session.playback.current_frame - clip.start;
-
-    // Prefer selected 3D object's animated `position` when an object is selected.
-    if let Some(obj_id) = session.selection.object_3d_ids.first()
-        && let Some(obj) = clip.objects_3d.iter().find(|o| &o.id == obj_id)
-        && let Some(prop) = obj.properties.get("position")
-        && prop.animated
-        && prop.keyframes.len() >= 2
-    {
-        let mut kfs: Vec<MotionPathKeyframe> = prop
-            .keyframes
-            .iter()
-            .filter_map(|k| {
-                value_to_vec3(&k.value).map(|v| MotionPathKeyframe {
-                    frame: k.frame,
-                    value: v,
-                    tween: k.tween,
-                    control_points: k.control_points,
+    // Prefer selected 3D object's animated `position` (supports Camera, Light, Text3D, Shape3D,
+    // Group, Effector, and any nested 3D object).
+    for obj_id in &session.selection.object_3d_ids {
+        if let Some(obj) = clip.objects_3d.iter().find(|o| &o.id == obj_id)
+            && let Some(prop) = obj.properties.get("position")
+            && prop.animated
+            && prop.keyframes.len() >= 2
+        {
+            let mut kfs: Vec<MotionPathKeyframe> = prop
+                .keyframes
+                .iter()
+                .filter_map(|k| {
+                    value_to_vec3(&k.value).map(|v| MotionPathKeyframe {
+                        frame: k.frame,
+                        value: v,
+                        tween: k.tween,
+                        control_points: k.control_points,
+                        continuous_tangent: k.continuous_tangent,
+                    })
                 })
-            })
-            .collect();
-        kfs.sort_by(|a, b| a.frame.total_cmp(&b.frame));
-        let parent_world = obj.parent_id.as_deref().map_or(Mat4::IDENTITY, |pid| {
-            compute_object_3d_world_matrix(&clip.objects_3d, pid, cur_local)
-        });
-        return Some(MotionPathTarget {
-            clip_id: clip.id.clone(),
-            target_id: obj.id.clone(),
-            frame_offset: clip.start,
-            is_3d: true,
-            locked: track.locked,
-            parent_world,
-            keyframes: kfs,
-        });
+                .collect();
+            if kfs.len() < 2 {
+                continue;
+            }
+            kfs.sort_by(|a, b| a.frame.total_cmp(&b.frame));
+            let parent_world = obj.parent_id.as_deref().map_or(Mat4::IDENTITY, |pid| {
+                compute_object_3d_world_matrix(&clip.objects_3d, pid, cur_local)
+            });
+            return Some(MotionPathTarget {
+                clip_id: clip.id.clone(),
+                target_id: obj.id.clone(),
+                frame_offset: clip.start,
+                clip_length: clip.length,
+                is_3d: true,
+                locked: track.locked || prop.expression.is_some(),
+                parent_id: obj.parent_id.clone(),
+                parent_world,
+                keyframes: kfs,
+            });
+        }
     }
 
-    // Fallback to clip's own 2D `position` keyframes.
-    if let Some(prop) = clip.properties.get("position")
+    // Fallback to selected clip's own 2D `position` keyframes.
+    if session.selection.clip_ids.len() == 1
+        && let Some(prop) = clip.properties.get("position")
         && prop.animated
         && prop.keyframes.len() >= 2
     {
@@ -1321,19 +2587,24 @@ pub(crate) fn collect_active_motion_path(session: &Session) -> Option<MotionPath
                     value: v,
                     tween: k.tween,
                     control_points: k.control_points,
+                    continuous_tangent: k.continuous_tangent,
                 })
             })
             .collect();
-        kfs.sort_by(|a, b| a.frame.total_cmp(&b.frame));
-        return Some(MotionPathTarget {
-            clip_id: clip.id.clone(),
-            target_id: clip.id.clone(),
-            frame_offset: clip.start,
-            is_3d: false,
-            locked: track.locked,
-            parent_world: Mat4::IDENTITY,
-            keyframes: kfs,
-        });
+        if kfs.len() >= 2 {
+            kfs.sort_by(|a, b| a.frame.total_cmp(&b.frame));
+            return Some(MotionPathTarget {
+                clip_id: clip.id.clone(),
+                target_id: clip.id.clone(),
+                frame_offset: clip.start,
+                clip_length: clip.length,
+                is_3d: false,
+                locked: track.locked || prop.expression.is_some(),
+                parent_id: None,
+                parent_world: Mat4::IDENTITY,
+                keyframes: kfs,
+            });
+        }
     }
 
     None
@@ -2083,7 +3354,13 @@ pub(crate) fn paint_and_interact_viewport_hud(
     // Top-right FPS Meter badge (single canonical overlay gated on `state.show_fps_overlay`).
     if state.show_fps_overlay && panel_rect.width() >= 280.0 {
         let (avg_ms, fps) = average_frame_ms_and_fps(&state.last_frame_times);
-        let label = format!("{fps:.1} fps · {avg_ms:.1} ms");
+        let target_fps = session.document().fps.max(1.0) as f32;
+        let not_realtime = session.playback.is_playing() && fps < target_fps * 0.85;
+        let label = if not_realtime {
+            format!("{fps:.1} fps · {avg_ms:.1} ms (not realtime)")
+        } else {
+            format!("{fps:.1} fps · {avg_ms:.1} ms")
+        };
         let fps_w = (label.len() as f32 * 6.4 + 14.0).max(114.0);
         let fps_rect = Rect::from_min_size(
             pos2(panel_rect.right() - margin - fps_w, y),
@@ -2127,3 +3404,557 @@ pub(crate) fn paint_and_interact_viewport_hud(
 // ---------------------------------------------------------------------------
 // 2D Anchor Drag, Canvas Snapping Guides & Click-to-Select 2D Layers
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod motion_path_tests {
+    use super::*;
+
+    fn test_static_prop(v: Value) -> SessionProperty {
+        SessionProperty {
+            animated: false,
+            expression: None,
+            default_value: v,
+            keyframes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn frustum_segment_clipping_handles_front_crossing_behind_and_non_finite() {
+        let cam_state = EditorCameraState::new();
+        let canvas = Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 540.0));
+        let cam =
+            ResolvedCamera3D::from_editor_camera(&cam_state, canvas.width() / canvas.height());
+
+        // 1. Both points in front of camera project identically to `project_world_point`.
+        let a = Vec3::new(-10.0, 0.0, 0.0);
+        let b = Vec3::new(10.0, 5.0, 0.0);
+        let [pa, pb] = clip_and_project_3d_segment(cam.view_proj, a, b, canvas)
+            .expect("in-front segment must project");
+        let exp_a = cam.project_world_point(a, canvas).expect("a projects");
+        let exp_b = cam.project_world_point(b, canvas).expect("b projects");
+        assert!(pa.distance(exp_a) < 1e-2);
+        assert!(pb.distance(exp_b) < 1e-2);
+
+        // 2. Segment crossing behind the camera (`clip_z <= 0`) clips cleanly without NaN/Inf.
+        let front = Vec3::ZERO;
+        let behind = cam.eye - cam.forward * 40.0;
+        assert!(cam.project_world_point(behind, canvas).is_none());
+        let [p_front, p_clipped] =
+            clip_and_project_3d_segment(cam.view_proj, front, behind, canvas)
+                .expect("crossing segment must clip to near plane instead of disappearing");
+        assert!(p_front.x.is_finite() && p_front.y.is_finite());
+        assert!(p_clipped.x.is_finite() && p_clipped.y.is_finite());
+        let exp_front = cam
+            .project_world_point(front, canvas)
+            .expect("front projects");
+        assert!(p_front.distance(exp_front) < 1e-2);
+
+        // 3. Both endpoints behind the camera are rejected cleanly.
+        let behind_a = cam.eye - cam.forward * 15.0;
+        let behind_b = cam.eye - cam.forward * 60.0;
+        assert!(clip_and_project_3d_segment(cam.view_proj, behind_a, behind_b, canvas).is_none());
+
+        // 4. Non-finite inputs never panic.
+        assert!(clip_and_project_3d_segment(cam.view_proj, Vec3::NAN, b, canvas).is_none());
+        assert!(clip_and_project_3d_segment(cam.view_proj, a, Vec3::INFINITY, canvas).is_none());
+    }
+
+    #[test]
+    fn camera_plane_unprojection_drag_delta_tracks_screen_delta_and_parent_transform() {
+        let canvas = Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 540.0));
+        let editor_cam = ResolvedCamera3D::from_editor_camera(
+            &EditorCameraState::new(),
+            canvas.width() / canvas.height(),
+        );
+
+        // Identity parent transform: dragging in screen space maps back to exact target pixels.
+        let orig_local = Vec3::new(12.0, -5.0, 8.0);
+        let start_px = editor_cam
+            .project_world_point(orig_local, canvas)
+            .expect("orig projects");
+        let end_px = start_px + vec2(48.0, -30.0);
+        let delta = unproject_motion_path_drag_3d(
+            &editor_cam,
+            Mat4::IDENTITY,
+            orig_local,
+            start_px,
+            end_px,
+            canvas,
+        )
+        .expect("unprojection succeeds");
+        let moved_px = editor_cam
+            .project_world_point(orig_local + delta, canvas)
+            .expect("moved projects");
+        assert!(
+            moved_px.distance(end_px) < 0.5,
+            "expected {end_px:?}, got {moved_px:?}"
+        );
+
+        // Nested rotated + scaled parent group transform.
+        let parent_world = Transform3D {
+            position: Vec3::new(10.0, 4.0, -6.0),
+            rotation: Vec3::new(0.2, PI * 0.5, -0.15),
+            scale: Vec3::new(2.0, 1.5, 0.75),
+            euler_order: GeomEulerOrder::YXZ,
+        }
+        .to_matrix();
+        let world_orig = parent_world.transform_point3(orig_local);
+        let p_start = editor_cam
+            .project_world_point(world_orig, canvas)
+            .expect("parented orig projects");
+        let p_end = p_start + vec2(-36.0, 22.0);
+        let local_delta = unproject_motion_path_drag_3d(
+            &editor_cam,
+            parent_world,
+            orig_local,
+            p_start,
+            p_end,
+            canvas,
+        )
+        .expect("parented unprojection succeeds");
+        let world_moved = parent_world.transform_point3(orig_local + local_delta);
+        let p_moved = editor_cam
+            .project_world_point(world_moved, canvas)
+            .expect("parented moved projects");
+        assert!(
+            p_moved.distance(p_end) < 0.5,
+            "parented drag mismatch: expected {p_end:?}, got {p_moved:?}"
+        );
+
+        // Scene camera (orthographic) unprojection also tracks screen delta accurately.
+        let mut cam_props = BTreeMap::new();
+        cam_props.insert("enabled".to_owned(), test_static_prop(json!(1)));
+        cam_props.insert("active".to_owned(), test_static_prop(json!(1)));
+        cam_props.insert("camera.kind".to_owned(), test_static_prop(json!(1)));
+        cam_props.insert(
+            "position".to_owned(),
+            test_static_prop(json!([0.0, 0.0, 80.0])),
+        );
+        cam_props.insert(
+            "rotation".to_owned(),
+            test_static_prop(json!([0.0, 0.0, 0.0])),
+        );
+        cam_props.insert("scale".to_owned(), test_static_prop(json!([1.0, 1.0, 1.0])));
+        cam_props.insert("zoom".to_owned(), test_static_prop(json!(1.0)));
+        let ortho_clip = SessionClip {
+            id: "clip-ortho".to_owned(),
+            kind: "scene".to_owned(),
+            name: "Scene".to_owned(),
+            start: 0.0,
+            length: 120.0,
+            time_start: 0.0,
+            time_end: 120.0,
+            time_animated: false,
+            media_length: None,
+            source_clip_id: None,
+            properties: BTreeMap::new(),
+            objects_3d: vec![SessionObject3D {
+                id: "ortho-cam".to_owned(),
+                parent_id: None,
+                kind: "camera".to_owned(),
+                name: "Ortho".to_owned(),
+                source_id: None,
+                properties: cam_props,
+            }],
+            effects: Vec::new(),
+        };
+        let scene_cam = ResolvedCamera3D::from_scene_clip(&ortho_clip, 0.0, 1920.0, 1080.0);
+        let o_start = scene_cam
+            .project_world_point(orig_local, canvas)
+            .expect("ortho orig projects");
+        let o_end = o_start + vec2(30.0, 18.0);
+        let o_delta = unproject_motion_path_drag_3d(
+            &scene_cam,
+            Mat4::IDENTITY,
+            orig_local,
+            o_start,
+            o_end,
+            canvas,
+        )
+        .expect("ortho unprojection succeeds");
+        let o_moved = scene_cam
+            .project_world_point(orig_local + o_delta, canvas)
+            .expect("ortho moved projects");
+        assert!(o_moved.distance(o_end) < 0.5);
+
+        // Singular parent matrix returns `None` cleanly.
+        let singular = Mat4::from_scale(Vec3::ZERO);
+        assert!(
+            unproject_motion_path_drag_3d(
+                &editor_cam,
+                singular,
+                orig_local,
+                start_px,
+                end_px,
+                canvas
+            )
+            .is_none()
+        );
+
+        // Shift axis constraint locks strictly to dominant axis.
+        let (c3, ax3) = constrain_motion_path_delta(Vec3::new(3.0, -12.0, 5.0), true, true);
+        assert_eq!(ax3, Some(1));
+        assert_eq!(c3, Vec3::new(0.0, -12.0, 0.0));
+        let (c2, ax2) = constrain_motion_path_delta(Vec3::new(9.0, -4.0, 20.0), false, true);
+        assert_eq!(ax2, Some(0));
+        assert_eq!(c2, Vec3::new(9.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn motion_path_sample_density_and_velocity_tick_spacing() {
+        // Exact per-frame tick dots for normal spans (strictly interior to `(0, 30)`).
+        let ticks_30 = motion_path_tick_frames(0.0, 30.0, 30.0);
+        assert_eq!(ticks_30.len(), 29);
+        assert!((ticks_30[0] - 1.0).abs() < 1e-9);
+        assert!((ticks_30[28] - 29.0).abs() < 1e-9);
+
+        // Long spans remain strictly bounded to `MOTION_PATH_MAX_TICKS` / `MOTION_PATH_MAX_SAMPLES`.
+        let long_ticks = motion_path_tick_frames(0.0, 2400.0, 2400.0);
+        assert!(!long_ticks.is_empty() && long_ticks.len() <= MOTION_PATH_MAX_TICKS);
+        let long_samples = motion_path_sample_frames(0.0, 2400.0, 2400.0);
+        assert!(long_samples.len() <= MOTION_PATH_MAX_SAMPLES + 1);
+        assert!((long_samples[0] - 0.0).abs() < 1e-9);
+        assert!((long_samples[long_samples.len() - 1] - 2400.0).abs() < 1e-9);
+
+        // Eased/Bezier curve produces non-uniform spacing between per-frame dots (speed visualization).
+        let bezier_tween = to_bezier_tween(1);
+        let kfs = vec![
+            MotionPathKeyframe {
+                frame: 0.0,
+                value: Vec3::ZERO,
+                tween: 1,
+                control_points: [[-10.0, 0.0], [22.0, 0.0]],
+                continuous_tangent: true,
+            },
+            MotionPathKeyframe {
+                frame: 30.0,
+                value: Vec3::new(100.0, 0.0, 0.0),
+                tween: bezier_tween,
+                control_points: [[-2.0, 0.0], [10.0, 0.0]],
+                continuous_tangent: true,
+            },
+        ];
+        let p0 = eval_motion_path_at(&kfs, 0.0).expect("p0");
+        let p1 = eval_motion_path_at(&kfs, 1.0).expect("p1");
+        let p28 = eval_motion_path_at(&kfs, 28.0).expect("p28");
+        let p29 = eval_motion_path_at(&kfs, 29.0).expect("p29");
+        let slow_step = (p1 - p0).length();
+        let fast_step = (p29 - p28).length();
+        assert!(
+            fast_step > slow_step * 2.0,
+            "ease-in curve must space late ticks much wider than early ticks: slow={slow_step}, fast={fast_step}"
+        );
+    }
+
+    #[test]
+    fn collect_motion_path_handles_clip_start_offset_and_all_3d_object_kinds() {
+        let mut session = Session::new();
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session.execute(Command::MoveClip {
+            clip_id: clip_id.clone(),
+            target_track_id: None,
+            start: 24.0,
+        });
+        let _ = session
+            .selection
+            .select_clip(clip_id.clone(), Some("scene"), false);
+
+        // Add parent Group + animated child Camera, Light, Text3D.
+        let group_id = session
+            .execute(Command::AddObject3D {
+                clip_id: clip_id.clone(),
+                parent_id: None,
+                kind: "group".to_owned(),
+                name: Some("Rig".to_owned()),
+            })
+            .expect("add group")["object_id"]
+            .as_str()
+            .expect("group id")
+            .to_owned();
+        let cam_id = session
+            .execute(Command::AddObject3D {
+                clip_id: clip_id.clone(),
+                parent_id: Some(group_id.clone()),
+                kind: "camera".to_owned(),
+                name: Some("OrbitCam".to_owned()),
+            })
+            .expect("add camera")["object_id"]
+            .as_str()
+            .expect("cam id")
+            .to_owned();
+        let _ = session.execute(Command::SetKeyframe {
+            target_id: cam_id.clone(),
+            property: "position".to_owned(),
+            frame: 0.0,
+            value: json!([0.0, 10.0, 50.0]),
+            tween: Some(1),
+        });
+        let _ = session.execute(Command::SetKeyframe {
+            target_id: cam_id.clone(),
+            property: "position".to_owned(),
+            frame: 30.0,
+            value: json!([30.0, 10.0, 50.0]),
+            tween: Some(1),
+        });
+        let _ = session
+            .selection
+            .select_object_3d(cam_id.clone(), "camera", false);
+
+        // Before clip start (frame 10 < 24): path is hidden for inactive clip.
+        session.playback.current_frame = 10.0;
+        assert!(collect_active_motion_path(&session).is_none());
+
+        // Inside clip span (frame 36 -> local 12): path is collected with exact `frame_offset = 24`.
+        session.playback.current_frame = 36.0;
+        let target = collect_active_motion_path(&session).expect("active 3D camera path");
+        assert!(target.is_3d);
+        assert_eq!(target.target_id, cam_id);
+        assert_eq!(target.parent_id.as_deref(), Some(group_id.as_str()));
+        assert!((target.frame_offset - 24.0).abs() < 1e-9);
+        assert_eq!(target.keyframes.len(), 2);
+    }
+
+    #[test]
+    fn headless_motion_path_3d_click_to_seek_and_undoable_keyframe_drag() {
+        let ctx = egui::Context::default();
+        let palette = ThemePalette::default();
+        let mut session = Session::new();
+        let _ = session.execute(Command::EnablePlugin {
+            plugin_id: "motion-path".to_owned(),
+        });
+        let clip_id = session.document().video_tracks[0].clips[0].id.clone();
+        let _ = session.execute(Command::MoveClip {
+            clip_id: clip_id.clone(),
+            target_track_id: None,
+            start: 10.0,
+        });
+        session.playback.current_frame = 10.0;
+        let _ = session
+            .selection
+            .select_clip(clip_id.clone(), Some("scene"), false);
+        session.playback.editing_camera = true;
+
+        let obj_id = session
+            .execute(Command::AddObject3D {
+                clip_id: clip_id.clone(),
+                parent_id: None,
+                kind: "box".to_owned(),
+                name: Some("AnimatedCube".to_owned()),
+            })
+            .expect("add box")["object_id"]
+            .as_str()
+            .expect("obj id")
+            .to_owned();
+        let _ = session.execute(Command::SetKeyframe {
+            target_id: obj_id.clone(),
+            property: "position".to_owned(),
+            frame: 0.0,
+            value: json!([0.0, 0.0, 0.0]),
+            tween: Some(1),
+        });
+        let _ = session.execute(Command::SetKeyframe {
+            target_id: obj_id.clone(),
+            property: "position".to_owned(),
+            frame: 30.0,
+            value: json!([20.0, 0.0, 0.0]),
+            tween: Some(1),
+        });
+        let _ = session
+            .selection
+            .select_object_3d(obj_id.clone(), "box", false);
+
+        let mut state = ViewportState::new();
+        state.motion_path_visible = true;
+        let screen_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 360.0));
+
+        let step = |session: &mut Session,
+                    state: &mut ViewportState,
+                    time: f64,
+                    events: Vec<egui::Event>|
+         -> ViewportAction {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen_rect),
+                time: Some(time),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let mut action = ViewportAction::default();
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        action = show_viewport(ui, session, state, None, &palette);
+                    });
+            });
+            full.textures_delta.clear();
+            action
+        };
+
+        let cam = ResolvedCamera3D::from_editor_camera(&state.camera, 640.0 / 360.0);
+        let kf30_screen = cam
+            .project_world_point(Vec3::new(20.0, 0.0, 0.0), screen_rect)
+            .expect("kf30 projects");
+
+        // Prime layout.
+        step(
+            &mut session,
+            &mut state,
+            0.0,
+            vec![egui::Event::PointerMoved(kf30_screen)],
+        );
+
+        // 1. Plain click on F30 keyframe diamond jumps playhead to `clip.start (10) + 30 = 40`.
+        step(
+            &mut session,
+            &mut state,
+            0.02,
+            vec![
+                egui::Event::PointerMoved(kf30_screen),
+                egui::Event::PointerButton {
+                    pos: kf30_screen,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        step(
+            &mut session,
+            &mut state,
+            0.04,
+            vec![
+                egui::Event::PointerMoved(kf30_screen),
+                egui::Event::PointerButton {
+                    pos: kf30_screen,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            (session.playback.current_frame - 40.0).abs() < 1e-6,
+            "clicking keyframe diamond must seek to timeline frame 40, got {}",
+            session.playback.current_frame
+        );
+        assert!(!session.history.is_in_transaction());
+
+        // 2. Drag F30 keyframe diamond in Editing Camera mode and verify undo restores `[20, 0, 0]`.
+        let drag_end = kf30_screen + vec2(36.0, -24.0);
+        step(
+            &mut session,
+            &mut state,
+            0.06,
+            vec![
+                egui::Event::PointerMoved(kf30_screen),
+                egui::Event::PointerButton {
+                    pos: kf30_screen,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let drag_act = step(
+            &mut session,
+            &mut state,
+            0.08,
+            vec![egui::Event::PointerMoved(drag_end)],
+        );
+        assert!(drag_act.transform_modified);
+        step(
+            &mut session,
+            &mut state,
+            0.10,
+            vec![
+                egui::Event::PointerMoved(drag_end),
+                egui::Event::PointerButton {
+                    pos: drag_end,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(!session.history.is_in_transaction());
+
+        let after_drag = collect_active_motion_path(&session)
+            .expect("path after drag")
+            .keyframes[1]
+            .value;
+        assert!(
+            (after_drag - Vec3::new(20.0, 0.0, 0.0)).length() > 1.0,
+            "3D keyframe drag must move position, got {after_drag:?}"
+        );
+
+        let _ = session.execute(Command::Undo);
+        let after_undo = collect_active_motion_path(&session)
+            .expect("path after undo")
+            .keyframes[1]
+            .value;
+        assert!(
+            (after_undo - Vec3::new(20.0, 0.0, 0.0)).length() < 1e-3,
+            "undo must restore original keyframe [20, 0, 0], got {after_undo:?}"
+        );
+
+        // 3. Also verify active Scene Camera projection + keyframe drag (`editing_camera = false`).
+        session.playback.editing_camera = false;
+        let clip_ref = &session.document().video_tracks[0].clips[0];
+        let scene_cam = ResolvedCamera3D::from_scene_clip(clip_ref, 30.0, 1920.0, 1080.0);
+        let scene_kf30 = scene_cam
+            .project_world_point(Vec3::new(20.0, 0.0, 0.0), screen_rect)
+            .expect("kf30 projects through scene camera");
+        let scene_drag_end = scene_kf30 + vec2(30.0, 18.0);
+        step(
+            &mut session,
+            &mut state,
+            0.12,
+            vec![egui::Event::PointerMoved(scene_kf30)],
+        );
+        step(
+            &mut session,
+            &mut state,
+            0.14,
+            vec![
+                egui::Event::PointerMoved(scene_kf30),
+                egui::Event::PointerButton {
+                    pos: scene_kf30,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let scene_drag_act = step(
+            &mut session,
+            &mut state,
+            0.16,
+            vec![egui::Event::PointerMoved(scene_drag_end)],
+        );
+        assert!(scene_drag_act.transform_modified);
+        step(
+            &mut session,
+            &mut state,
+            0.18,
+            vec![
+                egui::Event::PointerMoved(scene_drag_end),
+                egui::Event::PointerButton {
+                    pos: scene_drag_end,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let after_scene_drag = collect_active_motion_path(&session)
+            .expect("path after scene cam drag")
+            .keyframes[1]
+            .value;
+        assert!(
+            (after_scene_drag - Vec3::new(20.0, 0.0, 0.0)).length() > 1.0,
+            "Scene Camera 3D keyframe drag must move position, got {after_scene_drag:?}"
+        );
+        assert!(!session.history.is_in_transaction());
+    }
+}

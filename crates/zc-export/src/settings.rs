@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::ExportError;
+use crate::datamosh::DatamoshMode;
 use crate::padding::even_padded_dimensions;
 
 /// Maximum single-axis export resolution in pixels (8K UHD per Spec 04 §4.1).
@@ -82,6 +83,81 @@ pub enum QualityMode {
     Crf(u8),
     /// Target average video bitrate in kilobits per second.
     BitrateKbps(u32),
+}
+
+/// Hardware video encoder acceleration preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HardwareAcceleration {
+    /// Always use software encoders (`libx264`, `libx265`, `libvpx-vp9`, `libvpx`, `libsvtav1`).
+    #[default]
+    Off,
+    /// Probe FFmpeg for available platform hardware encoders (`videotoolbox`, `nvenc`, `vaapi`)
+    /// and fall back to software encoding when unavailable or incompatible.
+    Auto,
+    /// Prefer Apple VideoToolbox (`h264_videotoolbox` / `hevc_videotoolbox`), falling back to software.
+    VideoToolbox,
+    /// Prefer NVIDIA NVENC (`h264_nvenc` / `hevc_nvenc`), falling back to software.
+    Nvenc,
+    /// Prefer Linux VA-API (`h264_vaapi`), falling back to software.
+    Vaapi,
+}
+
+/// Encoder speed vs. compression efficiency preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EncoderSpeedPreset {
+    /// Faster encoding with slightly larger output files.
+    Fast,
+    /// Balanced speed and compression efficiency (default).
+    #[default]
+    Balanced,
+    /// Higher compression efficiency at slower encoding speeds.
+    Slow,
+}
+
+/// Optional encoder tuning, hardware acceleration, and True Datamosh cut-keyframe hints
+/// passed alongside [`ExportSettings`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExportEncodeOptions {
+    /// Hardware video encoder selection (defaults to [`HardwareAcceleration::Off`]).
+    pub hardware_acceleration: HardwareAcceleration,
+    /// Encoder speed/efficiency preset (defaults to [`EncoderSpeedPreset::Balanced`]).
+    pub speed_preset: EncoderSpeedPreset,
+    /// Active True Datamosh mode. When [`DatamoshMode::AtClipCuts`] is selected with non-empty
+    /// `cut_times_ms`, FFmpeg forces keyframes at those clip cut timestamps.
+    pub datamosh_mode: DatamoshMode,
+    /// Clip cut timestamps in milliseconds relative to the export start frame.
+    pub cut_times_ms: Vec<u64>,
+}
+
+impl ExportEncodeOptions {
+    /// Sets the preferred [`HardwareAcceleration`] mode.
+    #[must_use]
+    pub const fn with_hardware_acceleration(
+        mut self,
+        hardware_acceleration: HardwareAcceleration,
+    ) -> Self {
+        self.hardware_acceleration = hardware_acceleration;
+        self
+    }
+
+    /// Sets the [`EncoderSpeedPreset`].
+    #[must_use]
+    pub const fn with_speed_preset(mut self, speed_preset: EncoderSpeedPreset) -> Self {
+        self.speed_preset = speed_preset;
+        self
+    }
+
+    /// Configures True Datamosh mode and clip cut timestamps (ms relative to export start).
+    #[must_use]
+    pub fn with_datamosh_cuts(
+        mut self,
+        datamosh_mode: DatamoshMode,
+        cut_times_ms: Vec<u64>,
+    ) -> Self {
+        self.datamosh_mode = datamosh_mode;
+        self.cut_times_ms = cut_times_ms;
+        self
+    }
 }
 
 /// Complete configuration for an export job.
@@ -249,9 +325,10 @@ impl ExportSettings {
             ));
         }
 
-        if self.transparent_alpha && self.video_codec != VideoCodec::Vp9 {
+        if self.transparent_alpha && !matches!(self.video_codec, VideoCodec::Vp9 | VideoCodec::Vp8)
+        {
             return Err(ExportError::InvalidSettings(format!(
-                "transparent_alpha is only supported for PngSequence, Gif, or VP9 (WebM/MKV), not {:?}",
+                "transparent_alpha is only supported for PngSequence, Gif, or VP9/VP8 (WebM/MKV), not {:?}",
                 self.video_codec
             )));
         }

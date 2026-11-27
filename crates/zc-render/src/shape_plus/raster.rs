@@ -415,16 +415,87 @@ pub(crate) fn glyph_closed_contours(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn glyph_paths_with_fonts(
+    ch: char,
+    font_size: f64,
+    h_scale: f64,
+    v_scale: f64,
+    ox: f64,
+    oy: f64,
+    primary_font: Option<&[u8]>,
+    fallback_font: Option<&[u8]>,
+) -> Vec<ShapePath> {
+    if ch.is_whitespace() {
+        return Vec::new();
+    }
+    if (primary_font.is_some() || fallback_font.is_some())
+        && let Some(outline) = zc_scene::extract_glyph_outline_2d_with_fallback(
+            primary_font,
+            fallback_font,
+            ch,
+            font_size,
+        )
+    {
+        return outline
+            .contours
+            .into_iter()
+            .filter(|c| c.len() >= 3)
+            .map(|pts| ShapePath {
+                points: pts
+                    .into_iter()
+                    .map(|[x, y]| [ox + x * h_scale, oy + y * v_scale])
+                    .collect(),
+                vertices: None,
+                closed: true,
+                widths: None,
+                distances: None,
+                total_length: None,
+            })
+            .collect();
+    }
+    glyph_closed_contours(ch, font_size * h_scale, font_size * v_scale, ox, oy)
+}
+
+pub(crate) fn glyph_advance_with_fonts(
+    ch: char,
+    font_size: f64,
+    h_scale: f64,
+    primary_font: Option<&[u8]>,
+    fallback_font: Option<&[u8]>,
+) -> f64 {
+    if (primary_font.is_some() || fallback_font.is_some())
+        && let Some(outline) = zc_scene::extract_glyph_outline_2d_with_fallback(
+            primary_font,
+            fallback_font,
+            ch,
+            font_size,
+        )
+    {
+        return outline.advance * h_scale;
+    }
+    let factor = if ch == ' ' {
+        0.38
+    } else if matches!(ch, 'I' | 'i' | 'l' | '!' | '.' | ',' | ':') {
+        0.44
+    } else {
+        0.62
+    };
+    factor * font_size * h_scale
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TextGlyphInstance {
     pub(crate) ch: char,
+    pub(crate) render_ch: char,
+    pub(crate) eff_font_size: f64,
+    pub(crate) h_scale: f64,
+    pub(crate) v_scale: f64,
     pub(crate) line: usize,
     pub(crate) word: Option<usize>,
     pub(crate) x: f64,
     pub(crate) y: f64,
     pub(crate) advance: f64,
-    pub(crate) scale_x: f64,
-    pub(crate) scale_y: f64,
     pub(crate) paths: Vec<ShapePath>,
 }
 
@@ -432,6 +503,8 @@ pub(crate) fn layout_shape_plus_text(
     props: Option<&Map<String, Value>>,
     frame: f64,
     eval_expr: ExprEval<'_>,
+    primary_font: Option<&[u8]>,
+    fallback_font: Option<&[u8]>,
 ) -> (Vec<TextGlyphInstance>, usize) {
     let get = |k: &str| props.and_then(|p| p.get(k));
     let mut source = eval_prop_str(get("sourceText"), frame, "Text");
@@ -456,29 +529,50 @@ pub(crate) fn layout_shape_plus_text(
     let space_before = eval_prop_f64(get("spaceBefore"), frame, 0.0, eval_expr);
     let space_after = eval_prop_f64(get("spaceAfter"), frame, 0.0, eval_expr);
 
-    let sx = font_size * h_scale;
-    let sy = font_size * v_scale;
-    let char_adv = |c: char| -> f64 {
-        let factor = if c == ' ' {
-            0.38
-        } else if matches!(c, 'I' | 'i' | 'l' | '!' | '.' | ',' | ':') {
-            0.44
+    let has_fonts = primary_font.is_some() || fallback_font.is_some();
+    let tracking_px = tracking * font_size / 1000.0;
+    let render_spec = |c: char| -> (char, f64) {
+        if caps == "small" && c.is_ascii_lowercase() {
+            (c.to_ascii_uppercase(), font_size * 0.8)
         } else {
-            0.62
-        };
-        factor * sx + tracking * font_size / 1000.0
+            (c, font_size)
+        }
+    };
+    let char_adv = |c: char| -> f64 {
+        let (gch, eff_fs) = render_spec(c);
+        glyph_advance_with_fonts(gch, eff_fs, h_scale, primary_font, fallback_font) + tracking_px
+    };
+    let pair_kern = |prev: char, curr: char, eff_fs: f64| -> f64 {
+        if !has_fonts {
+            return 0.0;
+        }
+        zc_scene::font_kerning_2d_with_fallback(primary_font, fallback_font, prev, curr, eff_fs)
+            * h_scale
+    };
+    let measure_str = |s: &str| -> f64 {
+        let mut total = 0.0;
+        let mut prev_gch: Option<char> = None;
+        for c in s.chars() {
+            let (gch, eff_fs) = render_spec(c);
+            if let Some(p) = prev_gch {
+                total += pair_kern(p, gch, eff_fs);
+            }
+            total += char_adv(c);
+            prev_gch = Some(gch);
+        }
+        total
     };
 
-    // Split paragraphs on '\n', and word-wrap in box mode.
+    // Split paragraphs on '\n', and word-wrap in box mode (breaking long words/CJK runs as needed).
     let mut lines: Vec<(String, bool)> = Vec::new();
-    for para in source.split('\n') {
+    for para in source.replace("\r\n", "\n").replace('\r', "\n").split('\n') {
         if text_mode == "box" && box_size[0] > 0.0 {
             let max_w = box_size[0];
             let mut cur_line = String::new();
             let mut cur_w = first_line_indent;
             let mut first = true;
             for word in para.split(' ') {
-                let word_w: f64 = word.chars().map(char_adv).sum();
+                let word_w = measure_str(word);
                 let sp_w = if cur_line.is_empty() {
                     0.0
                 } else {
@@ -486,14 +580,27 @@ pub(crate) fn layout_shape_plus_text(
                 };
                 if !cur_line.is_empty() && cur_w + sp_w + word_w > max_w {
                     lines.push((cur_line, first));
-                    cur_line = word.to_owned();
-                    cur_w = word_w;
+                    cur_line = String::new();
+                    cur_w = 0.0;
                     first = false;
-                } else {
-                    if !cur_line.is_empty() {
-                        cur_line.push(' ');
-                        cur_w += sp_w;
+                }
+                if !cur_line.is_empty() {
+                    cur_line.push(' ');
+                    cur_w += sp_w;
+                }
+                if cur_w + word_w > max_w && word.chars().count() > 1 {
+                    for ch in word.chars() {
+                        let cw = char_adv(ch);
+                        if !cur_line.is_empty() && cur_w + cw > max_w {
+                            lines.push((cur_line, first));
+                            cur_line = String::new();
+                            cur_w = 0.0;
+                            first = false;
+                        }
+                        cur_line.push(ch);
+                        cur_w += cw;
                     }
+                } else {
                     cur_line.push_str(word);
                     cur_w += word_w;
                 }
@@ -516,7 +623,7 @@ pub(crate) fn layout_shape_plus_text(
                 pen_y -= space_before + space_after;
             }
         }
-        let line_w: f64 = line_str.chars().map(char_adv).sum();
+        let line_w = measure_str(line_str);
         let align_x = match alignment.as_str() {
             "center" | "justifycenter" => -line_w * 0.5,
             "right" | "justifyright" => -line_w,
@@ -530,6 +637,7 @@ pub(crate) fn layout_shape_plus_text(
         let mut pen_x = origin[0] + align_x + indent;
         let mut in_word = false;
         let mut cur_word = 0usize;
+        let mut prev_gch: Option<char> = None;
 
         for ch in line_str.chars() {
             let word_opt = if ch.is_whitespace() {
@@ -543,25 +651,36 @@ pub(crate) fn layout_shape_plus_text(
                 }
                 Some(cur_word)
             };
+            let (gch, eff_fs) = render_spec(ch);
+            if let Some(p) = prev_gch {
+                pen_x += pair_kern(p, gch, eff_fs);
+            }
             let adv = char_adv(ch);
-            let (gx, gy, gch) = if caps == "small" && ch.is_ascii_lowercase() {
-                (sx * 0.8, sy * 0.8, ch.to_ascii_uppercase())
-            } else {
-                (sx, sy, ch)
-            };
-            let paths = glyph_closed_contours(gch, gx, gy, pen_x, pen_y);
+            let paths = glyph_paths_with_fonts(
+                gch,
+                eff_fs,
+                h_scale,
+                v_scale,
+                pen_x,
+                pen_y,
+                primary_font,
+                fallback_font,
+            );
             glyphs.push(TextGlyphInstance {
                 ch,
+                render_ch: gch,
+                eff_font_size: eff_fs,
+                h_scale,
+                v_scale,
                 line: line_idx,
                 word: word_opt,
                 x: pen_x,
                 y: pen_y,
                 advance: adv,
-                scale_x: gx,
-                scale_y: gy,
                 paths,
             });
             pen_x += adv;
+            prev_gch = Some(gch);
         }
     }
 
@@ -742,13 +861,15 @@ pub(crate) fn animator_prop_enabled(
     props.contains_key(key) || (key == "fillColor" && props.contains_key("color"))
 }
 
-pub(crate) fn evaluate_text_with_animators(
+pub(crate) fn evaluate_text_glyph_instances(
     item: &Value,
     animators: &[&Value],
     frame: f64,
     fps: f64,
     eval_expr: ExprEval<'_>,
-) -> Vec<(Vec<ShapePath>, Mat2D, Option<CharPaintOverride>)> {
+    primary_font: Option<&[u8]>,
+    fallback_font: Option<&[u8]>,
+) -> Vec<(TextGlyphInstance, Mat2D, Option<CharPaintOverride>)> {
     let props = item.get("properties").and_then(Value::as_object);
     let font_size = eval_prop_f64(
         props.and_then(|p| p.get("fontSize")),
@@ -756,7 +877,8 @@ pub(crate) fn evaluate_text_with_animators(
         100.0,
         eval_expr,
     );
-    let (mut glyphs, line_count) = layout_shape_plus_text(props, frame, eval_expr);
+    let (mut glyphs, line_count) =
+        layout_shape_plus_text(props, frame, eval_expr, primary_font, fallback_font);
     if glyphs.is_empty() {
         return Vec::new();
     }
@@ -773,8 +895,10 @@ pub(crate) fn evaluate_text_with_animators(
         .collect();
 
     if active_animators.is_empty() {
-        let all_paths: Vec<ShapePath> = glyphs.into_iter().flat_map(|g| g.paths).collect();
-        return vec![(all_paths, MAT_IDENTITY, None)];
+        return glyphs
+            .into_iter()
+            .map(|g| (g, MAT_IDENTITY, None))
+            .collect();
     }
 
     let time = if fps > 0.0 { frame / fps } else { 0.0 };
@@ -916,9 +1040,18 @@ pub(crate) fn evaluate_text_with_animators(
             glyph.x += *carry;
             if shift != 0 {
                 glyph.ch = shift_codepoint(glyph.ch, shift);
+                glyph.render_ch = shift_codepoint(glyph.render_ch, shift);
             }
-            glyph.paths =
-                glyph_closed_contours(glyph.ch, glyph.scale_x, glyph.scale_y, glyph.x, glyph.y);
+            glyph.paths = glyph_paths_with_fonts(
+                glyph.render_ch,
+                glyph.eff_font_size,
+                glyph.h_scale,
+                glyph.v_scale,
+                glyph.x,
+                glyph.y,
+                primary_font,
+                fallback_font,
+            );
         }
         *carry += track_step;
     }
@@ -926,9 +1059,6 @@ pub(crate) fn evaluate_text_with_animators(
     // Build per-glyph composed transform matrix & optional opacity/fillColor override.
     let mut out = Vec::with_capacity(n);
     for (i, glyph) in glyphs.into_iter().enumerate() {
-        if glyph.paths.is_empty() {
-            continue;
-        }
         let mut mat = MAT_IDENTITY;
         let mut opacity = 1.0_f64;
         let mut fill_color: Option<[f64; 3]> = None;
@@ -1011,9 +1141,51 @@ pub(crate) fn evaluate_text_with_animators(
         } else {
             None
         };
-        out.push((glyph.paths, mat, ov));
+        out.push((glyph, mat, ov));
     }
     out
+}
+
+pub(crate) fn evaluate_text_with_animators(
+    item: &Value,
+    animators: &[&Value],
+    frame: f64,
+    fps: f64,
+    eval_expr: ExprEval<'_>,
+    primary_font: Option<&[u8]>,
+    fallback_font: Option<&[u8]>,
+) -> Vec<(Vec<ShapePath>, Mat2D, Option<CharPaintOverride>)> {
+    let instances = evaluate_text_glyph_instances(
+        item,
+        animators,
+        frame,
+        fps,
+        eval_expr,
+        primary_font,
+        fallback_font,
+    );
+    if instances.is_empty() {
+        return Vec::new();
+    }
+    let has_any_anim = instances
+        .iter()
+        .any(|(_, m, ov)| !mat_is_identity(*m) || ov.is_some());
+    if !has_any_anim {
+        let all_paths: Vec<ShapePath> = instances
+            .into_iter()
+            .flat_map(|(g, _, _)| g.paths)
+            .collect();
+        return if all_paths.is_empty() {
+            Vec::new()
+        } else {
+            vec![(all_paths, MAT_IDENTITY, None)]
+        };
+    }
+    instances
+        .into_iter()
+        .filter(|(g, _, _)| !g.paths.is_empty())
+        .map(|(g, mat, ov)| (g.paths, mat, ov))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,6 +1417,8 @@ impl<'a> Compiler<'a> {
         tolerance: f64,
         depth: usize,
         outer_animators: &[&Value],
+        primary_font: Option<&[u8]>,
+        fallback_font: Option<&[u8]>,
     ) -> (Vec<PathView>, Vec<ScopeCommand>) {
         if depth > MAX_SHAPE_PLUS_DEPTH {
             return (Vec::new(), Vec::new());
@@ -1293,6 +1467,8 @@ impl<'a> Compiler<'a> {
                         self.frame,
                         self.fps,
                         self.eval_expr,
+                        primary_font,
+                        fallback_font,
                     );
                     for (paths, mat, ov) in glyph_groups {
                         if paths.is_empty() {
@@ -1327,8 +1503,14 @@ impl<'a> Compiler<'a> {
                         .get("contents")
                         .and_then(Value::as_array)
                         .map_or(&[][..], Vec::as_slice);
-                    let (child_views, child_cmds) =
-                        self.compile_scope(children, item_tol / g_scale, depth + 1, &next_outer);
+                    let (child_views, child_cmds) = self.compile_scope(
+                        children,
+                        item_tol / g_scale,
+                        depth + 1,
+                        &next_outer,
+                        primary_font,
+                        fallback_font,
+                    );
 
                     // Propagate nested group paths UP to parent scope!
                     for mut cv in child_views {
@@ -2171,13 +2353,8 @@ pub(crate) fn fb_to_premul_rgba8(fb: &[[f32; 4]]) -> Vec<u8> {
     out
 }
 
-/// Compiles and rasterizes a full Shape+ JSON payload into a premultiplied RGBA8 buffer
-/// of length `width * height * 4`.
-///
-/// Sequence space has `(0, 0)` at the center of the frame with `+x` right and `+y` up
-/// (matching Zoidium `viewport-mapping.js` and `zc-render`'s 2D layer convention).
-#[must_use]
-pub fn rasterize_shape_plus(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rasterize_shape_plus_internal(
     payload: &Value,
     width: u32,
     height: u32,
@@ -2185,6 +2362,8 @@ pub fn rasterize_shape_plus(
     frame: f64,
     fps: f64,
     eval_expr: Option<ExprEvalFn<'_>>,
+    primary_font: Option<&[u8]>,
+    fallback_font: Option<&[u8]>,
 ) -> Vec<u8> {
     let w = width as usize;
     let h = height as usize;
@@ -2214,7 +2393,8 @@ pub fn rasterize_shape_plus(
         eval_expr,
         bases: Vec::new(),
     };
-    let (_views, scope_cmds) = compiler.compile_scope(contents, tolerance, 0, &[]);
+    let (_views, scope_cmds) =
+        compiler.compile_scope(contents, tolerance, 0, &[], primary_font, fallback_font);
     let render_cmds: Vec<RenderCommand> = scope_cmds
         .iter()
         .flat_map(|c| compiler.lower_command(c))
@@ -2223,4 +2403,58 @@ pub fn rasterize_shape_plus(
     let mut fb = vec![[0.0_f32; 4]; w * h];
     execute_render_commands(&render_cmds, display, w, h, &mut fb);
     fb_to_premul_rgba8(&fb)
+}
+
+/// Compiles and rasterizes a full Shape+ JSON payload into a premultiplied RGBA8 buffer
+/// of length `width * height * 4`, with explicit sequence resolution, frame rate, and
+/// optional TrueType/OpenType primary and fallback font bytes for real glyph outlines.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn rasterize_shape_plus_ex(
+    payload: &Value,
+    width: u32,
+    height: u32,
+    seq_res: [u32; 2],
+    frame: f64,
+    fps: f64,
+    eval_expr: Option<ExprEvalFn<'_>>,
+    primary_font: Option<&[u8]>,
+    fallback_font: Option<&[u8]>,
+) -> Vec<u8> {
+    rasterize_shape_plus_internal(
+        payload,
+        width,
+        height,
+        seq_res,
+        frame,
+        fps,
+        eval_expr,
+        primary_font,
+        fallback_font,
+    )
+}
+
+/// Compiles and rasterizes a full Shape+ JSON payload into a premultiplied RGBA8 buffer
+/// of length `width * height * 4`.
+///
+/// Sequence space has `(0, 0)` at the center of the frame with `+x` right and `+y` up
+/// (matching Zoidium `viewport-mapping.js` and `zc-render`'s 2D layer convention).
+#[must_use]
+pub fn rasterize_shape_plus(
+    payload: &Value,
+    width: u32,
+    height: u32,
+    seq_res: [u32; 2],
+    frame: f64,
+    fps: f64,
+    eval_expr: Option<ExprEvalFn<'_>>,
+) -> Vec<u8> {
+    if seq_res == [width, height] && (fps - 30.0).abs() < 1e-12 {
+        return rasterize_shape_plus_with_fonts(
+            payload, width, height, frame, eval_expr, None, None,
+        );
+    }
+    rasterize_shape_plus_internal(
+        payload, width, height, seq_res, frame, fps, eval_expr, None, None,
+    )
 }

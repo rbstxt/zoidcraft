@@ -29,15 +29,18 @@ use crate::ExportError;
 use crate::ffmpeg::GuardedPipe;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::ffmpeg::{
-    BoundedStderrBuffer, MAX_STDERR_BYTES, PipeCancelToken, abort_and_join_worker,
-    build_ffmpeg_os_args_with_output, configure_process_group, kill_process_tree_and_reap,
-    resolve_ffmpeg_binary,
+    AvailableHwEncoders, BoundedStderrBuffer, FfmpegProgressUpdate, MAX_STDERR_BYTES,
+    PipeCancelToken, abort_and_join_worker, build_ffmpeg_os_args_with_output_and_options,
+    configure_process_group, drain_ffmpeg_progress_interruptible, ffmpeg_progress_completed_frames,
+    kill_process_tree_and_reap, probe_hardware_encoders, resolve_ffmpeg_binary,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::padding::pad_rgba_frame_into;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::settings::{AudioCodec, ExportContainer};
-use crate::settings::{ExportProgress, ExportReport, ExportSettings, FrameProvider};
+use crate::settings::{AudioCodec, ExportContainer, HardwareAcceleration, VideoCodec};
+use crate::settings::{
+    ExportEncodeOptions, ExportProgress, ExportReport, ExportSettings, FrameProvider,
+};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::temp_audio::{TempFileGuard, unique_sibling_temp_path, write_temp_stereo_wav_f32};
 
@@ -97,15 +100,24 @@ impl SharedChildGuard {
         Ok(None)
     }
 
-    /// Waits cooperatively for child exit while polling `cancel` every 10 ms so
-    /// cancellation immediately kills and reaps a stalled muxing process.
-    fn wait_cancellable(&self, cancel: &AtomicBool) -> Result<ExitStatus, ExportError> {
+    /// Waits cooperatively for child exit while polling `cancel` every 10 ms and invoking
+    /// `on_tick` so progress streams drain live while waiting for encode/mux completion.
+    fn wait_cancellable_with<F>(
+        &self,
+        cancel: &AtomicBool,
+        mut on_tick: F,
+    ) -> Result<ExitStatus, ExportError>
+    where
+        F: FnMut(),
+    {
         loop {
+            on_tick();
             if cancel.load(Ordering::Acquire) {
                 self.kill_and_reap();
                 return Err(ExportError::Cancelled);
             }
             if let Some(status) = self.try_wait_cached()? {
+                on_tick();
                 return Ok(status);
             }
             {
@@ -143,10 +155,34 @@ where
     export_video_with_progress(settings, audio_stereo, cancel, frame_provider, |_| {})
 }
 
-/// Same as [`export_video`], invoking `on_progress` after each completed frame.
-#[cfg(not(target_arch = "wasm32"))]
+/// Same as [`export_video`], invoking `on_progress` as frames and encode progress advance.
 pub fn export_video_with_progress<F, P>(
     settings: &ExportSettings,
+    audio_stereo: Option<&[[f32; 2]]>,
+    cancel: &Arc<AtomicBool>,
+    frame_provider: F,
+    on_progress: P,
+) -> Result<ExportReport, ExportError>
+where
+    F: FrameProvider,
+    P: FnMut(ExportProgress),
+{
+    export_video_with_options(
+        settings,
+        &ExportEncodeOptions::default(),
+        audio_stereo,
+        cancel,
+        frame_provider,
+        on_progress,
+    )
+}
+
+/// Same as [`export_video_with_progress`], with explicit [`ExportEncodeOptions`] for hardware
+/// encoder acceleration, speed presets, and True Datamosh forced cut keyframes.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn export_video_with_options<F, P>(
+    settings: &ExportSettings,
+    options: &ExportEncodeOptions,
     audio_stereo: Option<&[[f32; 2]]>,
     cancel: &Arc<AtomicBool>,
     frame_provider: F,
@@ -165,21 +201,27 @@ where
         ExportContainer::PngSequence => {
             export_png_sequence(settings, cancel, frame_provider, on_progress)
         }
-        ExportContainer::Wav => export_wav_audio_only(settings, audio_stereo, cancel),
-        ExportContainer::M4a => export_m4a_audio_only(settings, audio_stereo, cancel),
+        ExportContainer::Wav => export_wav_audio_only(settings, audio_stereo, cancel, on_progress),
+        ExportContainer::M4a => export_m4a_audio_only(settings, audio_stereo, cancel, on_progress),
         ExportContainer::Mp4
         | ExportContainer::Webm
         | ExportContainer::Mkv
-        | ExportContainer::Gif => {
-            export_ffmpeg(settings, audio_stereo, cancel, frame_provider, on_progress)
-        }
+        | ExportContainer::Gif => export_ffmpeg(
+            settings,
+            options,
+            audio_stereo,
+            cancel,
+            frame_provider,
+            on_progress,
+        ),
     }
 }
 
 /// Reports that file-based export is unavailable in the browser.
 #[cfg(target_arch = "wasm32")]
-pub fn export_video_with_progress<F, P>(
+pub fn export_video_with_options<F, P>(
     _settings: &ExportSettings,
+    _options: &ExportEncodeOptions,
     _audio_stereo: Option<&[[f32; 2]]>,
     _cancel: &Arc<AtomicBool>,
     _frame_provider: F,
@@ -193,11 +235,35 @@ where
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn export_wav_audio_only(
+struct SpawnedAudioPipes {
+    child: Child,
+    stdout_reader: Box<dyn Read + Send>,
+    stdout_cancel: PipeCancelToken,
+    stderr_reader: Box<dyn Read + Send>,
+    stderr_cancel: PipeCancelToken,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct SpawnedVideoPipes {
+    child: Child,
+    stdin_writer: Box<dyn Write + Send>,
+    stdin_cancel: PipeCancelToken,
+    stdout_reader: Box<dyn Read + Send>,
+    stdout_cancel: PipeCancelToken,
+    stderr_reader: Box<dyn Read + Send>,
+    stderr_cancel: PipeCancelToken,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn export_wav_audio_only<P>(
     settings: &ExportSettings,
     audio_stereo: Option<&[[f32; 2]]>,
     cancel: &Arc<AtomicBool>,
-) -> Result<ExportReport, ExportError> {
+    mut on_progress: P,
+) -> Result<ExportReport, ExportError>
+where
+    P: FnMut(ExportProgress),
+{
     if let Ok(meta) = fs::symlink_metadata(&settings.output_path)
         && meta.is_dir()
     {
@@ -213,8 +279,9 @@ fn export_wav_audio_only(
         return Err(ExportError::Cancelled);
     }
 
+    let total_frames = settings.total_frames();
     let expected_samples = zc_audio::mixer::offline_total_samples(
-        f64::from(settings.total_frames()),
+        f64::from(total_frames),
         settings.fps,
         settings.sample_rate,
     );
@@ -230,6 +297,15 @@ fn export_wav_audio_only(
     let wav_bytes = zc_audio::try_encode_wav_pcm16_stereo(samples, settings.sample_rate)
         .map_err(|e| ExportError::InvalidSettings(e.to_string()))?;
 
+    if total_frames > 1 {
+        let mid = (total_frames / 2).max(1).min(total_frames - 1);
+        on_progress(ExportProgress {
+            completed_frames: mid,
+            total_frames,
+            frame_index: settings.start_frame.saturating_add(mid.saturating_sub(1)),
+        });
+    }
+
     if let Some(parent) = settings.output_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -244,6 +320,12 @@ fn export_wav_audio_only(
     publish_temp_output(temp_output_guard.path(), &settings.output_path)?;
     temp_output_guard.disarm();
 
+    on_progress(ExportProgress {
+        completed_frames: total_frames,
+        total_frames,
+        frame_index: settings.end_frame.saturating_sub(1),
+    });
+
     Ok(ExportReport {
         frames_exported: 0,
         output_width: 0,
@@ -254,11 +336,15 @@ fn export_wav_audio_only(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn export_m4a_audio_only(
+fn export_m4a_audio_only<P>(
     settings: &ExportSettings,
     audio_stereo: Option<&[[f32; 2]]>,
     cancel: &Arc<AtomicBool>,
-) -> Result<ExportReport, ExportError> {
+    mut on_progress: P,
+) -> Result<ExportReport, ExportError>
+where
+    P: FnMut(ExportProgress),
+{
     if let Ok(meta) = fs::symlink_metadata(&settings.output_path)
         && meta.is_dir()
     {
@@ -274,8 +360,9 @@ fn export_m4a_audio_only(
         return Err(ExportError::Cancelled);
     }
 
+    let total_frames = settings.total_frames();
     let expected_samples = zc_audio::mixer::offline_total_samples(
-        f64::from(settings.total_frames()),
+        f64::from(total_frames),
         settings.fps,
         settings.sample_rate,
     );
@@ -300,26 +387,31 @@ fn export_m4a_audio_only(
 
     let temp_output_path = unique_sibling_temp_path(&settings.output_path);
     let mut temp_output_guard = TempFileGuard::new(temp_output_path);
-    let args = build_ffmpeg_os_args_with_output(
+    let args = build_ffmpeg_os_args_with_output_and_options(
         settings,
         Some(temp_audio_guard.path()),
         temp_output_guard.path(),
+        &ExportEncodeOptions::default(),
+        &AvailableHwEncoders::default(),
     )?;
 
     let bin = resolve_ffmpeg_binary(settings.ffmpeg_binary.as_deref());
     let mut cmd = Command::new(bin.as_ref());
-    cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::null());
+    cmd.args(&args).stdin(Stdio::null());
 
-    // Mirror `export_ffmpeg`'s interruptible stderr setup so cancelling an M4A export
-    // or a descendant keeping stderr open can never detach or hang indefinitely.
+    // Mirror `export_ffmpeg`'s interruptible stdout/stderr setup so cancelling an M4A export
+    // or a descendant keeping pipes open can never detach or hang indefinitely.
     #[cfg(unix)]
-    let (child, stderr_reader, stderr_cancel): (Child, Box<dyn Read + Send>, PipeCancelToken) = {
+    let pipes: SpawnedAudioPipes = {
         use std::os::fd::OwnedFd;
         use std::os::unix::net::UnixStream;
 
+        let (stdout_read, stdout_write) = UnixStream::pair()?;
         let (stderr_read, stderr_write) = UnixStream::pair()?;
+        stdout_read.set_read_timeout(Some(Duration::from_millis(50)))?;
         stderr_read.set_read_timeout(Some(Duration::from_millis(50)))?;
-        cmd.stderr(Stdio::from(OwnedFd::from(stderr_write)));
+        cmd.stdout(Stdio::from(OwnedFd::from(stdout_write)))
+            .stderr(Stdio::from(OwnedFd::from(stderr_write)));
         configure_process_group(&mut cmd);
 
         let child = cmd.spawn().map_err(|err| {
@@ -330,12 +422,18 @@ fn export_m4a_audio_only(
             }
         })?;
         drop(cmd);
-        (child, Box::new(stderr_read), PipeCancelToken::noop())
+        SpawnedAudioPipes {
+            child,
+            stdout_reader: Box::new(stdout_read),
+            stdout_cancel: PipeCancelToken::noop(),
+            stderr_reader: Box::new(stderr_read),
+            stderr_cancel: PipeCancelToken::noop(),
+        }
     };
 
     #[cfg(windows)]
-    let (child, stderr_reader, stderr_cancel): (Child, Box<dyn Read + Send>, PipeCancelToken) = {
-        cmd.stderr(Stdio::piped());
+    let pipes: SpawnedAudioPipes = {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         configure_process_group(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|err| {
@@ -346,16 +444,26 @@ fn export_m4a_audio_only(
             }
         })?;
         drop(cmd);
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ExportError::Io(std::io::Error::other("failed to capture ffmpeg stdout"))
+        })?;
         let stderr = child.stderr.take().ok_or_else(|| {
             ExportError::Io(std::io::Error::other("failed to capture ffmpeg stderr"))
         })?;
+        let (stdout_guarded, stdout_token) = GuardedPipe::new(stdout);
         let (stderr_guarded, stderr_token) = GuardedPipe::new(stderr);
-        (child, Box::new(stderr_guarded), stderr_token)
+        SpawnedAudioPipes {
+            child,
+            stdout_reader: Box::new(stdout_guarded),
+            stdout_cancel: stdout_token,
+            stderr_reader: Box::new(stderr_guarded),
+            stderr_cancel: stderr_token,
+        }
     };
 
     #[cfg(not(any(unix, windows)))]
-    let (child, stderr_reader, stderr_cancel): (Child, Box<dyn Read + Send>, PipeCancelToken) = {
-        cmd.stderr(Stdio::piped());
+    let pipes: SpawnedAudioPipes = {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         configure_process_group(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|err| {
@@ -366,11 +474,39 @@ fn export_m4a_audio_only(
             }
         })?;
         drop(cmd);
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ExportError::Io(std::io::Error::other("failed to capture ffmpeg stdout"))
+        })?;
         let stderr = child.stderr.take().ok_or_else(|| {
             ExportError::Io(std::io::Error::other("failed to capture ffmpeg stderr"))
         })?;
-        (child, Box::new(stderr), PipeCancelToken::noop())
+        SpawnedAudioPipes {
+            child,
+            stdout_reader: Box::new(stdout),
+            stdout_cancel: PipeCancelToken::noop(),
+            stderr_reader: Box::new(stderr),
+            stderr_cancel: PipeCancelToken::noop(),
+        }
     };
+
+    let SpawnedAudioPipes {
+        child,
+        stdout_reader,
+        stdout_cancel,
+        stderr_reader,
+        stderr_cancel,
+    } = pipes;
+
+    let progress_abort = Arc::new(AtomicBool::new(false));
+    let progress_abort_clone = Arc::clone(&progress_abort);
+    let (progress_tx, progress_rx) = mpsc::channel::<FfmpegProgressUpdate>();
+    let (progress_done_tx, progress_done_rx) = mpsc::channel::<()>();
+    let progress_handle = std::thread::spawn(move || {
+        drain_ffmpeg_progress_interruptible(stdout_reader, &progress_abort_clone, |upd| {
+            let _ = progress_tx.send(upd);
+        });
+        let _ = progress_done_tx.send(());
+    });
 
     let stderr_abort = Arc::new(AtomicBool::new(false));
     let stderr_abort_clone = Arc::clone(&stderr_abort);
@@ -383,9 +519,27 @@ fn export_m4a_audio_only(
 
     let child_guard = SharedChildGuard::new(child);
     let mut stderr_finished = false;
+    let mut progress_finished = false;
+    let mut last_reported = 0_u32;
+    let cap_before_done = total_frames.saturating_sub(1);
 
     let result: Result<(), ExportError> = (|| {
-        let status = child_guard.wait_cancellable(cancel)?;
+        let status = child_guard.wait_cancellable_with(cancel, || {
+            while let Ok(upd) = progress_rx.try_recv() {
+                let completed = ffmpeg_progress_completed_frames(&upd, total_frames, settings.fps)
+                    .min(cap_before_done);
+                if completed > last_reported {
+                    last_reported = completed;
+                    on_progress(ExportProgress {
+                        completed_frames: completed,
+                        total_frames,
+                        frame_index: settings
+                            .start_frame
+                            .saturating_add(completed.saturating_sub(1)),
+                    });
+                }
+            }
+        })?;
         let stderr_text = {
             let deadline = std::time::Instant::now() + Duration::from_millis(500);
             loop {
@@ -435,6 +589,27 @@ fn export_m4a_audio_only(
             }
         };
 
+        if matches!(
+            progress_done_rx.recv_timeout(Duration::from_millis(50)),
+            Ok(()) | Err(RecvTimeoutError::Disconnected)
+        ) {
+            progress_finished = true;
+        }
+        while let Ok(upd) = progress_rx.try_recv() {
+            let completed = ffmpeg_progress_completed_frames(&upd, total_frames, settings.fps)
+                .min(cap_before_done);
+            if completed > last_reported {
+                last_reported = completed;
+                on_progress(ExportProgress {
+                    completed_frames: completed,
+                    total_frames,
+                    frame_index: settings
+                        .start_frame
+                        .saturating_add(completed.saturating_sub(1)),
+                });
+            }
+        }
+
         if cancel.load(Ordering::Acquire) {
             return Err(ExportError::Cancelled);
         }
@@ -449,10 +624,22 @@ fn export_m4a_audio_only(
         Ok(())
     })();
 
-    // Signal stderr worker abort and kill the process tree ONLY if the child is still live.
-    if result.is_err() || !stderr_finished {
+    // Signal worker aborts and kill the process tree ONLY if the child is still live.
+    if result.is_err() || !stderr_finished || !progress_finished {
+        progress_abort.store(true, Ordering::Release);
         stderr_abort.store(true, Ordering::Release);
         child_guard.kill_and_reap();
+    }
+    if progress_finished {
+        let _ = progress_handle.join();
+    } else {
+        let _ = abort_and_join_worker(
+            &progress_abort,
+            &stdout_cancel,
+            &progress_done_rx,
+            progress_handle,
+            Duration::from_millis(500),
+        );
     }
     if stderr_finished {
         let _ = stderr_handle.join();
@@ -471,6 +658,14 @@ fn export_m4a_audio_only(
 
     publish_temp_output(temp_output_guard.path(), &settings.output_path)?;
     temp_output_guard.disarm();
+
+    if last_reported < total_frames {
+        on_progress(ExportProgress {
+            completed_frames: total_frames,
+            total_frames,
+            frame_index: settings.end_frame.saturating_sub(1),
+        });
+    }
 
     Ok(ExportReport {
         frames_exported: 0,
@@ -936,6 +1131,7 @@ fn publish_staged_png_directory(
 #[cfg(not(target_arch = "wasm32"))]
 fn export_ffmpeg<F, P>(
     settings: &ExportSettings,
+    options: &ExportEncodeOptions,
     audio_stereo: Option<&[[f32; 2]]>,
     cancel: &Arc<AtomicBool>,
     mut frame_provider: F,
@@ -987,35 +1183,45 @@ where
     let temp_output_path = unique_sibling_temp_path(&settings.output_path);
     let mut temp_output_guard = TempFileGuard::new(temp_output_path.clone());
 
-    let args = build_ffmpeg_os_args_with_output(
+    let available_hw = if options.hardware_acceleration != HardwareAcceleration::Off
+        && !settings.transparent_alpha
+        && !matches!(settings.container, ExportContainer::Gif)
+        && matches!(settings.video_codec, VideoCodec::H264 | VideoCodec::H265)
+    {
+        probe_hardware_encoders(settings.ffmpeg_binary.as_deref())
+    } else {
+        AvailableHwEncoders::default()
+    };
+
+    let args = build_ffmpeg_os_args_with_output_and_options(
         settings,
         temp_audio_guard.as_ref().map(|g| g.path()),
         temp_output_guard.path(),
+        options,
+        &available_hw,
     )?;
 
     let bin = resolve_ffmpeg_binary(settings.ffmpeg_binary.as_deref());
     let mut cmd = Command::new(bin.as_ref());
-    cmd.args(&args).stdout(Stdio::null());
+    cmd.args(&args);
 
-    // On Unix, connect FFmpeg's stdin and stderr via SOCK_STREAM UnixStream pairs with bounded
-    // 50 ms timeouts and drop `cmd` immediately after spawn (closing parent copies of child fds)
-    // so both worker threads can always interrupt blocked I/O, release descriptors/buffers, and join.
+    // On Unix, connect FFmpeg's stdin, stdout (`-progress pipe:1`), and stderr via SOCK_STREAM
+    // UnixStream pairs with bounded 50 ms timeouts and drop `cmd` immediately after spawn
+    // (closing parent copies of child fds) so all worker threads can always interrupt blocked I/O,
+    // release descriptors/buffers, and join.
     #[cfg(unix)]
-    let (child, stdin_writer, stdin_cancel, stderr_reader, stderr_cancel): (
-        Child,
-        Box<dyn Write + Send>,
-        PipeCancelToken,
-        Box<dyn Read + Send>,
-        PipeCancelToken,
-    ) = {
+    let pipes: SpawnedVideoPipes = {
         use std::os::fd::OwnedFd;
         use std::os::unix::net::UnixStream;
 
         let (stdin_read, stdin_write) = UnixStream::pair()?;
+        let (stdout_read, stdout_write) = UnixStream::pair()?;
         let (stderr_read, stderr_write) = UnixStream::pair()?;
         stdin_write.set_write_timeout(Some(Duration::from_millis(50)))?;
+        stdout_read.set_read_timeout(Some(Duration::from_millis(50)))?;
         stderr_read.set_read_timeout(Some(Duration::from_millis(50)))?;
         cmd.stdin(Stdio::from(OwnedFd::from(stdin_read)))
+            .stdout(Stdio::from(OwnedFd::from(stdout_write)))
             .stderr(Stdio::from(OwnedFd::from(stderr_write)));
         configure_process_group(&mut cmd);
 
@@ -1027,24 +1233,22 @@ where
             }
         })?;
         drop(cmd);
-        (
+        SpawnedVideoPipes {
             child,
-            Box::new(stdin_write),
-            PipeCancelToken::noop(),
-            Box::new(stderr_read),
-            PipeCancelToken::noop(),
-        )
+            stdin_writer: Box::new(stdin_write),
+            stdin_cancel: PipeCancelToken::noop(),
+            stdout_reader: Box::new(stdout_read),
+            stdout_cancel: PipeCancelToken::noop(),
+            stderr_reader: Box::new(stderr_read),
+            stderr_cancel: PipeCancelToken::noop(),
+        }
     };
 
     #[cfg(windows)]
-    let (child, stdin_writer, stdin_cancel, stderr_reader, stderr_cancel): (
-        Child,
-        Box<dyn Write + Send>,
-        PipeCancelToken,
-        Box<dyn Read + Send>,
-        PipeCancelToken,
-    ) = {
-        cmd.stdin(Stdio::piped()).stderr(Stdio::piped());
+    let pipes: SpawnedVideoPipes = {
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         configure_process_group(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|err| {
@@ -1057,30 +1261,32 @@ where
         drop(cmd);
         let stdin = child.stdin.take().ok_or_else(|| {
             ExportError::Io(std::io::Error::other("failed to capture ffmpeg stdin"))
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ExportError::Io(std::io::Error::other("failed to capture ffmpeg stdout"))
         })?;
         let stderr = child.stderr.take().ok_or_else(|| {
             ExportError::Io(std::io::Error::other("failed to capture ffmpeg stderr"))
         })?;
         let (stdin_guarded, stdin_token) = GuardedPipe::new(stdin);
+        let (stdout_guarded, stdout_token) = GuardedPipe::new(stdout);
         let (stderr_guarded, stderr_token) = GuardedPipe::new(stderr);
-        (
+        SpawnedVideoPipes {
             child,
-            Box::new(stdin_guarded),
-            stdin_token,
-            Box::new(stderr_guarded),
-            stderr_token,
-        )
+            stdin_writer: Box::new(stdin_guarded),
+            stdin_cancel: stdin_token,
+            stdout_reader: Box::new(stdout_guarded),
+            stdout_cancel: stdout_token,
+            stderr_reader: Box::new(stderr_guarded),
+            stderr_cancel: stderr_token,
+        }
     };
 
     #[cfg(not(any(unix, windows)))]
-    let (child, stdin_writer, stdin_cancel, stderr_reader, stderr_cancel): (
-        Child,
-        Box<dyn Write + Send>,
-        PipeCancelToken,
-        Box<dyn Read + Send>,
-        PipeCancelToken,
-    ) = {
-        cmd.stdin(Stdio::piped()).stderr(Stdio::piped());
+    let pipes: SpawnedVideoPipes = {
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         configure_process_group(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|err| {
@@ -1094,22 +1300,48 @@ where
         let stdin = child.stdin.take().ok_or_else(|| {
             ExportError::Io(std::io::Error::other("failed to capture ffmpeg stdin"))
         })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ExportError::Io(std::io::Error::other("failed to capture ffmpeg stdout"))
+        })?;
         let stderr = child.stderr.take().ok_or_else(|| {
             ExportError::Io(std::io::Error::other("failed to capture ffmpeg stderr"))
         })?;
-        (
+        SpawnedVideoPipes {
             child,
-            Box::new(stdin),
-            PipeCancelToken::noop(),
-            Box::new(stderr),
-            PipeCancelToken::noop(),
-        )
+            stdin_writer: Box::new(stdin),
+            stdin_cancel: PipeCancelToken::noop(),
+            stdout_reader: Box::new(stdout),
+            stdout_cancel: PipeCancelToken::noop(),
+            stderr_reader: Box::new(stderr),
+            stderr_cancel: PipeCancelToken::noop(),
+        }
     };
+
+    let SpawnedVideoPipes {
+        child,
+        stdin_writer,
+        stdin_cancel,
+        stdout_reader,
+        stdout_cancel,
+        stderr_reader,
+        stderr_cancel,
+    } = pipes;
 
     let total_frames = settings.total_frames();
 
-    // Stage B: Stream frames to FFmpeg over a dedicated interruptible stdin writer thread and
-    // drain stderr on a dedicated interruptible reader thread.
+    // Stage B: Stream frames to FFmpeg over a dedicated interruptible stdin writer thread,
+    // parse `-progress pipe:1` on stdout, and drain stderr on a dedicated interruptible reader.
+    let progress_abort = Arc::new(AtomicBool::new(false));
+    let progress_abort_clone = Arc::clone(&progress_abort);
+    let (progress_tx, progress_rx) = mpsc::channel::<FfmpegProgressUpdate>();
+    let (progress_done_tx, progress_done_rx) = mpsc::channel::<()>();
+    let progress_handle = std::thread::spawn(move || {
+        drain_ffmpeg_progress_interruptible(stdout_reader, &progress_abort_clone, |upd| {
+            let _ = progress_tx.send(upd);
+        });
+        let _ = progress_done_tx.send(());
+    });
+
     let stderr_abort = Arc::new(AtomicBool::new(false));
     let stderr_abort_clone = Arc::clone(&stderr_abort);
     let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
@@ -1250,13 +1482,38 @@ where
     let child_guard = SharedChildGuard::new(child);
 
     let mut writer_finished = false;
+    let mut progress_finished = false;
     let mut stderr_finished = false;
+    let mut last_reported_frames = 0_u32;
+    let cap_before_done = total_frames.saturating_sub(1);
 
     let result = (|| -> Result<(), ExportError> {
         let mut frame_tx_opt = Some(frame_tx);
         let mut writer_outcome: Option<WriterOutcome> = None;
         let mut child_exited_at: Option<std::time::Instant> = None;
+        let mut ffmpeg_encoded_frames = 0_u32;
         const CHILD_EXIT_WRITER_GRACE: Duration = Duration::from_millis(250);
+
+        let mut drain_progress = |min_floor: u32, on_progress: &mut P| {
+            while let Ok(upd) = progress_rx.try_recv() {
+                let encoded = ffmpeg_progress_completed_frames(&upd, total_frames, settings.fps);
+                if encoded > ffmpeg_encoded_frames {
+                    ffmpeg_encoded_frames = encoded;
+                }
+            }
+            let candidate = ffmpeg_encoded_frames.max(min_floor).min(cap_before_done);
+            if candidate > last_reported_frames {
+                last_reported_frames = candidate;
+                let frame_idx = settings
+                    .start_frame
+                    .saturating_add(candidate.saturating_sub(1));
+                on_progress(ExportProgress {
+                    completed_frames: candidate,
+                    total_frames,
+                    frame_index: frame_idx,
+                });
+            }
+        };
 
         for (offset, frame_index) in (settings.start_frame..settings.end_frame).enumerate() {
             if cancel.load(Ordering::Acquire) {
@@ -1379,11 +1636,8 @@ where
                 }
             }
 
-            on_progress(ExportProgress {
-                completed_frames: (offset as u32) + 1,
-                total_frames,
-                frame_index,
-            });
+            let render_floor = (offset as u32).div_ceil(2).max(1);
+            drain_progress(render_floor, &mut on_progress);
         }
 
         // Close the frame channel so the writer thread flushes and drops FFmpeg's stdin.
@@ -1393,6 +1647,7 @@ where
         // and bounded grace after early child exit (in case a descendant kept stdin open).
         if writer_outcome.is_none() {
             loop {
+                drain_progress(0, &mut on_progress);
                 if cancel.load(Ordering::Acquire) {
                     writer_abort.store(true, Ordering::Release);
                     child_guard.kill_and_reap();
@@ -1458,7 +1713,9 @@ where
             _ => (0, true),
         };
 
-        let status = child_guard.wait_cancellable(cancel)?;
+        let status = child_guard.wait_cancellable_with(cancel, || {
+            drain_progress(0, &mut on_progress);
+        })?;
         let stderr_text = {
             let deadline = std::time::Instant::now() + Duration::from_millis(500);
             loop {
@@ -1508,6 +1765,14 @@ where
             }
         };
 
+        if matches!(
+            progress_done_rx.recv_timeout(Duration::from_millis(50)),
+            Ok(()) | Err(RecvTimeoutError::Disconnected)
+        ) {
+            progress_finished = true;
+        }
+        drain_progress(0, &mut on_progress);
+
         if cancel.load(Ordering::Acquire) {
             return Err(ExportError::Cancelled);
         }
@@ -1539,8 +1804,9 @@ where
     })();
 
     // Signal worker aborts and kill the process tree ONLY if the child is still live (unreaped).
-    if result.is_err() || !writer_finished || !stderr_finished {
+    if result.is_err() || !writer_finished || !progress_finished || !stderr_finished {
         writer_abort.store(true, Ordering::Release);
+        progress_abort.store(true, Ordering::Release);
         stderr_abort.store(true, Ordering::Release);
         child_guard.kill_and_reap();
     }
@@ -1552,6 +1818,17 @@ where
             &stdin_cancel,
             &writer_done_rx,
             writer_handle,
+            Duration::from_millis(500),
+        );
+    }
+    if progress_finished {
+        let _ = progress_handle.join();
+    } else {
+        let _ = abort_and_join_worker(
+            &progress_abort,
+            &stdout_cancel,
+            &progress_done_rx,
+            progress_handle,
             Duration::from_millis(500),
         );
     }
@@ -1576,6 +1853,14 @@ where
     publish_temp_output(temp_output_guard.path(), &settings.output_path)?;
     temp_output_guard.disarm();
 
+    if last_reported_frames < total_frames {
+        on_progress(ExportProgress {
+            completed_frames: total_frames,
+            total_frames,
+            frame_index: settings.end_frame.saturating_sub(1),
+        });
+    }
+
     Ok(ExportReport {
         frames_exported: total_frames,
         output_width: enc_w,
@@ -1586,7 +1871,7 @@ where
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn publish_temp_output(src: &Path, dst: &Path) -> Result<(), ExportError> {
+pub(crate) fn publish_temp_output(src: &Path, dst: &Path) -> Result<(), ExportError> {
     match fs::rename(src, dst) {
         Ok(()) => Ok(()),
         Err(err)
@@ -2580,5 +2865,91 @@ mod tests {
             !fail_dir.exists(),
             "failed parallel PNG export must not publish output directory"
         );
+    }
+
+    #[test]
+    fn audio_only_wav_and_m4a_emit_monotonic_progress_to_completion() {
+        let wav_path = unique_test_path("wav_progress.wav");
+        let _wav_guard = TempFileGuard::new(wav_path.clone());
+        let audio = vec![[0.25_f32, -0.25_f32]; 4_800];
+        let wav_settings = ExportSettings {
+            width: 0,
+            height: 0,
+            fps: 30.0,
+            start_frame: 0,
+            end_frame: 30,
+            container: ExportContainer::Wav,
+            video_codec: VideoCodec::H264,
+            audio_codec: AudioCodec::Pcm,
+            quality: QualityMode::Crf(18),
+            audio_bitrate_kbps: 0,
+            sample_rate: 48_000,
+            transparent_alpha: false,
+            output_path: wav_path.clone(),
+            ffmpeg_binary: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut wav_steps = Vec::new();
+        let report = export_video_with_progress(
+            &wav_settings,
+            Some(&audio),
+            &cancel,
+            |_idx, _buf: &mut Vec<u8>| unreachable!("WAV export must not render video frames"),
+            |p| {
+                assert_eq!(p.total_frames, 30);
+                wav_steps.push(p.completed_frames);
+            },
+        )
+        .expect("WAV export with progress succeeds");
+        assert_eq!(report.audio_samples_written, 4_800);
+        assert!(!wav_steps.is_empty());
+        assert_eq!(wav_steps.last().copied(), Some(30));
+        assert!(wav_steps.windows(2).all(|w| w[0] < w[1]));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let fake_m4a = unique_test_path("fake_m4a_progress.sh");
+            let _script_guard = TempFileGuard::new(fake_m4a.clone());
+            fs::write(
+                &fake_m4a,
+                "#!/bin/sh\nfor last; do :; done\nprintf 'out_time_us=500000\\nprogress=continue\\n'\nprintf 'out_time_us=1000000\\nprogress=end\\n'\nprintf 'FAKE_M4A' > \"$last\"\nexit 0\n",
+            )
+            .expect("write fake m4a progress script");
+            let mut perms = fs::metadata(&fake_m4a).expect("meta").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_m4a, perms).expect("chmod");
+
+            let out_m4a = unique_test_path("m4a_progress.m4a");
+            let _m4a_guard = TempFileGuard::new(out_m4a.clone());
+            let m4a_settings = ExportSettings {
+                container: ExportContainer::M4a,
+                audio_codec: AudioCodec::Aac,
+                audio_bitrate_kbps: 128,
+                output_path: out_m4a.clone(),
+                ffmpeg_binary: Some(fake_m4a),
+                ..wav_settings
+            };
+            let mut m4a_steps = Vec::new();
+            export_video_with_progress(
+                &m4a_settings,
+                Some(&audio),
+                &cancel,
+                |_idx, _buf: &mut Vec<u8>| unreachable!("M4A export must not render video frames"),
+                |p| {
+                    assert_eq!(p.total_frames, 30);
+                    m4a_steps.push(p.completed_frames);
+                },
+            )
+            .expect("M4A progress export succeeds");
+            assert!(
+                m4a_steps.len() >= 2,
+                "expected intermediate + final M4A progress callbacks, got {m4a_steps:?}"
+            );
+            assert_eq!(m4a_steps.last().copied(), Some(30));
+            assert!(m4a_steps.windows(2).all(|w| w[0] < w[1]));
+            assert_eq!(fs::read(&out_m4a).expect("read m4a"), b"FAKE_M4A");
+        }
     }
 }

@@ -1,11 +1,110 @@
+use std::collections::HashMap;
+
 use super::*;
+
+fn eval_blend_rgb(a: [f64; 3], b: [f64; 3], opacity: f64, mode: i32) -> [f64; 3] {
+    if mode == 19 {
+        let op = opacity.clamp(0.0, 1.0);
+        let hard_light = |base: f64, top: f64| -> f64 {
+            if top < 0.5 {
+                2.0 * base * top
+            } else {
+                1.0 - 2.0 * (1.0 - base) * (1.0 - top)
+            }
+        };
+        let mixed = [
+            hard_light(a[0], b[0]),
+            hard_light(a[1], b[1]),
+            hard_light(a[2], b[2]),
+        ];
+        return [
+            a[0] + (mixed[0] - a[0]) * op,
+            a[1] + (mixed[1] - a[1]) * op,
+            a[2] + (mixed[2] - a[2]) * op,
+        ];
+    }
+    mat_blend_rgb(a, b, opacity, mode)
+}
+
+fn eval_math_op(va: f64, vb: f64, vc: f64, op: i32) -> f64 {
+    match op {
+        31 => {
+            if va >= vb {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        32 => {
+            let neg = -va;
+            if neg.is_finite() {
+                neg.clamp(-1.0e30, 1.0e30)
+            } else {
+                0.0
+            }
+        }
+        _ => mat_math_op(va, vb, vc, op),
+    }
+}
+
+fn extract_image_asset_key(params: &BTreeMap<String, Value>) -> Option<&str> {
+    for key in [
+        "assetId", "asset_id", "asset", "image", "texture", "src", "media", "file", "url",
+    ] {
+        if let Some(v) = params.get(key)
+            && let Some(s) = v
+                .as_str()
+                .or_else(|| v.get("value").and_then(Value::as_str))
+            && !s.is_empty()
+        {
+            return Some(s);
+        }
+    }
+    None
+}
+
+fn sample_rgba8_bilinear(w: usize, h: usize, rgba: &[u8], u: f64, v: f64) -> [f64; 4] {
+    let uu = u.rem_euclid(1.0);
+    let vv = v.rem_euclid(1.0);
+    let fx = uu * (w as f64) - 0.5;
+    let fy = vv * (h as f64) - 0.5;
+    let x0 = fx.floor() as isize;
+    let y0 = fy.floor() as isize;
+    let tx = fx - (x0 as f64);
+    let ty = fy - (y0 as f64);
+    let ix0 = x0.rem_euclid(w as isize) as usize;
+    let ix1 = (x0 + 1).rem_euclid(w as isize) as usize;
+    let iy0 = y0.rem_euclid(h as isize) as usize;
+    let iy1 = (y0 + 1).rem_euclid(h as isize) as usize;
+
+    let fetch = |x: usize, y: usize| -> [f64; 4] {
+        let base = (x + y * w) * 4;
+        [
+            f64::from(rgba[base]) / 255.0,
+            f64::from(rgba[base + 1]) / 255.0,
+            f64::from(rgba[base + 2]) / 255.0,
+            f64::from(rgba[base + 3]) / 255.0,
+        ]
+    };
+    let c00 = fetch(ix0, iy0);
+    let c10 = fetch(ix1, iy0);
+    let c01 = fetch(ix0, iy1);
+    let c11 = fetch(ix1, iy1);
+    let mut out = [0.0; 4];
+    for ch in 0..4 {
+        let top = c00[ch] + (c10[ch] - c00[ch]) * tx;
+        let bot = c01[ch] + (c11[ch] - c01[ch]) * tx;
+        out[ch] = top + (bot - top) * ty;
+    }
+    out
+}
 
 pub(super) struct MaterialEvaluator<'a> {
     pub(super) size: usize,
     pub(super) incoming: BTreeMap<(String, String), (String, String)>,
     pub(super) outputs: BTreeMap<String, BTreeMap<String, MatBuf>>,
     pub(super) tracker: Arc<BakeMemoryTracker>,
-    pub(super) _marker: std::marker::PhantomData<&'a ()>,
+    pub(super) images: &'a HashMap<String, (u32, u32, Vec<u8>)>,
 }
 
 impl<'a> MaterialEvaluator<'a> {
@@ -89,6 +188,7 @@ impl<'a> MaterialEvaluator<'a> {
                 } else {
                     param_f64(p, &["contrast"], 1.0)
                 };
+                let roughness = param_f64(p, &["roughness", "persistence"], 0.5).clamp(0.05, 0.99);
                 let transform = match kind.as_str() {
                     "ridgedFractal" => 1,
                     "turbulence" | "dirt" => 2,
@@ -103,6 +203,7 @@ impl<'a> MaterialEvaluator<'a> {
                         seed,
                         brightness,
                         contrast,
+                        roughness,
                         transform,
                     },
                     uv.as_ref(),
@@ -130,6 +231,7 @@ impl<'a> MaterialEvaluator<'a> {
                                 seed: seed.wrapping_add(173 * (ch as i32) + 331),
                                 brightness,
                                 contrast,
+                                roughness,
                                 transform: 0,
                             },
                             uv.as_ref(),
@@ -146,16 +248,47 @@ impl<'a> MaterialEvaluator<'a> {
             }
             "voronoi" => {
                 let uv = self.get_input(&node.id, &["uv"]).cloned();
+                let is_cell_id = param_str(p, &["feature", "mode"]).is_some_and(|s| {
+                    matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "cell id" | "cellid" | "cell_id" | "cell"
+                    )
+                }) || (param_str(p, &["feature", "mode"]).is_none()
+                    && (param_f64(p, &["feature", "mode"], 0.0).round() as i32) == 4);
                 let (dist, col, pos) = eval_voronoi_buffers(size, p, uv.as_ref(), &self.tracker)?;
-                node_outs.insert("out".to_string(), dist.clone());
-                node_outs.insert("distance".to_string(), dist);
+                let primary = if is_cell_id {
+                    let mut id_buf = self.alloc_image()?;
+                    for px in 0..(size * size) {
+                        let c = col.sample_rgba(px);
+                        let id_v = c[0] as f32;
+                        let i = px * 4;
+                        id_buf.data[i] = id_v;
+                        id_buf.data[i + 1] = id_v;
+                        id_buf.data[i + 2] = id_v;
+                        id_buf.data[i + 3] = 1.0;
+                    }
+                    MatBuf::from_image(id_buf)
+                } else {
+                    dist
+                };
+                node_outs.insert("out".to_string(), primary.clone());
+                node_outs.insert("distance".to_string(), primary);
                 node_outs.insert("color".to_string(), col);
                 node_outs.insert("position".to_string(), pos);
             }
             "gradient" => {
                 let pos_in = self.get_input(&node.id, &["t", "factor", "in"]).cloned();
                 let base_in = self.get_input(&node.id, &["a", "base"]).cloned();
-                let grad_type = (param_f64(p, &["type", "mode"], 0.0).round() as i32).clamp(0, 3);
+                let grad_type = if let Some(s) = param_str(p, &["type", "mode"]) {
+                    match s.trim().to_ascii_lowercase().as_str() {
+                        "radial" | "circular" => 1,
+                        "angular" => 2,
+                        "diamond" => 3,
+                        _ => 0,
+                    }
+                } else {
+                    (param_f64(p, &["type", "mode"], 0.0).round() as i32).clamp(0, 3)
+                };
                 let ox = param_f64(p, &["offsetX"], 0.0);
                 let oy = param_f64(p, &["offsetY"], 0.0);
                 let sx = param_f64(p, &["scaleX"], 1.0).max(0.001);
@@ -198,7 +331,7 @@ impl<'a> MaterialEvaluator<'a> {
                         ];
                         let rgb = if let Some(ref bi) = base_in {
                             let b = bi.sample_rgba(px);
-                            mat_blend_rgb([b[0], b[1], b[2]], cr, opacity, blend_mode)
+                            eval_blend_rgb([b[0], b[1], b[2]], cr, opacity, blend_mode)
                         } else {
                             cr
                         };
@@ -252,6 +385,7 @@ impl<'a> MaterialEvaluator<'a> {
                             seed,
                             brightness: 1.0,
                             contrast: 1.0,
+                            roughness: 0.5,
                             transform: 0,
                         },
                         uv.as_ref(),
@@ -322,7 +456,7 @@ impl<'a> MaterialEvaluator<'a> {
                 let scale = param_f64(p, &["scale"], 5.0).max(0.01);
                 let width = param_f64(p, &["width"], 1.0).max(0.01);
                 let height = param_f64(p, &["height"], 0.5).max(0.01);
-                let mortar_size = param_f64(p, &["mortar"], 0.04).clamp(0.0, 0.5);
+                let mortar_size = param_f64(p, &["mortar", "mortarSize"], 0.04).clamp(0.0, 0.5);
                 let offset = param_f64(p, &["offset"], 0.5);
                 let seed = param_f64(p, &["seed"], 1.0).round() as i32;
                 let c1 = param_color3(p, &["color1"], [0.6, 0.17, 0.08]);
@@ -359,13 +493,15 @@ impl<'a> MaterialEvaluator<'a> {
                         col_out.data[i + 3] = 1.0;
                     }
                 }
-                node_outs.insert("out".to_string(), MatBuf::from_image(col_out));
+                let col_buf = MatBuf::from_image(col_out);
+                node_outs.insert("out".to_string(), col_buf.clone());
+                node_outs.insert("color".to_string(), col_buf);
                 node_outs.insert("mortar".to_string(), MatBuf::from_image(mortar_out));
             }
             "marble" => {
                 let uv = self.get_input(&node.id, &["uv"]).cloned();
                 let scale = param_f64(p, &["scale"], 5.0);
-                let veins = param_f64(p, &["veins"], 3.0);
+                let veins = param_f64(p, &["veins", "turbulence"], 3.0);
                 let fscale = param_f64(p, &["fractalScale"], 6.0);
                 let octaves = param_f64(p, &["octaves"], 4.0).round().max(1.0) as usize;
                 let seed = param_f64(p, &["seed"], 1.0).round() as i32;
@@ -378,6 +514,7 @@ impl<'a> MaterialEvaluator<'a> {
                         seed,
                         brightness: 1.0,
                         contrast: 1.0,
+                        roughness: 0.5,
                         transform: 0,
                     },
                     uv.as_ref(),
@@ -458,7 +595,7 @@ impl<'a> MaterialEvaluator<'a> {
             "colorRamp" => {
                 let fac_in = self.get_input(&node.id, &["factor", "t", "in"]).cloned();
                 let stops = parse_ramp_stops(p);
-                let interp = (param_f64(p, &["interpolation"], 1.0).round() as i32).clamp(0, 3);
+                let interp = resolve_ramp_interp(p);
                 let default_fac = param_f64(p, &["factor"], 0.5);
                 let mut col_out = self.alloc_image()?;
                 let mut alp_out = self.alloc_image()?;
@@ -749,7 +886,8 @@ impl<'a> MaterialEvaluator<'a> {
                         .map_or([0.0, 0.0, 0.0, 1.0], |v| v.sample_rgba(px));
                     let cb = b.as_ref().map_or(ca, |v| v.sample_rgba(px));
                     let op = op_in.as_ref().map_or(def_op, |v| v.sample_luma(px));
-                    let rgb = mat_blend_rgb([ca[0], ca[1], ca[2]], [cb[0], cb[1], cb[2]], op, mode);
+                    let rgb =
+                        eval_blend_rgb([ca[0], ca[1], ca[2]], [cb[0], cb[1], cb[2]], op, mode);
                     let i = px * 4;
                     out.data[i] = rgb[0].clamp(0.0, 1.0) as f32;
                     out.data[i + 1] = rgb[1].clamp(0.0, 1.0) as f32;
@@ -848,7 +986,7 @@ impl<'a> MaterialEvaluator<'a> {
                     let vc = c.as_ref().map_or(def_c, |v| v.sample_luma(0));
                     node_outs.insert(
                         "out".to_string(),
-                        MatBuf::Scalar(mat_math_op(va, vb, vc, op)),
+                        MatBuf::Scalar(eval_math_op(va, vb, vc, op)),
                     );
                 } else {
                     let mut out = self.alloc_image()?;
@@ -856,7 +994,7 @@ impl<'a> MaterialEvaluator<'a> {
                         let va = a.as_ref().map_or(def_a, |v| v.sample_luma(px));
                         let vb = b.as_ref().map_or(def_b, |v| v.sample_luma(px));
                         let vc = c.as_ref().map_or(def_c, |v| v.sample_luma(px));
-                        let res = mat_math_op(va, vb, vc, op) as f32;
+                        let res = eval_math_op(va, vb, vc, op) as f32;
                         let i = px * 4;
                         out.data[i] = res;
                         out.data[i + 1] = res;
@@ -985,7 +1123,9 @@ impl<'a> MaterialEvaluator<'a> {
                 }
             }
             "blackbody" => {
-                let inp = self.get_input(&node.id, &["t", "in"]).cloned();
+                let inp = self
+                    .get_input(&node.id, &["t", "temperature", "in"])
+                    .cloned();
                 let temp = param_f64(p, &["temperature", "kelvin"], 4000.0);
                 if let Some(ref src) = inp {
                     let mut out = self.alloc_image()?;
@@ -1017,8 +1157,125 @@ impl<'a> MaterialEvaluator<'a> {
                 node_outs.insert("normal".to_string(), normal);
             }
             "fresnel" => {
+                let norm_in = self.get_input(&node.id, &["normal"]).cloned();
                 let c = param_color3(p, &["color"], [1.0, 1.0, 1.0]);
-                node_outs.insert("out".to_string(), MatBuf::Uniform([c[0], c[1], c[2], 1.0]));
+                let ior = param_f64(p, &["ior"], 1.45).max(1.0);
+                let power = param_f64(p, &["power"], 3.0).max(0.1);
+                let mix_v = param_f64(p, &["mix", "strength"], 1.0).clamp(0.0, 1.0);
+                let view_angle_rad = param_f64(p, &["viewAngle", "grazingAngle", "angle"], 0.0)
+                    .clamp(0.0, 89.0)
+                    * PI
+                    / 180.0;
+                // 3D unit view vector in tangent space (tilted from +Z toward grazing angle).
+                let (vy, vz) = view_angle_rad.sin_cos();
+                let vx = 0.0_f64;
+                let f0 = ((ior - 1.0) / (ior + 1.0)).powi(2);
+                let mut out = self.alloc_image()?;
+                for y in 0..size {
+                    for x in 0..size {
+                        let px = x + y * size;
+                        let (nx, ny, nz) = if let Some(ref nb) = norm_in {
+                            let nc = nb.sample_rgba(px);
+                            let raw_x = nc[0] * 2.0 - 1.0;
+                            let raw_y = nc[1] * 2.0 - 1.0;
+                            let raw_z = nc[2] * 2.0 - 1.0;
+                            let len = (raw_x * raw_x + raw_y * raw_y + raw_z * raw_z)
+                                .sqrt()
+                                .max(1e-12);
+                            (raw_x / len, raw_y / len, raw_z / len)
+                        } else {
+                            // Map UV smoothly onto a 3D hemisphere normal so corners do not clip
+                            // to a flat 2D circular disc vignette.
+                            let u = ((x as f64) + 0.5) / (size as f64);
+                            let v = ((y as f64) + 0.5) / (size as f64);
+                            let phi = (u - 0.5) * PI;
+                            let theta = (v - 0.5) * PI;
+                            let (sin_p, cos_p) = phi.sin_cos();
+                            let (sin_t, cos_t) = theta.sin_cos();
+                            (sin_p * cos_t, sin_t, cos_p * cos_t)
+                        };
+                        let ndotv = (nx * vx + ny * vy + nz * vz).clamp(0.0, 1.0);
+                        let fres =
+                            ((f0 + (1.0 - f0) * (1.0 - ndotv).powf(power)) * mix_v).clamp(0.0, 1.0);
+                        let i = px * 4;
+                        out.data[i] = (c[0] * fres).clamp(0.0, 1.0) as f32;
+                        out.data[i + 1] = (c[1] * fres).clamp(0.0, 1.0) as f32;
+                        out.data[i + 2] = (c[2] * fres).clamp(0.0, 1.0) as f32;
+                        out.data[i + 3] = 1.0;
+                    }
+                }
+                let buf = MatBuf::from_image(out);
+                node_outs.insert("out".to_string(), buf.clone());
+                node_outs.insert("color".to_string(), buf);
+            }
+            "image" => {
+                let tint = param_color3(p, &["color", "tint"], [1.0, 1.0, 1.0]);
+                let asset_key = extract_image_asset_key(p).or_else(|| {
+                    self.images
+                        .contains_key(&node.id)
+                        .then_some(node.id.as_str())
+                });
+                if let Some(key) = asset_key
+                    && let Some(&(img_w, img_h, ref rgba)) = self.images.get(key)
+                    && img_w > 0
+                    && img_h > 0
+                    && rgba.len()
+                        >= (img_w as usize)
+                            .saturating_mul(img_h as usize)
+                            .saturating_mul(4)
+                {
+                    let uv = self.get_input(&node.id, &["uv"]).cloned();
+                    let w = img_w as usize;
+                    let h = img_h as usize;
+                    let mut col_out = self.alloc_image()?;
+                    let mut has_varying_alpha = false;
+                    for y in 0..size {
+                        for x in 0..size {
+                            let px = x + y * size;
+                            let (u, v) = if let Some(ref uv_buf) = uv {
+                                let c = uv_buf.sample_rgba(px);
+                                (c[0], c[1])
+                            } else {
+                                (
+                                    ((x as f64) + 0.5) / (size as f64),
+                                    ((y as f64) + 0.5) / (size as f64),
+                                )
+                            };
+                            let sample = sample_rgba8_bilinear(w, h, rgba, u, v);
+                            if (sample[3] - 1.0).abs() > 1e-4 {
+                                has_varying_alpha = true;
+                            }
+                            let i = px * 4;
+                            col_out.data[i] = (sample[0] * tint[0]).clamp(0.0, 1.0) as f32;
+                            col_out.data[i + 1] = (sample[1] * tint[1]).clamp(0.0, 1.0) as f32;
+                            col_out.data[i + 2] = (sample[2] * tint[2]).clamp(0.0, 1.0) as f32;
+                            col_out.data[i + 3] = sample[3].clamp(0.0, 1.0) as f32;
+                        }
+                    }
+                    let alp_buf = if has_varying_alpha {
+                        let mut alp_out = self.alloc_image()?;
+                        for px in 0..(size * size) {
+                            let a = col_out.data[px * 4 + 3];
+                            let i = px * 4;
+                            alp_out.data[i] = a;
+                            alp_out.data[i + 1] = a;
+                            alp_out.data[i + 2] = a;
+                            alp_out.data[i + 3] = 1.0;
+                        }
+                        MatBuf::from_image(alp_out)
+                    } else {
+                        MatBuf::Scalar(1.0)
+                    };
+                    let col_buf = MatBuf::from_image(col_out);
+                    node_outs.insert("out".to_string(), col_buf.clone());
+                    node_outs.insert("color".to_string(), col_buf);
+                    node_outs.insert("alpha".to_string(), alp_buf);
+                } else {
+                    let buf = MatBuf::Uniform([tint[0], tint[1], tint[2], 1.0]);
+                    node_outs.insert("out".to_string(), buf.clone());
+                    node_outs.insert("color".to_string(), buf);
+                    node_outs.insert("alpha".to_string(), MatBuf::Scalar(1.0));
+                }
             }
             other => {
                 return Err(format!(

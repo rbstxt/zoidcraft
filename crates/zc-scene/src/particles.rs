@@ -30,6 +30,7 @@ pub enum VelocityDistribution {
     #[default]
     Box = 0,
     Sphere = 1,
+    Radial = 2,
 }
 
 /// Particle blending mode (`blending`).
@@ -39,6 +40,8 @@ pub enum ParticleBlending {
     #[default]
     Normal = 0,
     Add = 1,
+    Subtractive = 2,
+    Multiply = 3,
 }
 
 /// A single RGBA stop in a 1D particle color or size gradient.
@@ -379,6 +382,16 @@ fn evaluate_particle_kinematics(
                 Vec3::new(sin_theta * phi.cos(), sin_theta * phi.sin(), cos_theta)
             };
             dir * speed
+        }
+        VelocityDistribution::Radial => {
+            let speed = params.radial_velocity + (r3 - 0.5) * params.radial_velocity_spread;
+            let dir = if spawn_offset.length_squared() > 1e-8 {
+                spawn_offset.normalize()
+            } else {
+                let phi = TAU * r1;
+                Vec3::new(phi.cos(), 0.0, phi.sin())
+            };
+            params.velocity + dir * speed
         }
     };
 
