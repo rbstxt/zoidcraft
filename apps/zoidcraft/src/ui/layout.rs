@@ -913,6 +913,12 @@ pub enum UiAction {
     RestoreRecoverySnapshot(PathBuf),
     #[cfg(not(target_arch = "wasm32"))]
     DeleteRecoverySnapshot(PathBuf),
+    #[cfg(not(target_arch = "wasm32"))]
+    CheckForUpdates,
+    #[cfg(not(target_arch = "wasm32"))]
+    OpenUpdateDetails,
+    #[cfg(not(target_arch = "wasm32"))]
+    ClearSkippedUpdate,
     EyedropperActivate {
         target_id: String,
         property: String,
@@ -1674,6 +1680,12 @@ impl Cm3Workspace {
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 PanelAction::DeleteRecoverySnapshot(path) => UiAction::DeleteRecoverySnapshot(path),
+                #[cfg(not(target_arch = "wasm32"))]
+                PanelAction::CheckForUpdates => UiAction::CheckForUpdates,
+                #[cfg(not(target_arch = "wasm32"))]
+                PanelAction::OpenUpdateDetails => UiAction::OpenUpdateDetails,
+                #[cfg(not(target_arch = "wasm32"))]
+                PanelAction::ClearSkippedUpdate => UiAction::ClearSkippedUpdate,
                 PanelAction::EyedropperActivate {
                     target_id,
                     property,

@@ -2521,6 +2521,144 @@ pub(super) fn show_settings_tab(
                 );
             }
 
+            // 6c. UPDATES: desktop release check settings / web deployment status
+            let (upd_hdr, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());
+            ui.painter()
+                .rect_filled(upd_hdr, CornerRadius::ZERO, BG_TITLE);
+            let upd_div_y = (upd_hdr.bottom() - 1.0).round();
+            ui.painter().rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(upd_hdr.left(), upd_div_y),
+                    Pos2::new(upd_hdr.right(), upd_div_y + 1.0),
+                ),
+                CornerRadius::ZERO,
+                BG_SUNKEN,
+            );
+            ui.painter().text(
+                Pos2::new(upd_hdr.left() + 6.0, upd_hdr.center().y),
+                Align2::LEFT_CENTER,
+                "UPDATES",
+                theme.font(FONT_BANNER),
+                TEXT_FAINT,
+            );
+
+            settings_flat_row_margin(
+                ui,
+                egui::Margin {
+                    left: 6,
+                    right: 6,
+                    top: 6,
+                    bottom: 8,
+                },
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = 5.0;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let status_color = if state.update_status.available {
+                            theme.value()
+                        } else {
+                            TEXT_MUTED
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Current version: v{}",
+                                    env!("CARGO_PKG_VERSION")
+                                ))
+                                .font(theme.font(FONT_SMALL))
+                                .color(TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                egui::RichText::new(&state.update_status.status_message)
+                                    .font(theme.font(FONT_COMPACT))
+                                    .color(status_color),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Check for updates on startup")
+                                    .font(theme.font(FONT_SMALL))
+                                    .color(TEXT_PRIMARY),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let toggle_state = if state.app_settings.check_updates_on_startup {
+                                    PillToggleState::On
+                                } else {
+                                    PillToggleState::Off
+                                };
+                                if paint_pill_toggle(ui, toggle_state, false, theme).clicked() {
+                                    state.app_settings.check_updates_on_startup =
+                                        !state.app_settings.check_updates_on_startup;
+                                }
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let checking = state.update_status.checking;
+                            if cm3_prop_button(
+                                ui,
+                                if checking { "Checking..." } else { "Check now" },
+                                ButtonVariant::Normal,
+                                false,
+                                theme,
+                            )
+                            .clicked()
+                                && !checking
+                            {
+                                actions.push(PanelAction::CheckForUpdates);
+                            }
+                            if state.update_status.available
+                                && cm3_prop_button(
+                                    ui,
+                                    "View update...",
+                                    ButtonVariant::Primary,
+                                    false,
+                                    theme,
+                                )
+                                .clicked()
+                            {
+                                actions.push(PanelAction::OpenUpdateDetails);
+                            }
+                            if let Some(skipped) = &state.app_settings.skipped_update_version
+                                && cm3_prop_button(
+                                    ui,
+                                    &format!("Unskip v{skipped}"),
+                                    ButtonVariant::Normal,
+                                    false,
+                                    theme,
+                                )
+                                .clicked()
+                            {
+                                actions.push(PanelAction::ClearSkippedUpdate);
+                            }
+                        });
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Current version: v{} (Web)",
+                                env!("CARGO_PKG_VERSION")
+                            ))
+                            .font(theme.font(FONT_SMALL))
+                            .color(TEXT_PRIMARY),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "Web edition checks automatically for new deployments and prompts to reload.",
+                                )
+                                .font(theme.font(FONT_COMPACT))
+                                .color(TEXT_MUTED),
+                            )
+                            .wrap(),
+                        );
+                    }
+                },
+            );
+
             // 7. DEBUG INFORMATION: full-width 28px #222222 uppercase banner (27px body + 1px #1d1d1d divider)
             let (dbg_hdr, _) =
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());

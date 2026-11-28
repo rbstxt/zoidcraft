@@ -1333,9 +1333,80 @@ function cancelExport(id) {
     if (state) closeExport(state);
 }
 
+function evaluateWebUpdate(currentBuildId, payload, dismissedBuildId = null) {
+    if (typeof currentBuildId !== "string" || !currentBuildId.trim() || currentBuildId === "__ZC_BUILD_ID__") {
+        return null;
+    }
+    if (!payload || typeof payload !== "object") return null;
+    const remoteBuildId = typeof payload.buildId === "string" ? payload.buildId.trim() : "";
+    if (!remoteBuildId || remoteBuildId === currentBuildId || remoteBuildId === dismissedBuildId) {
+        return null;
+    }
+    const version = typeof payload.version === "string" && payload.version.trim()
+        ? payload.version.trim()
+        : null;
+    return { buildId: remoteBuildId, version };
+}
+
+function createWebUpdateMonitor({
+    currentBuildId,
+    fetchVersion,
+    onUpdate,
+    intervalMs = 10 * 60 * 1000,
+    minCheckGapMs = 60 * 1000,
+    now = () => Date.now(),
+}) {
+    let dismissedBuildId = null;
+    let lastCheckAt = null;
+    let inFlight = false;
+    let timerId = null;
+
+    async function checkNow({ force = false } = {}) {
+        if (inFlight) return null;
+        if (typeof currentBuildId !== "string" || !currentBuildId.trim() || currentBuildId === "__ZC_BUILD_ID__") {
+            return null;
+        }
+        const currentTime = now();
+        if (!force && lastCheckAt !== null && (currentTime - lastCheckAt) < minCheckGapMs) {
+            return null;
+        }
+        inFlight = true;
+        lastCheckAt = currentTime;
+        try {
+            const payload = await fetchVersion();
+            const update = evaluateWebUpdate(currentBuildId, payload, dismissedBuildId);
+            if (update) onUpdate?.(update);
+            return update;
+        } catch {
+            return null;
+        } finally {
+            inFlight = false;
+        }
+    }
+
+    function dismiss(buildId) {
+        dismissedBuildId = typeof buildId === "string" && buildId.trim() ? buildId.trim() : null;
+    }
+
+    function start() {
+        if (timerId !== null) return;
+        timerId = setInterval(() => { void checkNow(); }, intervalMs);
+        timerId?.unref?.();
+    }
+
+    function stop() {
+        if (timerId === null) return;
+        clearInterval(timerId);
+        timerId = null;
+    }
+
+    return { checkNow, dismiss, start, stop };
+}
+
 globalThis.__zcFiles = { pickFile, downloadBlob, yieldToBrowser };
 globalThis.__zcClipboard = { readText, writeText };
 globalThis.__zcWebAudio = { start, sampleRate };
+globalThis.__zcWebUpdate = { evaluateWebUpdate, createWebUpdateMonitor };
 globalThis.__zcWebCodecs = {
     isSupported, importVideo, disposeVideo, disposeAllVideos, getVideoFrame, isExactVideoFrame,
     beginFrameRequests, endFrameRequests, usePreparedFrames: frames => { preparedFrames = frames; },
@@ -1354,4 +1425,13 @@ if (typeof document !== "undefined") {
     document.addEventListener("keydown", resumeAudio, { capture: true });
 }
 
-export { demuxIsoVideo, disposeAllVideos, disposeVideo, findSample, probeEbmlTracks, resolveVideoMime };
+export {
+    createWebUpdateMonitor,
+    demuxIsoVideo,
+    disposeAllVideos,
+    disposeVideo,
+    evaluateWebUpdate,
+    findSample,
+    probeEbmlTracks,
+    resolveVideoMime,
+};

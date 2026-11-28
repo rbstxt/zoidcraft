@@ -16,6 +16,19 @@
         h1 { margin: 0; font-size: 1.5rem; font-weight: 600; }
         p { max-width: 34rem; margin: 10px auto 0; color: #c0c0c0; font-size: .9rem; line-height: 1.5; }
         #error { color: #ffb4a8; overflow-wrap: anywhere; }
+        #update-banner { position: fixed; top: 12px; right: 12px; z-index: 20; display: flex; align-items: center;
+            gap: 10px; max-width: calc(100vw - 24px); padding: 8px 10px 8px 12px; border-radius: 8px;
+            background: #222222; border: 1px solid #4a88ff; color: #f2f2f2;
+            font: 500 0.8125rem/1.35 system-ui, sans-serif; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45); }
+        #update-banner[hidden] { display: none; }
+        #update-banner-text { color: #e8e8e8; }
+        .update-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+        #update-banner button { appearance: none; border-radius: 5px; padding: 4px 10px;
+            font: 600 0.75rem/1.3 system-ui, sans-serif; cursor: pointer; }
+        #update-reload { background: #4a88ff; border: 1px solid #4a88ff; color: #ffffff; }
+        #update-reload:hover { background: #5c95ff; border-color: #5c95ff; }
+        #update-dismiss { background: #1d1d1d; border: 1px solid #3c3c3c; color: #cfcfcf; }
+        #update-dismiss:hover { background: #2b2b2b; color: #f2f2f2; }
     </style>
     <script type="importmap">
         {
@@ -37,10 +50,21 @@
         <p id="error" hidden></p>
         <noscript><p>Enable JavaScript to open the ZoidCraft editor.</p></noscript>
     </div>
+    <div id="update-banner" role="status" aria-live="polite" hidden>
+        <span id="update-banner-text"></span>
+        <div class="update-actions">
+            <button id="update-reload" type="button">Reload</button>
+            <button id="update-dismiss" type="button">Dismiss</button>
+        </div>
+    </div>
     <script type="module">
         const status = document.querySelector("#status");
         const error = document.querySelector("#error");
         const loading = document.querySelector("#loading");
+        const updateBanner = document.querySelector("#update-banner");
+        const updateBannerText = document.querySelector("#update-banner-text");
+        const updateReload = document.querySelector("#update-reload");
+        const updateDismiss = document.querySelector("#update-dismiss");
         const canvasId = "zoidcraft_canvas";
         const version = "__ZC_BUILD_ID__";
 
@@ -76,6 +100,34 @@
                 await start_zoidcraft_web(canvasId, true);
             }
             loading.hidden = true;
+
+            let pendingUpdate = null;
+            const updateMonitor = globalThis.__zcWebUpdate.createWebUpdateMonitor({
+                currentBuildId: version,
+                async fetchVersion() {
+                    const response = await fetch(`./version.json?t=${Date.now()}`, { cache: "no-store" });
+                    if (!response.ok) return null;
+                    return await response.json();
+                },
+                onUpdate(update) {
+                    pendingUpdate = update;
+                    updateBannerText.textContent = update.version
+                        ? `ZoidCraft v${update.version} is available`
+                        : "A new version of ZoidCraft is available";
+                    updateBanner.hidden = false;
+                },
+            });
+            updateReload.addEventListener("click", () => {
+                window.location.reload();
+            });
+            updateDismiss.addEventListener("click", () => {
+                if (pendingUpdate) updateMonitor.dismiss(pendingUpdate.buildId);
+                updateBanner.hidden = true;
+            });
+            updateMonitor.start();
+            document.addEventListener("visibilitychange", () => {
+                if (document.visibilityState === "visible") void updateMonitor.checkNow();
+            });
         } catch (failure) {
             status.textContent = "Could not start the editor.";
             error.textContent = failure?.message ?? String(failure);

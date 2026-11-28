@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { unzipSync } from "fflate";
-import { demuxIsoVideo, findSample, probeEbmlTracks } from "./zc_web_runtime.js";
+import {
+    createWebUpdateMonitor,
+    demuxIsoVideo,
+    evaluateWebUpdate,
+    findSample,
+    probeEbmlTracks,
+} from "./zc_web_runtime.js";
 
 const codecs = globalThis.__zcWebCodecs;
 
@@ -47,6 +53,91 @@ test("cancelling an export drops its state", async () => {
 test("clipboard writes have an in-memory fallback", () => {
     globalThis.__zcClipboard.writeText("clipboard sample");
     assert.equal(globalThis.__zcClipboard.readText(), "clipboard sample");
+});
+
+test("evaluateWebUpdate ignores matching, placeholder, invalid, and dismissed builds", () => {
+    assert.equal(globalThis.__zcWebUpdate.evaluateWebUpdate, evaluateWebUpdate);
+    assert.equal(globalThis.__zcWebUpdate.createWebUpdateMonitor, createWebUpdateMonitor);
+
+    assert.equal(evaluateWebUpdate("abc123", { buildId: "abc123", version: "0.2.6" }), null);
+    assert.equal(evaluateWebUpdate("__ZC_BUILD_ID__", { buildId: "def456", version: "0.2.7" }), null);
+    assert.equal(evaluateWebUpdate("", { buildId: "def456", version: "0.2.7" }), null);
+    assert.equal(evaluateWebUpdate("abc123", null), null);
+    assert.equal(evaluateWebUpdate("abc123", { version: "0.2.7" }), null);
+    assert.equal(evaluateWebUpdate("abc123", { buildId: "   ", version: "0.2.7" }), null);
+    assert.equal(evaluateWebUpdate("abc123", { buildId: "def456", version: "0.2.7" }, "def456"), null);
+});
+
+test("evaluateWebUpdate returns update details when remote build differs", () => {
+    assert.deepEqual(
+        evaluateWebUpdate("abc123", { buildId: "def456", version: " 0.2.7 " }),
+        { buildId: "def456", version: "0.2.7" },
+    );
+    assert.deepEqual(
+        evaluateWebUpdate("abc123", { buildId: "def456", version: "   " }),
+        { buildId: "def456", version: null },
+    );
+    assert.deepEqual(
+        evaluateWebUpdate("abc123", { buildId: "def456" }),
+        { buildId: "def456", version: null },
+    );
+});
+
+test("createWebUpdateMonitor throttles checks, honors force and dismiss, and survives fetch errors", async () => {
+    let clock = 1_000;
+    let fetches = 0;
+    let remote = { buildId: "build-2", version: "0.2.7" };
+    let shouldFail = false;
+    const updates = [];
+
+    const monitor = createWebUpdateMonitor({
+        currentBuildId: "build-1",
+        minCheckGapMs: 60_000,
+        intervalMs: 600_000,
+        now: () => clock,
+        async fetchVersion() {
+            fetches++;
+            if (shouldFail) throw new Error("network down");
+            return remote;
+        },
+        onUpdate(update) {
+            updates.push(update);
+        },
+    });
+
+    const first = await monitor.checkNow();
+    assert.deepEqual(first, { buildId: "build-2", version: "0.2.7" });
+    assert.equal(fetches, 1);
+    assert.equal(updates.length, 1);
+
+    // Throttled within minCheckGapMs.
+    clock += 30_000;
+    assert.equal(await monitor.checkNow(), null);
+    assert.equal(fetches, 1);
+
+    // Force bypasses minCheckGapMs, but dismissal suppresses the same buildId.
+    monitor.dismiss("build-2");
+    assert.equal(await monitor.checkNow({ force: true }), null);
+    assert.equal(fetches, 2);
+    assert.equal(updates.length, 1);
+
+    // A newer buildId after dismissal triggers a new notification once gap elapses.
+    clock += 60_000;
+    remote = { buildId: "build-3", version: "0.2.8" };
+    assert.deepEqual(await monitor.checkNow(), { buildId: "build-3", version: "0.2.8" });
+    assert.equal(fetches, 3);
+    assert.equal(updates.length, 2);
+
+    // Fetch errors are swallowed cleanly.
+    clock += 60_000;
+    shouldFail = true;
+    assert.equal(await monitor.checkNow(), null);
+    assert.equal(fetches, 4);
+    assert.equal(updates.length, 2);
+
+    // start/stop manages interval cleanly.
+    monitor.start();
+    monitor.stop();
 });
 
 test("MP4 sample index yields AVC configuration and bounded sample offsets", {

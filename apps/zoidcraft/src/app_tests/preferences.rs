@@ -37,6 +37,8 @@ fn preferences_round_trip_and_flush_pending_changes_on_drop() {
         ffmpeg_path: Some("/opt/custom/bin/ffmpeg".to_owned()),
         ffprobe_path: Some("/opt/custom/bin/ffprobe".to_owned()),
         ffmpeg_setup_dismissed: true,
+        check_updates_on_startup: false,
+        skipped_update_version: Some("0.2.7".to_owned()),
     };
     app.workspace.player_plus.preview_quality = PreviewQuality::Quarter;
     app.theme.set_custom_hue_sat(40.0, 125.0);
@@ -166,4 +168,37 @@ fn new_project_applies_default_fps_and_preserves_plugins_and_configs() {
         app.session.plugins.export_settings().plugin_configs,
         plugin_configs
     );
+}
+
+#[test]
+fn update_settings_round_trip_trim_and_affect_fingerprint() {
+    let dir = TestPreferencesDir::new();
+    let path = dir.path();
+    let mut app = make_headless_app_for_test();
+    app.preferences_path = Some(path.clone());
+
+    let fp_initial = preferences_fingerprint(&app.workspace, &app.session.plugins, &app.theme);
+    app.workspace.panels.app_settings.check_updates_on_startup = false;
+    let fp_toggled = preferences_fingerprint(&app.workspace, &app.session.plugins, &app.theme);
+    assert_ne!(fp_initial, fp_toggled);
+
+    app.workspace.panels.app_settings.skipped_update_version = Some("  0.2.8  ".to_owned());
+    let fp_skipped = preferences_fingerprint(&app.workspace, &app.session.plugins, &app.theme);
+    assert_ne!(fp_toggled, fp_skipped);
+
+    app.save_user_preferences(false);
+    let loaded = UserPreferences::load(&path).expect("load saved update preferences");
+    assert!(!loaded.app_settings.check_updates_on_startup);
+    assert_eq!(
+        loaded.app_settings.skipped_update_version.as_deref(),
+        Some("0.2.8")
+    );
+
+    // Blank / whitespace-only skipped_update_version normalizes to None on load.
+    app.workspace.panels.app_settings.skipped_update_version = Some("   ".to_owned());
+    let fp_blank = preferences_fingerprint(&app.workspace, &app.session.plugins, &app.theme);
+    assert_ne!(fp_skipped, fp_blank);
+    app.save_user_preferences(false);
+    let loaded_blank = UserPreferences::load(&path).expect("load blank skipped version");
+    assert_eq!(loaded_blank.app_settings.skipped_update_version, None);
 }

@@ -104,6 +104,19 @@ impl UserPreferences {
             ffmpeg_setup_dismissed: settings["ffmpeg_setup_dismissed"]
                 .as_bool()
                 .unwrap_or(defaults.ffmpeg_setup_dismissed),
+            check_updates_on_startup: settings["check_updates_on_startup"]
+                .as_bool()
+                .unwrap_or(defaults.check_updates_on_startup),
+            skipped_update_version: settings.get("skipped_update_version").map_or(
+                defaults.skipped_update_version,
+                |value| {
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                },
+            ),
         };
         let preview_quality = PreviewQuality::ALL
             .into_iter()
@@ -181,6 +194,8 @@ impl UserPreferences {
                 "ffmpeg_path": settings.ffmpeg_path,
                 "ffprobe_path": settings.ffprobe_path,
                 "ffmpeg_setup_dismissed": settings.ffmpeg_setup_dismissed,
+                "check_updates_on_startup": settings.check_updates_on_startup,
+                "skipped_update_version": settings.skipped_update_version,
             },
             "enabled_plugins": self.enabled_plugins,
             "plugin_configs": self.plugin_configs,
@@ -230,6 +245,8 @@ pub(crate) fn preferences_fingerprint(
         settings.ffmpeg_path.as_deref(),
         settings.ffprobe_path.as_deref(),
         settings.ffmpeg_setup_dismissed,
+        settings.check_updates_on_startup,
+        settings.skipped_update_version.as_deref(),
         workspace.player_plus.preview_quality.divisor(),
     )
         .hash(&mut hasher);

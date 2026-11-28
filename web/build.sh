@@ -34,6 +34,9 @@ done
 build_id="$(shasum -a 256 web/index.html "$staging"/pkg/* "$staging"/vendor/*.js \
     "$staging"/icons/* "$staging/zc_web_runtime.js" | awk '{print $1}' | shasum -a 256 | cut -c1-16)"
 sed "s/__ZC_BUILD_ID__/$build_id/g" web/index.html > "$staging/index.html"
+app_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+app_version="${app_version:-0.0.0}"
+printf '{"version":"%s","buildId":"%s"}\n' "$app_version" "$build_id" > "$staging/version.json"
 rm -rf web/dist
 mv "$staging" web/dist
 

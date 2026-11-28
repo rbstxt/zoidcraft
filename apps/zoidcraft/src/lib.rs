@@ -16,6 +16,8 @@ mod media_import;
 mod preferences;
 mod project_io;
 mod ui;
+#[cfg(not(target_arch = "wasm32"))]
+mod update_check;
 mod viewport_renderer;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -32,6 +34,8 @@ use preferences::{
     UserPreferences, apply_default_project_fps, default_preferences_path, preferences_fingerprint,
 };
 use project_io::*;
+#[cfg(not(target_arch = "wasm32"))]
+use update_check::*;
 use viewport_renderer::*;
 
 #[cfg(test)]
@@ -184,6 +188,9 @@ struct ZoidCraftApp {
     /// On-demand "No FFmpeg Inside" setup banner, modal dialog, and background installer state.
     #[cfg(not(target_arch = "wasm32"))]
     ffmpeg_setup: FfmpegSetupState,
+    /// Non-blocking GitHub Releases update checker banner, modal, and background worker state.
+    #[cfg(not(target_arch = "wasm32"))]
+    update_check: UpdateCheckState,
     /// In-flight background video imports processed off the UI thread.
     pending_media_imports: Vec<PendingMediaImport>,
     #[cfg(target_arch = "wasm32")]
@@ -303,8 +310,10 @@ impl eframe::App for ZoidCraftApp {
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.workspace.suppress_shortcuts |= self.ffmpeg_setup.open;
+            self.workspace.suppress_shortcuts |= self.update_check.dialog_open;
             self.poll_ffmpeg_probe(&ctx);
             self.poll_ffmpeg_install(&ctx);
+            self.poll_update_check(&ctx);
         }
         #[cfg(target_arch = "wasm32")]
         self.poll_web_tasks(&ctx);
@@ -667,6 +676,12 @@ impl eframe::App for ZoidCraftApp {
                 UiAction::DeleteRecoverySnapshot(path) => {
                     self.handle_delete_recovery_snapshot(&path);
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                UiAction::CheckForUpdates => self.trigger_update_check(true),
+                #[cfg(not(target_arch = "wasm32"))]
+                UiAction::OpenUpdateDetails => self.open_update_details_modal(),
+                #[cfg(not(target_arch = "wasm32"))]
+                UiAction::ClearSkippedUpdate => self.clear_skipped_update_version(),
                 UiAction::EyedropperActivate {
                     target_id,
                     property,
@@ -795,6 +810,8 @@ impl eframe::App for ZoidCraftApp {
         {
             self.show_ffmpeg_setup_banner(&ctx);
             self.show_ffmpeg_setup_modal(&ctx);
+            self.show_update_banner(&ctx);
+            self.show_update_modal(&ctx);
         }
         self.update_window_title(&ctx);
         self.save_user_preferences(false);
@@ -984,7 +1001,8 @@ impl ZoidCraftApp {
         let mut viewport = ViewportState::new();
         viewport.show_fps_overlay = workspace.panels.app_settings.show_fps_overlay;
 
-        Self {
+        #[allow(unused_mut)]
+        let mut app = Self {
             session,
             theme: theme.clone(),
             applied_theme: Some(theme),
@@ -1021,6 +1039,8 @@ impl ZoidCraftApp {
             ffmpeg_probe_rx: Some(probe_rx),
             #[cfg(not(target_arch = "wasm32"))]
             ffmpeg_setup: FfmpegSetupState::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            update_check: UpdateCheckState::default(),
             pending_media_imports: Vec::new(),
             #[cfg(target_arch = "wasm32")]
             web: web::AppState::default(),
@@ -1058,6 +1078,11 @@ impl ZoidCraftApp {
             last_title: String::new(),
             status_toast: None,
             last_viewport_render_error: None,
+        };
+        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+        if app.workspace.panels.app_settings.check_updates_on_startup {
+            app.trigger_update_check(false);
         }
+        app
     }
 }

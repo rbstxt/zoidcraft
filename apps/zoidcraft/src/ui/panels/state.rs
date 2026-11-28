@@ -327,6 +327,28 @@ impl Default for ExportStatus {
     }
 }
 
+/// Live update-checker telemetry mirrored into the Settings tab.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateUiStatus {
+    pub checking: bool,
+    pub available: bool,
+    pub latest_version: Option<String>,
+    pub status_message: String,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for UpdateUiStatus {
+    fn default() -> Self {
+        Self {
+            checking: false,
+            available: false,
+            latest_version: None,
+            status_message: "Not checked yet".to_owned(),
+        }
+    }
+}
+
 /// Persistent editor preferences shown in the Settings tab.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppSettings {
@@ -341,6 +363,10 @@ pub struct AppSettings {
     pub ffprobe_path: Option<String>,
     /// Suppresses the non-blocking startup FFmpeg setup banner when `true`.
     pub ffmpeg_setup_dismissed: bool,
+    /// When true, checks GitHub Releases for a newer desktop version on startup.
+    pub check_updates_on_startup: bool,
+    /// Optional release version (e.g. `"0.2.7"`) skipped by the user for update banners.
+    pub skipped_update_version: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -354,6 +380,8 @@ impl Default for AppSettings {
             ffmpeg_path: None,
             ffprobe_path: None,
             ffmpeg_setup_dismissed: false,
+            check_updates_on_startup: true,
+            skipped_update_version: None,
         }
     }
 }
@@ -398,6 +426,12 @@ pub enum PanelAction {
     ClearFfmpegBinary,
     #[cfg(not(target_arch = "wasm32"))]
     ReprobeFfmpeg,
+    #[cfg(not(target_arch = "wasm32"))]
+    CheckForUpdates,
+    #[cfg(not(target_arch = "wasm32"))]
+    OpenUpdateDetails,
+    #[cfg(not(target_arch = "wasm32"))]
+    ClearSkippedUpdate,
     #[cfg(not(target_arch = "wasm32"))]
     SaveRecoverySnapshotNow,
     #[cfg(not(target_arch = "wasm32"))]
@@ -500,6 +534,8 @@ pub struct PanelsState {
     pub assets_sort_mode: usize,
     pub recovery_snapshots: Vec<RecoverySnapshotInfo>,
     pub app_settings: AppSettings,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub update_status: UpdateUiStatus,
     pub plugin_notice: Option<String>,
     pub floating_windows: FloatingWindowManager,
     pub new_seq_control_name: String,
@@ -596,6 +632,8 @@ impl Default for PanelsState {
             assets_sort_mode: 0,
             recovery_snapshots: Vec::new(),
             app_settings: AppSettings::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            update_status: UpdateUiStatus::default(),
             plugin_notice: None,
             floating_windows: FloatingWindowManager::default(),
             new_seq_control_name: String::from("ctl_slider_1"),
